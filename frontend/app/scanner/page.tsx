@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import { refreshLabel, useAutoRefresh } from '@/lib/useAutoRefresh';
 import { api, Signal } from '@/lib/api';
 import { Chart } from '@/components/Chart';
 import { SignalCard } from '@/components/SignalCard';
@@ -75,10 +76,15 @@ export default function ScannerPage() {
       setScanned(true);
     } catch (e: any) {
       setError(e.message);
+      throw e;
     } finally {
       setScanning(false);
     }
   }
+
+  // Rescan AUTOMATIQUE toutes les 3 min une fois le premier scan lancé : les marchés bougent,
+  // l'analyse affichée ne doit pas dater.
+  const autoScan = useAutoRefresh(scan, 180_000, scanned);
 
   // Lance un trade PAPIER directement depuis une carte de scan : génère le signal complet (SL/TP)
   // puis ouvre la position. Refuse si le signal consolidé est HOLD (cohérent avec l'analyse).
@@ -206,6 +212,9 @@ export default function ScannerPage() {
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="flex flex-wrap items-center gap-2 text-lg font-semibold text-white">
               Résultats du scan ({results.length}{results.length ? ` · ${results.filter((r) => r.high_conviction).length} haute-conviction` : ''})
+              <span className="text-[11px] font-normal text-muted">
+                <span className={autoScan.refreshing ? 'text-accent' : ''}>🔄 rescan auto</span> · {refreshLabel(autoScan)}
+              </span>
               <span className="rounded bg-surface px-2 py-0.5 text-xs font-normal text-muted">
                 ⏱ {TIMEFRAMES.find((t) => t.tf === tf)?.label ?? tf}
               </span>

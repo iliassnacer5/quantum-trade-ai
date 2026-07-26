@@ -13,7 +13,10 @@ from app.agents.base import AgentOutput
 from app.models.signal import Direction
 
 # Poids de base par agent.
+# Le PLAYBOOK (stratégie du desk : mensuel+journalier -> 4h -> entrée 15 min) domine : c'est lui
+# qui porte la méthode, les autres agents nuancent. Il dispose en plus d'un droit de VETO.
 DEFAULT_WEIGHTS = {
+    "playbook": 0.35,
     "technical": 0.25,
     "volume": 0.15,
     "sentiment": 0.20,
@@ -32,6 +35,7 @@ class MasterDecision:
     conflict: bool
     weights_used: dict
     consensus: int = 0
+    playbook_veto: str | None = None  # motif du refus imposé par la stratégie, le cas échéant
 
 
 def _effective_weights(
@@ -55,6 +59,7 @@ def decide(
     weights: dict[str, float] | None = None,
     journal_multipliers: dict[str, float] | None = None,
     risk_output: AgentOutput | None = None,
+    playbook_gate: bool = True,
 ) -> MasterDecision:
     base = weights or DEFAULT_WEIGHTS
     regime_bias = next((o.score for o in outputs if o.name == "macro"), 0.0)
@@ -87,6 +92,24 @@ def decide(
     else:
         direction = Direction.HOLD
 
+    # --- Autorité du PLAYBOOK : la stratégie du desk prime sur le vote des agents ---
+    # Le playbook a un droit de veto ; et aucun trade ne peut partir DANS L'AUTRE SENS que le sien.
+    # (Neutralisé si le playbook n'avait pas assez de données -> comportement historique préservé.)
+    pb = next((o for o in outputs if o.name == "playbook"), None)
+    pb_details = (pb.details or {}) if pb is not None else {}
+    playbook_veto: str | None = None
+    if playbook_gate and pb is not None and not pb_details.get("insufficient"):
+        pb_dir = pb_details.get("direction")
+        if pb_details.get("veto"):
+            reasons = pb_details.get("reasons") or []
+            playbook_veto = "; ".join(reasons) or "conditions de la stratégie non réunies"
+            direction = Direction.HOLD
+        elif pb_dir in ("BUY", "SELL") and direction.value != pb_dir:
+            playbook_veto = (
+                f"les autres agents contredisent le playbook ({pb_dir}) — on ne trade pas contre la méthode"
+            )
+            direction = Direction.HOLD
+
     # --- Confiance recalibrée : force du signal × consensus pondéré des agents ---
     sign = 1 if combined > 0 else -1 if combined < 0 else 0
     agree_w = sum(
@@ -111,6 +134,11 @@ def decide(
     # Contrainte de l'Agent Risque : sa confidence < 1 réduit la confiance globale.
     if risk_output is not None:
         confidence *= max(0.4, risk_output.confidence)
+    # Timing de session : la stratégie privilégie l'ouverture de Londres, celle de New York et
+    # surtout leur chevauchement. Hors de ces fenêtres, la conviction est mécaniquement réduite.
+    session = pb_details.get("session") or {}
+    if session.get("quality") is not None:
+        confidence *= 0.75 + 0.25 * float(session["quality"])
     confidence = int(round(max(0, min(100, confidence))))
     if direction == Direction.HOLD:
         confidence = min(confidence, 45)
@@ -123,7 +151,11 @@ def decide(
     )
     if adx:
         arb += f" | ADX {adx:.0f}"
+    if session.get("label"):
+        arb += f" | session : {session['label']}"
     arb += "."
+    if playbook_veto:
+        arb += f" ⛔ Refus imposé par la stratégie (playbook) : {playbook_veto}."
     if conflict:
         arb += " ⚠️ Signaux divergents : pondération prudente."
     if risk_output is not None and risk_output.details.get("penalty", 0) > 0:
@@ -139,4 +171,5 @@ def decide(
         conflict=conflict,
         weights_used={k: round(v, 3) for k, v in eff.items()},
         consensus=consensus_pct,
+        playbook_veto=playbook_veto,
     )

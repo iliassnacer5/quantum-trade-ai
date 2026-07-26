@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from app.agents.base import AgentOutput, enrich
+from app.agents.base import AgentOutput, apply_playbook, enrich
 from app.domain import ta
 from app.domain.indicators import Candle
 
@@ -39,15 +39,21 @@ async def run(candles: list[Candle], symbol: str | None = None, context: dict | 
         if market == "commodity":
             from app.agents import gold_expert
             return await gold_expert.run(candles, symbol=symbol or "XAU/USD", context=context)
-    return await _generic(candles)
+    return await _generic(candles, context)
 
 
-async def _generic(candles: list[Candle]) -> AgentOutput:
+async def _generic(candles: list[Candle], context: dict | None = None) -> AgentOutput:
     name = "technical"
     if len(candles) < 35:
         return AgentOutput(name, 0.0, 0.1, "Données insuffisantes pour l'analyse technique.")
 
     a = ta.analyze(candles)
+    notes = list(a["notes"])
+    metrics = a["metrics"]
+    # Cadre commun : la stratégie du desk (tendance de fond, niveaux majeurs, fenêtre de session).
+    score, conf = apply_playbook(a["score"], a["confidence"], notes, metrics, context)
+    a = {**a, "score": round(max(-1.0, min(1.0, score)), 3), "confidence": round(conf, 3),
+         "notes": notes, "metrics": metrics}
     rationale = "Analyse technique : " + " ; ".join(a["notes"]) + "."
 
     from app.agents import llm

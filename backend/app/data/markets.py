@@ -43,14 +43,16 @@ async def _alpaca_candles(symbol: str, interval: str, limit: int) -> list[Candle
         raise RuntimeError("pas de clé Alpaca")
     import httpx
 
-    tf = {"5m": "5Min", "15m": "15Min", "1h": "1Hour", "4h": "4Hour", "1d": "1Day"}.get(interval, "1Hour")
+    tf = {"5m": "5Min", "15m": "15Min", "1h": "1Hour", "4h": "4Hour", "1d": "1Day",
+          "1w": "1Week", "1M": "1Month"}.get(interval, "1Hour")
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
     headers = {"APCA-API-KEY-ID": s.alpaca_api_key, "APCA-API-SECRET-KEY": s.alpaca_api_secret}
     # Sans `start`, Alpaca ne renvoie que la journée en cours (~7 bougies 1h) -> repli Yahoo forcé.
     # On remonte assez loin (marchés actions ~7h/jour, week-ends fermés) puis on tronque à `limit`.
     from datetime import UTC, datetime, timedelta
 
-    _secs = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(interval, 3600)
+    _secs = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400,
+             "1w": 604800, "1M": 2592000}.get(interval, 3600)
     start = (datetime.now(UTC) - timedelta(seconds=_secs * limit * 5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     params = {"timeframe": tf, "limit": min(limit * 2, 1000), "start": start, "feed": "iex"}
     async with httpx.AsyncClient(timeout=10) as client:
@@ -66,7 +68,8 @@ async def _oanda_candles(symbol: str, interval: str, limit: int) -> list[Candle]
         raise RuntimeError("pas de clé OANDA")
     import httpx
 
-    gran = {"5m": "M5", "15m": "M15", "1h": "H1", "4h": "H4", "1d": "D"}.get(interval, "H1")
+    gran = {"5m": "M5", "15m": "M15", "1h": "H1", "4h": "H4", "1d": "D",
+            "1w": "W", "1M": "M"}.get(interval, "H1")
     instr = symbol.replace("/", "_")
     url = f"https://api-fxtrade.oanda.com/v3/instruments/{instr}/candles"
     headers = {"Authorization": f"Bearer {s.oanda_api_key}"}
@@ -112,6 +115,9 @@ async def load_candles(symbol: str, interval: str = "1h", limit: int = 200) -> l
     """
     cls = asset_class(symbol)
     key = symbol.upper()
+    # Minimum de bougies exploitables : les unités LONGUES (hebdo/mensuel, étape 1 du playbook) en
+    # ont mécaniquement moins — exiger 60 bougies mensuelles enverrait tout vers le synthétique.
+    min_needed = {"1M": 12, "1w": 30}.get(interval, 60)
     # Cache temps réel (crypto) : si le flux WS a chauffé le cache, on évite un appel REST.
     if cls == "crypto":
         from app.realtime import market_stream
@@ -127,14 +133,14 @@ async def load_candles(symbol: str, interval: str = "1h", limit: int = 200) -> l
         elif cls == "stock":
             try:
                 candles = await _alpaca_candles(symbol, interval, limit)
-                if len(candles) < 60:
+                if len(candles) < min_needed:
                     candles = await _yahoo_candles(symbol, interval, limit)
             except Exception:  # noqa: BLE001 — pas de clé Alpaca -> Yahoo
                 candles = await _yahoo_candles(symbol, interval, limit)
         elif cls == "forex":
             try:
                 candles = await _oanda_candles(symbol, interval, limit)
-                if len(candles) < 60:
+                if len(candles) < min_needed:
                     candles = await _yahoo_candles(symbol, interval, limit)
             except Exception:  # noqa: BLE001 — pas de clé OANDA -> Yahoo
                 candles = await _yahoo_candles(symbol, interval, limit)
@@ -143,7 +149,7 @@ async def load_candles(symbol: str, interval: str = "1h", limit: int = 200) -> l
             candles = await _yahoo_candles(symbol, interval, limit)
         else:
             candles = []
-        if len(candles) >= 60:
+        if len(candles) >= min_needed:
             _LAST_SOURCE[key] = "real"
             return candles
         logger.warning("Backfill %s (%s) insuffisant, repli synthétique", symbol, cls)

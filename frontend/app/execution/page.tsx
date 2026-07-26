@@ -1,17 +1,23 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
-import { api, BrokerConn, Order, PlanInfo } from '@/lib/api';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { api, BrokerConn, Order, PlanInfo, PositionsSnapshot } from '@/lib/api';
 import { MarketSelector, OutcomeBanner, DataSourceBadge } from '@/components/domain';
 import { PageHeader } from '@/components/ui';
+import { refreshLabel, useAutoRefresh } from '@/lib/useAutoRefresh';
 
 type Ticket = { connId: string; side: 'buy' | 'sell' };
+
+/** Le P&L latent est recalculé côté serveur toutes les 15 s — aucun clic nécessaire. */
+const REFRESH_MS = 15_000;
 
 export default function ExecutionPage() {
   const [plan, setPlan] = useState<PlanInfo | null>(null);
   const [kyc, setKyc] = useState<string>('none');
   const [conns, setConns] = useState<BrokerConn[]>([]);
-  const [orders, setOrders] = useState<Order[]>([]);
+  const [snap, setSnap] = useState<PositionsSnapshot | null>(null);
+  // Récapitulatif de CE QUE J'AI CHOISI au lancement du dernier trade.
+  const [lastOrder, setLastOrder] = useState<Order | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Ticket d'ordre (formulaire complet : entrée, SL, TP, taille).
@@ -27,28 +33,32 @@ export default function ExecutionPage() {
   const [takeProfit, setTakeProfit] = useState('');
   const [price, setPrice] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [checks, setChecks] = useState<Record<string, Order>>({});
   const [checking, setChecking] = useState<string | null>(null);
   const [dataSrc, setDataSrc] = useState<{ source: string; real: boolean; label: string } | null>(null);
 
-  async function load() {
+  // Un seul appel : positions + P&L latent déjà calculé côté serveur.
+  const refresh = useCallback(async () => {
+    setSnap(await api.positions());
+  }, []);
+
+  const auto = useAutoRefresh(refresh, REFRESH_MS);
+
+  const load = useCallback(async () => {
     try {
-      const [k, c, o] = await Promise.all([api.kycStatus(), api.brokers(), api.orders()]);
+      const [k, c] = await Promise.all([api.kycStatus(), api.brokers()]);
       setKyc(k.status);
       setConns(c);
-      setOrders(o);
+      await refresh();
     } catch (e: any) {
       setError(e.message);
     }
-  }
+  }, [refresh]);
+
   useEffect(() => {
     api.myPlan().then(setPlan).catch(() => {});
     api.sessions().then((d) => { setSessions(d.sessions); setUtcTime(d.utc_time); }).catch(() => {});
-    load();
-    // Rafraîchit régulièrement pour refléter les clôtures automatiques (moniteur de positions).
-    const id = setInterval(() => api.orders().then(setOrders).catch(() => {}), 45000);
-    return () => clearInterval(id);
-  }, []);
+    void load();
+  }, [load]);
 
   // Charge les symboles selon le marché et la session sélectionnés.
   useEffect(() => {
@@ -131,21 +141,7 @@ export default function ExecutionPage() {
     setError(null);
     try {
       await api.closeOrder(id);
-      load();
-    } catch (e: any) {
-      setError(e.message);
-    } finally {
-      setChecking(null);
-    }
-  }
-
-  async function verify(id: string) {
-    setChecking(id);
-    setError(null);
-    try {
-      const r = await api.checkOrder(id);
-      setChecks((prev) => ({ ...prev, [id]: r }));
-      if (r.outcome === 'won' || r.outcome === 'lost') load(); // clôture persistée
+      await refresh();
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -166,13 +162,14 @@ export default function ExecutionPage() {
     setSubmitting(true);
     setError(null);
     try {
-      await api.placeOrder(
+      const placed = await api.placeOrder(
         ticket.connId, symbol, ticket.side, q,
         stopLoss ? parseFloat(stopLoss) : null,
         takeProfit ? parseFloat(takeProfit) : null,
       );
+      setLastOrder(placed);   // récapitulatif de ce qui a été choisi
       setTicket(null);
-      load();
+      await refresh();
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -322,72 +319,150 @@ export default function ExecutionPage() {
         ))}
       </section>
 
+      {/* Récapitulatif du trade que je viens de lancer : tout ce que j'ai choisi. */}
+      {lastOrder && (
+        <section className="rounded-xl border border-buy/40 bg-buy/5 p-4">
+          <div className="flex items-start justify-between">
+            <h2 className="text-sm font-semibold text-white">
+              ✅ Trade lancé — voici exactement ce qui a été enregistré
+            </h2>
+            <button onClick={() => setLastOrder(null)} className="text-xs text-muted hover:text-white">✕</button>
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-x-6 gap-y-1 text-xs sm:grid-cols-3 lg:grid-cols-4">
+            <Recap label="Symbole" value={lastOrder.symbol} mono />
+            <Recap label="Sens" value={lastOrder.side === 'buy' ? 'ACHAT' : 'VENTE'}
+              tone={lastOrder.side === 'buy' ? 'buy' : 'sell'} />
+            <Recap label="Quantité" value={lastOrder.qty} mono />
+            <Recap label="Prix d'entrée" value={lastOrder.entry ?? lastOrder.filled_price ?? '—'} mono />
+            <Recap label="Stop loss" value={lastOrder.stop_loss ?? 'aucun'} tone="sell" mono />
+            <Recap label="Take profit" value={lastOrder.take_profit ?? 'aucun'} tone="buy" mono />
+            <Recap label="Risque / rendement" value={lastOrder.risk_reward != null ? `1 : ${lastOrder.risk_reward}` : '—'} />
+            <Recap label="Montant risqué" value={lastOrder.risk_amount ?? '—'} tone="sell" />
+            <Recap label="Gain visé" value={lastOrder.potential_profit ?? '—'} tone="buy" />
+            <Recap label="Mode" value={lastOrder.mode} />
+            <Recap label="Statut" value={lastOrder.status} />
+          </div>
+          <p className="mt-2 text-[11px] text-muted">
+            Le stop et l&apos;objectif sont enregistrés avec la position : elle sera clôturée
+            automatiquement dès que l&apos;un des deux est touché. Aucune action de ta part.
+          </p>
+        </section>
+      )}
+
       <section className="space-y-2">
-        <h2 className="text-lg font-semibold text-white">Ordres ({orders.length})</h2>
-        {orders.map((o) => {
-          const chk = checks[o.id];
-          const outcome = o.outcome ?? chk?.outcome;       // clôturé (persisté) ou dernière vérif
-          const hasLevels = o.stop_loss != null || o.take_profit != null;
-          const closed = outcome === 'won' || outcome === 'lost';
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h2 className="text-lg font-semibold text-white">
+            Positions ({snap?.open_count ?? 0} ouverte(s) · {snap?.closed_count ?? 0} clôturée(s))
+          </h2>
+          <span className="text-[11px] text-muted">
+            <span className={auto.refreshing ? 'text-accent' : ''}>🔄 Suivi automatique</span> · {refreshLabel(auto)}
+          </span>
+        </div>
+
+        {/* Bandeau P&L global, mis à jour tout seul. */}
+        {snap && (snap.open_count > 0 || snap.closed_count > 0) && (
+          <div className="flex flex-wrap gap-x-6 gap-y-1 rounded-lg border border-border bg-surface px-4 py-2 text-xs">
+            <span className="text-muted">
+              P&L latent (positions ouvertes) :{' '}
+              <span className={snap.unrealized_pnl >= 0 ? 'text-buy' : 'text-sell'}>
+                {snap.unrealized_pnl >= 0 ? '+' : ''}{snap.unrealized_pnl}
+              </span>
+            </span>
+            <span className="text-muted">
+              P&L réalisé :{' '}
+              <span className={snap.realized_pnl >= 0 ? 'text-buy' : 'text-sell'}>
+                {snap.realized_pnl >= 0 ? '+' : ''}{snap.realized_pnl}
+              </span>
+            </span>
+            <span className="text-muted">Gagnants : <span className="text-buy">{snap.wins}</span></span>
+            <span className="text-muted">Perdants : <span className="text-sell">{snap.losses}</span></span>
+            {snap.win_rate != null && (
+              <span className="text-muted">Taux de réussite : <span className="text-white">{snap.win_rate}%</span></span>
+            )}
+          </div>
+        )}
+
+        {snap?.positions.length === 0 && (
+          <p className="text-muted">Aucune position. Lance un trade ci-dessus ou depuis les trades du jour.</p>
+        )}
+
+        {snap?.positions.map((o) => {
+          const closed = o.closed;
+          const pnl = closed ? o.realized_pnl : o.unrealized_pnl;
+          const progress = Math.max(0, Math.min(100, o.progress_pct ?? 0));
           return (
             <div key={o.id} className="rounded-lg border border-border bg-surface p-3 text-sm">
               <div className="flex flex-wrap items-center gap-3">
                 <span className="font-mono text-white">{o.symbol}</span>
-                <span className={o.side === 'buy' ? 'text-buy' : 'text-sell'}>{o.side}</span>
-                <span className="text-muted">{o.qty} @ {o.filled_price ?? '—'}</span>
+                <span className={o.side === 'buy' ? 'text-buy' : 'text-sell'}>
+                  {o.side === 'buy' ? 'ACHAT' : 'VENTE'}
+                </span>
+                <span className="text-muted">{o.qty} @ {o.entry ?? o.filled_price ?? '—'}</span>
                 <span className="rounded bg-muted/20 px-2 py-0.5 text-xs text-muted">{o.mode}</span>
-                {outcome ? (
-                  <OutcomeBanner outcome={outcome} className="px-2 py-0.5" />
-                ) : (
-                  <span className="text-xs text-gray-400">{o.status}</span>
-                )}
+                {closed ? <OutcomeBanner outcome={o.outcome!} className="px-2 py-0.5" />
+                  : <span className="rounded bg-accent/15 px-2 py-0.5 text-xs text-accent">en cours</span>}
                 {o.copied_from && <span className="rounded bg-accent/20 px-2 py-0.5 text-xs text-accent">copié</span>}
+                {pnl != null && (
+                  <span className={`font-mono font-semibold ${pnl >= 0 ? 'text-buy' : 'text-sell'}`}>
+                    {pnl >= 0 ? '+' : ''}{pnl}
+                    {o.pnl_pct != null && !closed && <span className="ml-1 text-[11px]">({o.pnl_pct > 0 ? '+' : ''}{o.pnl_pct}%)</span>}
+                  </span>
+                )}
                 {!closed && (
-                  <div className="ml-auto flex gap-2">
-                    {hasLevels && (
-                      <button onClick={() => verify(o.id)} disabled={checking === o.id}
-                        className="rounded border border-accent/50 px-2 py-0.5 text-xs text-accent hover:bg-accent/10 disabled:opacity-50">
-                        {checking === o.id ? '…' : 'Vérifier'}
-                      </button>
-                    )}
-                    <button onClick={() => manualClose(o.id)} disabled={checking === o.id}
-                      className="rounded border border-sell/50 px-2 py-0.5 text-xs text-sell hover:bg-sell/10 disabled:opacity-50">
-                      {checking === o.id ? '…' : 'Clôturer'}
-                    </button>
-                  </div>
+                  <button onClick={() => manualClose(o.id)} disabled={checking === o.id}
+                    className="ml-auto rounded border border-sell/50 px-2 py-0.5 text-xs text-sell hover:bg-sell/10 disabled:opacity-50">
+                    {checking === o.id ? '…' : 'Clôturer maintenant'}
+                  </button>
                 )}
               </div>
-              {hasLevels && (
-                <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted">
-                  {o.stop_loss != null && <span>SL : <span className="text-sell">{o.stop_loss}</span></span>}
-                  {o.take_profit != null && <span>TP : <span className="text-buy">{o.take_profit}</span></span>}
-                  {o.risk_reward != null && <span>R/R : <span className="text-white">1 : {o.risk_reward}</span></span>}
-                  {o.risk_amount != null && <span>Risque : <span className="text-sell">{o.risk_amount}</span></span>}
-                  {o.potential_profit != null && <span>Gain potentiel : <span className="text-buy">{o.potential_profit}</span></span>}
+
+              {/* Ce qui a été choisi au lancement du trade. */}
+              <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted">
+                {o.stop_loss != null && <span>Stop : <span className="text-sell">{o.stop_loss}</span></span>}
+                {o.take_profit != null && <span>Objectif : <span className="text-buy">{o.take_profit}</span></span>}
+                {o.risk_reward != null && <span>R/R : <span className="text-white">1 : {o.risk_reward}</span></span>}
+                {o.risk_amount != null && <span>Risqué : <span className="text-sell">{o.risk_amount}</span></span>}
+                {o.potential_profit != null && <span>Gain visé : <span className="text-buy">{o.potential_profit}</span></span>}
+                {!closed && o.current_price != null && <span>Prix actuel : <span className="text-white">{o.current_price}</span></span>}
+                {!closed && o.r_multiple != null && <span>En multiples de risque : <span className="text-white">{o.r_multiple} R</span></span>}
+              </div>
+
+              {/* Progression vers l'objectif, sans aucun clic. */}
+              {!closed && o.progress_pct != null && (
+                <div className="mt-2">
+                  <div className="mb-0.5 flex justify-between text-[10px] text-muted">
+                    <span>Entrée</span>
+                    <span>{o.progress_pct}% du chemin vers l&apos;objectif</span>
+                    <span>Objectif</span>
+                  </div>
+                  <div className="h-1.5 w-full rounded bg-border">
+                    <div className={`h-1.5 rounded ${(o.progress_pct ?? 0) >= 0 ? 'bg-buy' : 'bg-sell'}`}
+                      style={{ width: `${progress}%` }} />
+                  </div>
                 </div>
               )}
-              {/* Résultat de la vérification */}
-              {closed && (o.realized_pnl ?? chk?.realized_pnl) != null && (
-                <p className="mt-1.5 text-xs">
-                  Sortie @ {o.exit_price ?? chk?.exit_price} · P&L réalisé :{' '}
-                  <span className={(o.realized_pnl ?? chk?.realized_pnl)! >= 0 ? 'text-buy' : 'text-sell'}>
-                    {(o.realized_pnl ?? chk?.realized_pnl)! >= 0 ? '+' : ''}{o.realized_pnl ?? chk?.realized_pnl}
-                  </span>
-                </p>
-              )}
-              {chk?.outcome === 'open' && (
+
+              {closed && o.exit_price != null && (
                 <p className="mt-1.5 text-xs text-muted">
-                  Trade encore ouvert · prix actuel {chk.current_price} · P&L latent :{' '}
-                  <span className={(chk.unrealized_pnl ?? 0) >= 0 ? 'text-buy' : 'text-sell'}>
-                    {(chk.unrealized_pnl ?? 0) >= 0 ? '+' : ''}{chk.unrealized_pnl}
-                  </span>
-                  {chk.note && <span className="ml-1">· {chk.note}</span>}
+                  Sortie @ <span className="text-white">{o.exit_price}</span>
+                  {o.closed_at && <> · le {new Date(o.closed_at).toLocaleString('fr-FR')}</>}
                 </p>
               )}
             </div>
           );
         })}
       </section>
+    </div>
+  );
+}
+
+function Recap({ label, value, tone = '', mono = false }:
+  { label: string; value: string | number; tone?: string; mono?: boolean }) {
+  const color = tone === 'buy' ? 'text-buy' : tone === 'sell' ? 'text-sell' : 'text-white';
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wide text-muted">{label}</div>
+      <div className={`${mono ? 'font-mono' : ''} ${color}`}>{value}</div>
     </div>
   );
 }

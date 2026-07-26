@@ -21,5 +21,10 @@ def _test_env():
     settings.edge_sweep_enabled = False      # pas de sweep de fond en test (testé séparément)
     settings.auto_trade_green_only = False   # les tests d'auto-trade n'exigent pas la carte de l'edge
     settings.block_synthetic_orders = False  # tests déterministes (pas de dépendance réseau)
+    # Le PLAYBOOK (stratégie du desk) est un gate à part entière : il exige 4 unités de temps
+    # réelles et refuse la plupart des setups synthétiques. Il est désactivé par défaut ici et
+    # testé spécifiquement dans tests/test_playbook.py (comme les autres gates : experts,
+    # blackout événementiel, sweep de l'edge).
+    settings.playbook_enabled = False
     reset_store()
     yield

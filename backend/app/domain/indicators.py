@@ -40,6 +40,23 @@ def sma(values: list[float], period: int) -> float | None:
     return sum(values[-period:]) / period
 
 
+def sma_series(values: list[float], period: int) -> list[float | None]:
+    """Série complète de la moyenne mobile simple (None avant amorçage).
+
+    Utilisée par le playbook : la stratégie raisonne sur la PENTE des MA20/MA50, pas seulement
+    sur leur dernière valeur.
+    """
+    if len(values) < period:
+        return []
+    out: list[float | None] = [None] * (period - 1)
+    running = sum(values[:period])
+    out.append(running / period)
+    for i in range(period, len(values)):
+        running += values[i] - values[i - period]
+        out.append(running / period)
+    return out
+
+
 def rsi(closes: list[float], period: int = 14) -> float | None:
     """Relative Strength Index (0-100). Méthode de Wilder."""
     if len(closes) < period + 1:
@@ -61,6 +78,36 @@ def rsi(closes: list[float], period: int = 14) -> float | None:
     return 100 - (100 / (1 + rs))
 
 
+def rsi_series(closes: list[float], period: int = 14) -> list[float | None]:
+    """RSI de Wilder sur TOUTE la série (aligné sur `closes`, None avant amorçage).
+
+    Nécessaire pour détecter les DIVERGENCES prix/RSI : il faut la valeur du RSI au moment de
+    chaque sommet/creux, pas seulement la dernière.
+    """
+    if len(closes) < period + 1:
+        return []
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+
+    def _val(ag: float, al: float) -> float:
+        if al == 0:
+            return 100.0
+        return 100 - (100 / (1 + ag / al))
+
+    out: list[float | None] = [None] * len(closes)
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    out[period] = _val(avg_gain, avg_loss)
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        out[i + 1] = _val(avg_gain, avg_loss)
+    return out
+
+
 def macd(
     closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9
 ) -> tuple[float, float, float] | None:
@@ -73,6 +120,20 @@ def macd(
     signal_line = ema(macd_line, signal)
     hist = macd_line[-1] - signal_line[-1]
     return macd_line[-1], signal_line[-1], hist
+
+
+def macd_series(
+    closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9
+) -> tuple[list[float], list[float], list[float]] | None:
+    """MACD sur toute la série -> (ligne, signal, histogramme). Base de la divergence MACD."""
+    if len(closes) < slow + signal:
+        return None
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    line = [f - s for f, s in zip(ema_fast, ema_slow, strict=True)]
+    sig = ema(line, signal)
+    hist = [ln - sg for ln, sg in zip(line, sig, strict=True)]
+    return line, sig, hist
 
 
 def bollinger(closes: list[float], period: int = 20, mult: float = 2.0) -> tuple[float, float, float] | None:
@@ -237,6 +298,107 @@ def vwap(candles: list[Candle]) -> float | None:
     if cum_vol == 0:
         return None
     return cum_pv / cum_vol
+
+
+def rolling_vwap(candles: list[Candle], period: int = 20) -> list[float | None]:
+    """VWAP glissant sur `period` bougies (série complète) -> permet d'en lire la TENDANCE.
+
+    Le VWAP « ancré » classique (cf. `vwap`) donne un niveau ; la stratégie demande la *tendance*
+    VWAP, donc il faut la série.
+    """
+    out: list[float | None] = []
+    for i in range(len(candles)):
+        window = candles[max(0, i - period + 1) : i + 1]
+        cum_vol = sum(c.volume for c in window)
+        if cum_vol <= 0:
+            out.append(None)
+            continue
+        cum_pv = sum(((c.high + c.low + c.close) / 3) * c.volume for c in window)
+        out.append(cum_pv / cum_vol)
+    return out
+
+
+def slope_pct(series: list[float | None], lookback: int = 5) -> float | None:
+    """Pente relative d'une série sur `lookback` points, en % de la valeur de départ.
+
+    Sert à qualifier « MA20 montante », « VWAP orienté à la hausse »… sans dépendre de l'échelle
+    du symbole (EUR/USD à 1,08 et BTC à 60 000 se comparent).
+    """
+    vals = [v for v in series if v is not None]
+    if len(vals) < lookback + 1:
+        return None
+    start, end = vals[-lookback - 1], vals[-1]
+    if not start:
+        return None
+    return (end - start) / abs(start) * 100
+
+
+def swing_points(candles: list[Candle], left: int = 2, right: int = 2) -> dict:
+    """Sommets et creux de swing (pivots fractals) -> structure de marché et niveaux majeurs.
+
+    Un sommet est confirmé si son `high` domine les `left` bougies précédentes et les `right`
+    suivantes (idem, inversé, pour les creux). Retourne {"highs": [(index, prix)], "lows": [...]}.
+    """
+    highs: list[tuple[int, float]] = []
+    lows: list[tuple[int, float]] = []
+    for i in range(left, len(candles) - right):
+        window = candles[i - left : i + right + 1]
+        if candles[i].high >= max(c.high for c in window):
+            highs.append((i, candles[i].high))
+        if candles[i].low <= min(c.low for c in window):
+            lows.append((i, candles[i].low))
+    return {"highs": highs, "lows": lows}
+
+
+def divergence(
+    candles: list[Candle], oscillator: list[float | None], lookback: int = 60,
+    left: int = 2, right: int = 2,
+) -> str | None:
+    """Divergence RÉGULIÈRE entre le prix et un oscillateur (RSI ou histogramme MACD).
+
+    - haussière : le prix fait un creux plus BAS, l'oscillateur un creux plus HAUT (vendeurs à bout).
+    - baissière : le prix fait un sommet plus HAUT, l'oscillateur un sommet plus BAS (acheteurs à bout).
+    Retourne la divergence la plus RÉCENTE, ou None.
+    """
+    if not oscillator or len(candles) < left + right + 10:
+        return None
+    start = max(0, len(candles) - lookback)
+    sw = swing_points(candles[start:], left, right)
+
+    def _osc(idx: int) -> float | None:
+        real = idx + start
+        return oscillator[real] if 0 <= real < len(oscillator) else None
+
+    found: list[tuple[int, str]] = []
+    lows = sw["lows"]
+    if len(lows) >= 2:
+        (i1, p1), (i2, p2) = lows[-2], lows[-1]
+        o1, o2 = _osc(i1), _osc(i2)
+        if o1 is not None and o2 is not None and p2 < p1 and o2 > o1:
+            found.append((i2, "haussière"))
+    highs = sw["highs"]
+    if len(highs) >= 2:
+        (i1, p1), (i2, p2) = highs[-2], highs[-1]
+        o1, o2 = _osc(i1), _osc(i2)
+        if o1 is not None and o2 is not None and p2 > p1 and o2 < o1:
+            found.append((i2, "baissière"))
+    if not found:
+        return None
+    return max(found, key=lambda f: f[0])[1]
+
+
+def relative_volume(candles: list[Candle], period: int = 20) -> float | None:
+    """Volume de la dernière bougie rapporté à la moyenne des `period` précédentes.
+
+    > 1 = participation supérieure à la normale (mouvement soutenu) ; < 1 = mouvement mou.
+    None si le marché n'a pas de volume centralisé (forex spot).
+    """
+    if len(candles) < period + 1:
+        return None
+    avg = sum(c.volume for c in candles[-period - 1 : -1]) / period
+    if avg <= 0:
+        return None
+    return candles[-1].volume / avg
 
 
 def acc_dist(candles: list[Candle]) -> list[float]:

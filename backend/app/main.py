@@ -92,6 +92,13 @@ async def lifespan(_app: FastAPI):
 
         alerts_task = asyncio.create_task(strategy_alerts_loop())
 
+    # Veille des sessions : ouverture Londres, ouverture New York et surtout leur chevauchement.
+    session_task = None
+    if get_settings().session_watch_enabled:
+        from app.services.scheduler import session_watch_loop
+
+        session_task = asyncio.create_task(session_watch_loop())
+
     edge_task = None
     if get_settings().edge_sweep_enabled:
         from app.services.scheduler import edge_sweep_loop
@@ -113,6 +120,8 @@ async def lifespan(_app: FastAPI):
         learning_task.cancel()
     if alerts_task:
         alerts_task.cancel()
+    if session_task:
+        session_task.cancel()
     if edge_task:
         edge_task.cancel()
     if get_settings().live_ingestion_enabled:

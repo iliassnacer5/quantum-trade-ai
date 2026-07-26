@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 
-from app.agents.base import AgentOutput
+from app.agents.base import AgentOutput, apply_playbook
 from app.data import cross_asset
 from app.domain import ta
 from app.domain.indicators import Candle
@@ -60,6 +60,9 @@ async def run(candles: list[Candle], symbol: str = "BTC/USDT", context: dict | N
             conf *= 0.7
             notes.append(f"BTC lead opposé ({btc:+.2f}) → confiance réduite")
             metrics["btc_lead"] = round(btc, 3)
+
+    # Cadre commun : la stratégie du desk (tendance de fond, niveaux majeurs, fenêtre de session).
+    score, conf = apply_playbook(score, conf, notes, metrics, context)
 
     score = max(-1.0, min(1.0, score))
     metrics["expert"] = True

@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 import { PageHeader, Button } from '@/components/ui';
+import { TopTrades } from '@/components/domain';
 
 const TIMEFRAMES = [
   { tf: '5m', label: 'Scalp 5m' },
@@ -56,6 +57,17 @@ export default function DailyPage() {
           </Button>
         }
       />
+
+      {/* Les 5 trades du jour produits par la STRATÉGIE (playbook multi-unités de temps). */}
+      <TopTrades />
+
+      <div className="border-t border-border pt-6">
+        <h2 className="text-lg font-semibold text-white">Scanner complémentaire par marché</h2>
+        <p className="text-xs text-muted">
+          Balayage large indépendant de la stratégie : utile pour repérer d&apos;autres marchés en
+          mouvement, mais la décision reste celle du playbook ci-dessus.
+        </p>
+      </div>
 
       {/* Sélecteur d'unité de temps : les TF longs (4h, 1d) filtrent le bruit -> plus fiables. */}
       <div className="flex flex-wrap items-center gap-2">

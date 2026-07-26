@@ -245,6 +245,150 @@ export type AgentStatus = {
   llm_enabled: boolean;
   providers: { anthropic: boolean; google: boolean };
   agents: AgentInfo[];
+  strategy?: {
+    name: string; enabled: boolean; veto: boolean; steps: string[];
+    min_risk_reward: number; min_target_pips: number; entry_timeframe: string; daily_trades: number;
+  };
+  session?: SessionContext;
+};
+
+/** Contexte de session : ouvertures Londres / New York et leur chevauchement. */
+export type SessionContext = {
+  utc_time: string;
+  active: string[];
+  active_labels: string[];
+  kill_zones: string[];
+  overlap: boolean;
+  quality: number;
+  prime: boolean;
+  label: string;
+  next_window?: { id: string; label: string; starts_in_minutes: number; window_utc: string } | null;
+};
+
+/** Un facteur d'analyse EXPLIQUÉ : sa valeur, sa lecture, son poids et sa contribution au score. */
+export type PlaybookFactor = {
+  key: string;
+  label: string;
+  value: string;
+  reading: string;
+  signal: number;          // vote interne du facteur, -1 à +1 (non affiché)
+  /** Score AFFICHÉ : +1..+5 = argument haussier, -1..-5 = argument baissier, 0 = ne tranche pas. */
+  score: number;
+  reliability: string;     // « fiable », « fragile »…
+  weight: number;
+  weight_pct: number;
+  contribution: number;
+  verdict: string;         // haussier | baissier | neutre | multiplicateur | contexte
+  explain: string;         // ce que MESURE l'indicateur (pédagogie)
+  multiplier?: number;
+};
+
+/** Une unité de temps analysée, avec la décomposition arithmétique de son score. */
+export type PlaybookLayer = {
+  label: string;
+  score: number;
+  bias: number;
+  score_5: number;         // fiabilité de l'unité de temps, -5 à +5
+  reliability: string;
+  strength: string;        // « biais net », « neutre »…
+  notes: string[];
+  metrics: Record<string, any>;
+  factors: PlaybookFactor[];
+  explanation: string;     // phrase qui explique d'où vient le score
+  breakdown: {
+    votes: { label: string; signal: number; weight_pct: number; contribution: number }[];
+    sum_of_votes: number;
+    divergence_adjustment: number;
+    volume_multiplier: number;
+    final: number;
+    bias_threshold: number;
+  };
+};
+
+/** Un setup produit par la stratégie du desk (playbook multi-unités de temps). */
+export type PlaybookTrade = {
+  symbol: string;
+  asset_class: string;
+  tier: 'ready' | 'armed';
+  direction: 'BUY' | 'SELL' | 'NO_TRADE';
+  entry: number | null;
+  stop_loss: number | null;
+  take_profit_1: number | null;
+  take_profit_2: number | null;
+  take_profit_3: number | null;
+  risk_pips: number;
+  reward_pips: number;
+  risk_reward: number;
+  pips_label: string;
+  trigger: string | null;
+  stop_basis: string;
+  horizon_days: number | null;
+  confidence: number;
+  strength: string;
+  ready: boolean;
+  context_ok: boolean;
+  summary: string;
+  reasons: string[];
+  trend_explanation: string;
+  /** Explication complète en français : pourquoi BUY / SELL / attente, argument par argument. */
+  narrative: string;
+  /** Score de fiabilité du trade : +1..+5 pour un achat, -1..-5 pour une vente, 0 = pas de trade. */
+  reliability_score: number;
+  reliability: string;
+  checklist: { step: number; label: string; pass: boolean; value: string; explain?: string }[];
+  levels: Record<string, any>;
+  layers: Record<string, PlaybookLayer>;
+};
+
+/** Une position papier telle qu'affichée : niveaux CHOISIS à l'ouverture + P&L live.
+ *  (Distinct de `Position`, qui décrit une ligne du portefeuille agrégé.) */
+export type PaperPosition = Order & {
+  closed: boolean;
+  current_price?: number;
+  unrealized_pnl?: number;
+  pnl_pct?: number;
+  progress_pct?: number;   // avancement vers l'objectif (100 % = TP touché)
+  r_multiple?: number;     // gain/perte exprimé en multiples du risque initial
+};
+
+export type PositionsSnapshot = {
+  positions: PaperPosition[];
+  open_count: number;
+  closed_count: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+  as_of: string;
+};
+
+/** Rapport d'ouverture des trades en compte démo (papier). */
+export type PaperExecutionReport = {
+  mode: string;
+  connection_id: string;
+  requested: number;
+  opened: {
+    order_id: string; symbol: string; side: string; qty: number; entry: number | null;
+    stop_loss: number; take_profit: number; risk_reward: number; target_pips: number;
+    stop_pips: number; pips_label: string; risk_amount: number | null;
+    potential_profit: number | null; trigger: string | null; horizon_days: number | null;
+  }[];
+  skipped: { symbol: string; reason: string }[];
+  armed_waiting: { symbol: string; direction: string; reason: string }[];
+  summary: string;
+};
+
+export type TopTrades = {
+  date?: string;
+  generated_at: string;
+  strategy: string;
+  session: SessionContext;
+  scanned: number;
+  ready: number;
+  requested: number;
+  picks: PlaybookTrade[];
+  note: string;
 };
 
 function token(): string | null {
@@ -329,6 +473,17 @@ export const api = {
     req<{ date: string; timeframe?: string; picks: any[]; generated_at: string }>(
       `/api/signals/daily-picks?timeframe=${timeframe}${refresh ? '&refresh=true' : ''}`,
     ),
+  /** Les trades du jour issus de la STRATÉGIE (mensuel+journalier → 4h → entrée 15 min). */
+  topTrades: (refresh = false, count = 5) =>
+    req<TopTrades>(`/api/signals/top-trades?count=${count}${refresh ? '&refresh=true' : ''}`),
+  /** Détail des 4 étapes de la stratégie pour un symbole. */
+  playbook: (symbol: string) =>
+    req<PlaybookTrade & { summary: string }>(`/api/signals/playbook/${symbol}`),
+  /** Ouvre les trades prêts du playbook en COMPTE DÉMO, avec leur SL/TP. */
+  executePlaybook: (count = 5) =>
+    req<PaperExecutionReport>(`/api/execution/playbook/execute?count=${count}`, { method: 'POST' }),
+  /** Positions + P&L latent calculé côté serveur (pour un rafraîchissement automatique). */
+  positions: () => req<PositionsSnapshot>('/api/execution/positions'),
   verifySignal: (s: Signal) =>
     req<{ verdict: string; passed: number; total: number; checks: { label: string; pass: boolean; value: any }[]; backtest: any }>(
       '/api/signals/verify',

@@ -2,6 +2,7 @@
 
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
+import { useAutoRefresh } from '@/lib/useAutoRefresh';
 import { Chart } from '@/components/Chart';
 import { SignalCard } from '@/components/SignalCard';
 import { motion } from 'framer-motion';
@@ -53,17 +54,22 @@ export default function DashboardPage() {
 
   useEffect(() => {
     api.heatmap(heatMix).then(setHeat).catch(() => {});
+    // `autoPanels` prend ensuite le relais pour maintenir la heatmap à jour.
   }, [heatMix]);
 
   const loadPanels = useCallback(async () => {
     try {
-      const [p, r] = await Promise.all([api.portfolio(), api.riskStatus()]);
+      const [p, r, h] = await Promise.all([api.portfolio(), api.riskStatus(), api.heatmap(heatMix)]);
       setPnl(p);
       setRisk(r);
+      setHeat(h);
     } catch {
       /* panels best-effort */
     }
-  }, []);
+  }, [heatMix]);
+
+  // Portefeuille, risque et variations 24 h rafraîchis TOUT SEULS (les prix bougent en continu).
+  const autoPanels = useAutoRefresh(loadPanels, 30_000);
 
   const load = useCallback(async () => {
     try {

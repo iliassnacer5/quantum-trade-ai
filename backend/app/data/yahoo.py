@@ -15,8 +15,9 @@ _CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; QuantumTradeAI/1.0)"}
 
 # Yahoo ne propose pas 4h : on rabat sur 1h (position trading reste pertinent).
-_INTERVAL = {"5m": "5m", "15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d"}
-_RANGE = {"5m": "5d", "15m": "1mo", "1h": "3mo", "4h": "3mo", "1d": "1y"}
+# "1M" = MENSUEL (étape 1 du playbook) — 10 ans d'historique pour des niveaux majeurs solides.
+_INTERVAL = {"5m": "5m", "15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d", "1w": "1wk", "1M": "1mo"}
+_RANGE = {"5m": "5d", "15m": "1mo", "1h": "3mo", "4h": "3mo", "1d": "2y", "1w": "5y", "1M": "10y"}
 
 
 # Métaux précieux -> futures COMEX Yahoo (réels, AVEC volume, sans clé).

@@ -10,7 +10,30 @@ def test_buy_levels_ordering():
     p = RiskParams(capital=10000, risk_per_trade_pct=1.0)
     out = compute_levels(Direction.BUY, entry=100.0, atr=2.0, p=p)
     assert out.stop_loss < 100 < out.take_profit_1 < out.take_profit_2 < out.take_profit_3
-    assert out.risk_reward >= 1.5  # tp1=2.5*atr, sl=1.5*atr -> R/R ≈ 1.67 (>= seuil checklist)
+    # tp1=1.875*atr, sl=1.5*atr -> R/R 1:1,25, au centre de la bande imposée (1,2 à 1,3).
+    assert out.risk_reward == 1.25
+
+
+def test_default_levels_land_inside_the_strategy_rr_band():
+    """Les niveaux par défaut (ATR) doivent TOUJOURS tomber dans la bande R/R du playbook."""
+    from app.core.config import get_settings
+
+    s = get_settings()
+    p = RiskParams(capital=10000)
+    for direction in (Direction.BUY, Direction.SELL):
+        out = compute_levels(direction, entry=100.0, atr=2.0, p=p)
+        assert s.playbook_min_rr <= out.risk_reward <= s.playbook_max_rr
+
+
+def test_compute_levels_from_prices_keeps_playbook_levels():
+    """Les niveaux décidés par le playbook sont conservés tels quels ; seule la taille est déduite."""
+    from app.domain.risk import compute_levels_from_prices
+
+    p = RiskParams(capital=10000, risk_per_trade_pct=1.0)
+    out = compute_levels_from_prices(Direction.BUY, 1.1000, 1.0980, (1.1100, 1.1150, 1.1200), p)
+    assert out.stop_loss == 1.098 and out.take_profit_1 == 1.11
+    assert out.risk_reward == 5.0            # 100 pips visés pour 20 pips risqués
+    assert round(out.position_size * 0.0020, 2) == 100.0  # 1 % de 10 000 risqué au stop
 
 
 def test_sell_levels_inverted():

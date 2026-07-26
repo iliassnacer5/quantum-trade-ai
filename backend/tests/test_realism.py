@@ -48,14 +48,18 @@ async def test_fees_reduce_pnl_and_report_has_benchmark():
 
 
 async def test_exit_config_staged_tp_partial_close():
-    """TP étagé : la moitié réalisée à +1,5R -> plus de trades enregistrés (partiels), P&L cohérent."""
+    """TP étagé : la moitié réalisée AVANT l'objectif -> plus de trades enregistrés (partiels).
+
+    Le palier partiel vaut 60 % du chemin vers le TP (plafonné à 1,5R), donc il reste atteignable
+    quel que soit le R/R visé — y compris dans la bande resserrée 1,2–1,3 de la stratégie.
+    """
     candles = _uptrend(300)
     strat = get_strategy("mtf_ema").fn
     plain = await run_backtest(_cfg(candles), candles, strategy=strat,
                                exit_config={"trailing": False, "breakeven_r": 0.0, "staged_tp": False})
     staged = await run_backtest(_cfg(candles), candles, strategy=strat,
                                 exit_config={"trailing": True, "trailing_mult": 3.0, "breakeven_r": 1.5, "staged_tp": True})
-    # En uptrend, le TP étagé génère des sorties partielles [TP partiel 1,5R].
+    # En uptrend, le TP étagé génère des sorties partielles [TP partiel …R].
     partials = [t for t in staged.trades if "[TP partiel" in (t.signal_rationale or "")]
     assert len(staged.trades) >= len(plain.trades)
     assert partials, "au moins une sortie partielle attendue en tendance haussière"

@@ -188,4 +188,12 @@ def test_agents_status_endpoint():
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "online"
-    assert len(data["agents"]) == 8
+    # 9 agents : les 8 historiques + le PLAYBOOK (stratégie du desk, avec droit de veto).
+    assert len(data["agents"]) == 9
+    names = [a["name"] for a in data["agents"]]
+    assert names[0] == "playbook"  # agent chef de file
+    assert data["strategy"]["min_risk_reward"] == 1.2
+    assert data["strategy"]["max_risk_reward"] == 1.3
+    assert data["strategy"]["min_target_pips"] == 200.0
+    assert data["strategy"]["entry_timeframe"] == "15m"
+    assert len(data["strategy"]["steps"]) == 4

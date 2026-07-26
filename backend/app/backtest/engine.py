@@ -153,12 +153,16 @@ async def _run_backtest_inner(
             in_profit_r = ((current_candle.high - entry_p) / R if is_buy
                            else (entry_p - current_candle.low) / R) if R > 0 else 0.0
 
-            # TP ÉTAGÉ (config c) : moitié de la position réalisée à +1,5R, le reste continue de
-            # courir (stop verrouillé à +0,3R) -> capture un gain sûr ET laisse courir le reste.
-            if staged_tp and R > 0 and not pos.get("half_closed") and in_profit_r >= 1.5:
-                half_price = entry_p + 1.5 * R if is_buy else entry_p - 1.5 * R
+            # TP ÉTAGÉ (config c) : moitié de la position réalisée AVANT l'objectif final, le reste
+            # continue de courir (stop verrouillé à +0,3R) -> capture un gain sûr ET laisse courir.
+            # Le palier est calculé à 60 % du chemin vers le TP (plafonné à 1,5R) : un palier fixe
+            # à 1,5R serait inatteignable dès que l'objectif est plus proche (R/R borné à 1,3).
+            target_r = (abs(pos["take_profit"] - entry_p) / R) if (pos.get("take_profit") and R > 0) else 0.0
+            partial_r = min(1.5, 0.6 * target_r) if target_r > 0 else 1.5
+            if staged_tp and R > 0 and not pos.get("half_closed") and in_profit_r >= partial_r:
+                half_price = entry_p + partial_r * R if is_buy else entry_p - partial_r * R
                 half = pos["size"] / 2
-                _realize(pos, half_price, i, half, note=" [TP partiel 1,5R]")
+                _realize(pos, half_price, i, half, note=f" [TP partiel {partial_r:.2f}R]")
                 pos["size"] -= half
                 pos["half_closed"] = True
                 lock = entry_p + 0.3 * R if is_buy else entry_p - 0.3 * R

@@ -15,6 +15,22 @@ export function SignalCard({ s }: { s: Signal }) {
   const badge = isBuy ? 'bg-buy-soft text-buy' : isSell ? 'bg-sell-soft text-sell' : 'bg-border text-muted';
   const tps = [s.take_profit_1, s.take_profit_2, s.take_profit_3].filter((t) => t != null) as number[];
   const m = s.metrics ?? {};
+  // Stratégie du desk : explication rédigée + note de fiabilité -5..+5 (aucun score technique brut).
+  const pb = (m.playbook ?? {}) as {
+    narrative?: string; reliability_score?: number; reliability?: string;
+    layers?: Record<string, { label: string; score_5: number; reliability: string; bias: number;
+      factors: { label: string; value: string; reading: string; score: number; weight_pct: number; reliability: string }[] }>;
+  };
+  const reliability = pb.reliability_score ?? 0;
+  // À défaut de narration (playbook indisponible), on nettoie la justification de ses chiffres
+  // d'arbitrage : la carte de prédiction ne montre que du texte compréhensible.
+  const explanation =
+    pb.narrative ??
+    (s.rationale ?? '')
+      .split('\n')
+      .filter((l) => !/score\s*[+-]?\d|consensus\s*\d|ADX\s*\d/i.test(l))
+      .join('\n')
+      .trim();
 
   const [verdict, setVerdict] = useState<Verdict | null>(null);
   const [verifying, setVerifying] = useState(false);
@@ -124,14 +140,19 @@ export function SignalCard({ s }: { s: Signal }) {
         <Field label="R/R" value={`1 : ${s.risk_reward}`} />
       </div>
 
-      <div className="mt-4">
-        <div className="mb-1 flex justify-between text-xs text-muted">
-          <span>Score de confiance{s.consensus_pct ? ` · consensus ${s.consensus_pct}%` : ''}</span>
-          <span className={s.confidence >= 70 ? 'text-buy' : s.confidence >= 45 ? 'text-white' : 'text-muted'}>{s.confidence}%</span>
+      {/* Fiabilité : une SEULE note lisible, de -5 à +5. Aucun score technique brut. */}
+      <div className="mt-4 rounded-lg border border-border bg-background/40 px-3 py-2">
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-muted">Fiabilité du trade</span>
+          <span className={`rounded px-2 py-0.5 text-sm font-bold ${
+            reliability > 0 ? 'bg-buy/15 text-buy' : reliability < 0 ? 'bg-sell/15 text-sell' : 'bg-border text-muted'
+          }`}>
+            {reliability > 0 ? `+${reliability}` : reliability}/5{pb.reliability ? ` · ${pb.reliability}` : ''}
+          </span>
         </div>
-        <div className="h-2 w-full rounded-full bg-border">
-          <div className={`h-2 rounded-full ${s.confidence >= 70 ? 'bg-buy' : 'bg-accent'}`} style={{ width: `${s.confidence}%` }} />
-        </div>
+        <p className="mt-1 text-[10px] text-muted">
+          De +1 à +5 pour un achat, de −1 à −5 pour une vente, 0 quand aucun trade n&apos;est justifié.
+        </p>
       </div>
 
       {s.risk_warning && (
@@ -221,20 +242,51 @@ export function SignalCard({ s }: { s: Signal }) {
         </div>
       )}
 
-      <details className="mt-4">
-        <summary className="cursor-pointer text-xs font-semibold text-white">Analyse détaillée (agents)</summary>
-        <p className="mt-2 whitespace-pre-line text-xs text-muted">{s.rationale}</p>
-        {s.agents && s.agents.length > 0 && (
-          <div className="mt-2 space-y-1">
-            {s.agents.map((a) => (
-              <div key={a.name} className="flex items-center gap-2 text-[11px]">
-                <span className="w-20 shrink-0 capitalize text-gray-400">{a.name}</span>
-                <span className={a.score > 0.1 ? 'text-buy' : a.score < -0.1 ? 'text-sell' : 'text-muted'}>{a.score >= 0 ? '+' : ''}{a.score.toFixed(2)}</span>
-              </div>
-            ))}
-          </div>
-        )}
+      {/* Pourquoi cette décision : explication rédigée, argument par argument. */}
+      <details className="mt-4" open>
+        <summary className="cursor-pointer text-xs font-semibold text-white">
+          Pourquoi {s.direction} ? — explication complète
+        </summary>
+        <p className="mt-2 whitespace-pre-line text-[11.5px] leading-relaxed text-gray-300">{explanation}</p>
       </details>
+
+      {/* Score de fiabilité de chaque indicateur, unité de temps par unité de temps. */}
+      {pb.layers && (
+        <details className="mt-3">
+          <summary className="cursor-pointer text-xs font-semibold text-white">
+            Score de fiabilité de chaque indicateur
+          </summary>
+          <p className="mt-1 text-[10px] text-muted">
+            +1 à +5 = argument d&apos;achat · −1 à −5 = argument de vente · 0 = ne tranche pas.
+          </p>
+          <div className="mt-2 space-y-2">
+            {(['monthly', 'daily', 'h4', 'm15'] as const).map((k) => {
+              const layer = pb.layers?.[k];
+              if (!layer) return null;
+              return (
+                <div key={k}>
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="font-semibold capitalize text-white/85">{layer.label}</span>
+                    <span className={layer.score_5 > 0 ? 'text-buy' : layer.score_5 < 0 ? 'text-sell' : 'text-muted'}>
+                      {layer.score_5 > 0 ? '+' : ''}{layer.score_5}/5 · {layer.reliability}
+                    </span>
+                  </div>
+                  <ul className="mt-0.5 space-y-0.5">
+                    {layer.factors.filter((f) => f.weight_pct > 0).map((f, i) => (
+                      <li key={i} className="flex items-start justify-between gap-2 text-[11px]">
+                        <span className="text-muted">{f.label} <span className="text-white/70">({f.value})</span></span>
+                        <span className={`shrink-0 font-semibold ${f.score > 0 ? 'text-buy' : f.score < 0 ? 'text-sell' : 'text-muted'}`}>
+                          {f.score > 0 ? '+' : ''}{f.score}/5
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      )}
 
       {s.id && (
         <a href={`/signal/${s.id}`}

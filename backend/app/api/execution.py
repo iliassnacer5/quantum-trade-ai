@@ -103,12 +103,56 @@ async def place_order(
     return order
 
 
+@router.post("/playbook/execute", status_code=status.HTTP_201_CREATED)
+async def execute_playbook(
+    count: int = 5,
+    user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """Ouvre EN COMPTE DÉMO les trades prêts du playbook, avec leur stop et leur objectif.
+
+    Toujours en mode **papier** (aucun argent réel, aucune clé broker requise) : la connexion démo
+    est créée automatiquement si elle n'existe pas. La taille de position découle du profil de
+    risque (% du capital risqué au stop) ; le stop et le TP1 sont ceux calculés par la stratégie.
+
+    Les garde-fous s'appliquent : nombre maximum de positions ouvertes, risque total plafonné,
+    refus si les données de marché ne sont pas réelles, pas de doublon sur un même symbole/sens.
+    Les setups « armés » (en attente du déclencheur 15 min) ne sont PAS ouverts et sont listés.
+    """
+    try:
+        report = await execution_service.execute_playbook_trades(
+            store, user.tenant_id, count=max(1, min(count, 10)),
+        )
+    except execution_service.ExecutionError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    audit.record(
+        "execution.playbook_executed", actor=user.email, tenant_id=user.tenant_id,
+        detail=f"{len(report['opened'])} ouverte(s), {len(report['skipped'])} ignorée(s)",
+    )
+    return report
+
+
 @router.get("/orders")
 async def orders(
     user: User = Depends(current_user),
     store: AppStore = Depends(store_dep),
 ) -> list[dict]:
     return execution_service.list_orders(store, user.tenant_id)
+
+
+@router.get("/positions")
+async def positions(
+    user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """Photo complète des positions, avec le P&L LATENT calculé — aucun clic requis.
+
+    Pensé pour un rafraîchissement automatique de la page Paper Trading : un seul appel renvoie,
+    pour chaque trade, les niveaux choisis à l'ouverture (entrée, stop, objectif, R/R, montant
+    risqué, gain visé) plus le prix actuel, le gain/perte latent, la progression vers l'objectif et
+    le multiple de R. Les positions clôturées portent leur P&L réalisé.
+    """
+    return await execution_service.positions_snapshot(store, user.tenant_id)
 
 
 @router.post("/orders/{order_id}/close")

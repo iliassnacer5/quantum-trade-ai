@@ -31,6 +31,117 @@ def _format_digest(picks: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def format_top_trades(payload: dict) -> str:
+    """Message des trades du jour issus de la STRATÉGIE (playbook) — format note de desk."""
+    picks = payload.get("picks") or []
+    sess = payload.get("session") or {}
+    head = f"🎯 Trades du jour — {payload.get('strategy', '')}\n🕒 {sess.get('label')} ({sess.get('utc_time')})"
+    if not picks:
+        return head + "\n\n" + payload.get("note", "Aucun setup conforme à la stratégie pour l'instant.")
+    lines = [head, ""]
+    for i, p in enumerate(picks, 1):
+        if p["tier"] == "ready":
+            lines.append(
+                f"{i}. ✅ {p['symbol']} {p['direction']} @ {p['entry']:g}\n"
+                f"   SL {p['stop_loss']:g} ({p['risk_pips']:g} {p['pips_label']}) · "
+                f"TP1 {p['take_profit_1']:g} ({p['reward_pips']:g}) · R/R 1:{p['risk_reward']:g}\n"
+                f"   Déclencheur 15 min : {p['trigger']}"
+            )
+        else:
+            lines.append(
+                f"{i}. 🟡 {p['symbol']} {p['direction']} — contexte validé (mensuel/journalier/4 h), "
+                f"en attente du déclencheur 15 min"
+            )
+    lines.append("")
+    lines.append(payload.get("note", ""))
+    lines.append("Aide à la décision, pas un conseil en investissement. Aucun trade n'est garanti gagnant.")
+    return "\n".join(lines)
+
+
+async def run_daily_top_trades(store, *, notify: bool = True) -> dict:  # noqa: ANN001
+    """Calcule les trades du jour selon la stratégie, les met en cache et notifie les abonnés."""
+    today = datetime.now(UTC).date().isoformat()
+    payload = await signal_service.daily_top_trades()
+    payload["date"] = today
+    store.records.put("top_trades", today, payload)
+    if notify:
+        await _broadcast(store, format_top_trades(payload), "Trades du jour 🎯")
+    logger.info(
+        "Trades du jour (playbook) : %d retenu(s) dont %d exécutable(s)",
+        len(payload.get("picks") or []), payload.get("ready", 0),
+    )
+    return payload
+
+
+async def _auto_execute_paper(store, payload: dict) -> str:  # noqa: ANN001
+    """Ouvre automatiquement les setups prêts en COMPTE DÉMO, pour les tenants qui l'ont activé.
+
+    L'activation est explicite : seuls les tenants ayant DÉJÀ connecté un broker papier sont
+    concernés (connecter le compte démo une fois = donner son accord). Aucun argent réel n'est
+    jamais engagé ici, et les garde-fous de portefeuille (positions max, risque total) s'appliquent.
+    """
+    from app.core.config import get_settings
+    from app.services import execution_service
+
+    if not get_settings().playbook_auto_paper_execute:
+        return ""
+    if not any(p.get("tier") == "ready" for p in (payload.get("picks") or [])):
+        return ""
+
+    lines: list[str] = []
+    try:
+        tenants = {u.tenant_id for u in store.users.list_all()}
+    except Exception:  # noqa: BLE001
+        return ""
+    for tid in tenants:
+        has_paper = any(
+            c.get("mode") == "paper" for c in execution_service.list_connections(store, tid)
+        )
+        if not has_paper:
+            continue  # pas d'opt-in : on ne touche pas au compte
+        try:
+            report = await execution_service.execute_playbook_trades(
+                store, tid, count=get_settings().daily_top_trades_count,
+                picks=payload.get("picks"),
+            )
+        except Exception as exc:  # noqa: BLE001 — un tenant en échec ne bloque pas les autres
+            logger.warning("Auto-exécution démo échouée pour %s (%s)", tid, exc)
+            continue
+        if report["opened"]:
+            logger.info("Auto-exécution démo (%s) : %s", tid, report["summary"])
+            for o in report["opened"]:
+                lines.append(
+                    f"📥 {o['symbol']} {o['side'].upper()} {o['qty']} @ {o['entry']} — "
+                    f"SL {o['stop_loss']} · TP {o['take_profit']} (R/R 1:{o['risk_reward']})"
+                )
+    if not lines:
+        return ""
+    return "🧪 Ouvert automatiquement en COMPTE DÉMO :\n" + "\n".join(lines)
+
+
+async def _broadcast(store, text: str, push_title: str) -> int:  # noqa: ANN001
+    """Envoie `text` à tous les utilisateurs abonnés au digest, via leurs canaux d'alerte."""
+    sent = 0
+    try:
+        users = store.users.list_all()
+    except Exception:  # noqa: BLE001
+        users = []
+    for user in users:
+        if not getattr(user, "daily_digest", False):
+            continue
+        try:
+            if user.alert_email and user.email:
+                await notifier.send_email(user.email, "Quantum Trade AI — Trades du jour", text)
+            if user.alert_telegram and user.telegram_chat_id:
+                await notifier.send_telegram(user.telegram_chat_id, text)
+            if user.push_token:
+                await notifier.send_push(user.push_token, push_title)
+            sent += 1
+        except Exception as exc:  # noqa: BLE001 — un échec ne doit pas bloquer les autres
+            logger.warning("Notification non envoyée à %s (%s)", user.email, exc)
+    return sent
+
+
 async def run_daily_digest(store) -> dict:  # noqa: ANN001
     """Calcule la sélection du jour, la met en cache et envoie le digest aux abonnés."""
     today = datetime.now(UTC).date().isoformat()
@@ -39,6 +150,12 @@ async def run_daily_digest(store) -> dict:  # noqa: ANN001
         "daily_picks", today, {"date": today, "picks": picks, "generated_at": datetime.now(UTC).isoformat()},
     )
     text = _format_digest(picks)
+    # Les trades du jour issus de la STRATÉGIE partent dans le même digest matinal.
+    try:
+        top = await run_daily_top_trades(store, notify=False)
+        text = format_top_trades(top) + "\n\n— — —\n" + text
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Trades du jour (playbook) indisponibles (%s)", exc)
     sent = 0
     try:
         users = store.users.list_all()
@@ -76,6 +193,57 @@ async def daily_loop() -> None:
             await run_daily_digest(get_store())
         except Exception as exc:  # noqa: BLE001
             logger.exception("Échec du digest quotidien (%s)", exc)
+
+
+async def session_watch_loop() -> None:
+    """VEILLE DES SESSIONS — le cœur du rythme quotidien demandé par la stratégie.
+
+    Surveille les fenêtres à forte valeur et recalcule les trades du jour dès qu'on y entre :
+    - ouverture de Londres (07:00–10:00 UTC),
+    - ouverture de New York (12:30–15:30 UTC),
+    - **chevauchement Londres / New York (12:00–16:00 UTC)** — la fenêtre la plus liquide, celle
+      que la stratégie demande de surveiller en priorité.
+
+    Une fenêtre ne déclenche qu'UNE alerte par jour (pas de spam), et le recalcul se poursuit à
+    l'intervalle configuré tant que la fenêtre est ouverte (le cache multi-UT absorbe le coût).
+    """
+    from app.data import sessions as sessions_mod
+    from app.repositories.store import get_store
+
+    fired: dict[str, str] = {}  # kill_zone -> date déjà notifiée
+    while True:
+        s = get_settings()
+        await asyncio.sleep(max(120, s.session_watch_interval))
+        if not s.session_watch_enabled:
+            continue
+        try:
+            ctx = sessions_mod.session_context()
+            today = datetime.now(UTC).date().isoformat()
+            fresh = [z for z in ctx["kill_zones"] if fired.get(z) != today]
+            if not fresh:
+                continue
+            store = get_store()
+            payload = await signal_service.daily_top_trades()
+            payload["date"] = today
+            payload["trigger_window"] = fresh
+            store.records.put("top_trades", today, payload)
+            zone_labels = {
+                "london_open": "🇬🇧 Ouverture de Londres",
+                "newyork_open": "🇺🇸 Ouverture de New York",
+                "overlap": "🔥 Chevauchement Londres / New York",
+            }
+            title = " + ".join(zone_labels.get(z, z) for z in fresh)
+            body = format_top_trades(payload)
+            # Exécution automatique en compte DÉMO des setups prêts (avec leur SL/TP).
+            exec_report = await _auto_execute_paper(store, payload)
+            if exec_report:
+                body += "\n\n" + exec_report
+            await _broadcast(store, f"{title}\n\n" + body, f"{title} — trades du jour")
+            for z in fresh:
+                fired[z] = today
+            logger.info("Veille session : %s -> %d setup(s)", title, len(payload.get("picks") or []))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Échec de la veille des sessions (%s)", exc)
 
 
 async def learning_loop() -> None:

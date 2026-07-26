@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import UTC, datetime
 
 from app.core import crypto
 from app.execution.alpaca import AlpacaBroker
@@ -306,6 +307,203 @@ async def close_order_manual(store: AppStore, tenant_id: str, order_id: str) -> 
     from app.core import metrics
     metrics.inc("paper_orders_closed_total", outcome=outcome)
     return store.records.put(ORDER, order_id, updated, tenant_id=tenant_id)
+
+
+# ---------------- Exécution DÉMO des trades du playbook ----------------
+_RISK_PCT = {"conservative": 0.5, "moderate": 1.0, "aggressive": 2.0}
+
+
+def ensure_paper_connection(store: AppStore, tenant_id: str) -> str:
+    """Retourne l'id d'une connexion PAPIER, en la créant au besoin (compte démo sans risque)."""
+    existing = next(
+        (c for c in list_connections(store, tenant_id) if c.get("mode") == "paper"), None
+    )
+    if existing:
+        return existing["id"]
+    return connect_broker(
+        store, tenant_id, broker="paper", api_key="", api_secret="", mode="paper"
+    )["id"]
+
+
+async def _reference_price(symbol: str) -> float | None:
+    """Dernier prix connu, à la MÊME source que celle du broker papier (cohérence du fill)."""
+    from app.data import markets
+
+    try:
+        candles = await markets.load_candles(symbol, interval="1h", limit=60)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Prix de référence %s indisponible (%s)", symbol, exc)
+        return None
+    return candles[-1].close if candles else None
+
+
+def _already_open(store: AppStore, tenant_id: str, symbol: str, side: str) -> bool:
+    """Évite d'empiler deux fois le même trade (relances successives de la veille de session)."""
+    return any(
+        o.get("mode") == "paper" and o.get("symbol") == symbol and o.get("side") == side
+        and o.get("outcome") not in ("won", "lost")
+        for o in store.records.list(ORDER, tenant_id)
+    )
+
+
+async def execute_playbook_trades(
+    store: AppStore, tenant_id: str, *, count: int = 5, picks: list[dict] | None = None,
+) -> dict:
+    """Ouvre en COMPTE DÉMO (papier) les setups PRÊTS du playbook, avec leur stop et leur TP1.
+
+    - la taille de position vient du profil de risque de l'utilisateur (% du capital risqué au stop) ;
+    - le stop et l'objectif sont ceux calculés par la stratégie (jamais recalculés ici) ;
+    - les garde-fous habituels s'appliquent (nb max de positions, risque total, données réelles) ;
+    - un même symbole/sens déjà ouvert n'est pas repris.
+
+    Retourne un rapport ligne par ligne : ce qui a été ouvert, et pourquoi le reste ne l'a pas été.
+    """
+    from app.services import playbook_service
+
+    if picks is None:
+        payload = await playbook_service.top_trades(count)
+        picks = payload.get("picks") or []
+        session = payload.get("session")
+        note = payload.get("note")
+    else:
+        session, note = None, None
+
+    ready = [p for p in picks if p.get("tier") == "ready" and p.get("entry")][:count]
+    users = store.users.list_by_tenant(tenant_id)
+    if not users:
+        raise ExecutionError("aucun utilisateur pour ce tenant")
+    user = users[0]
+    capital = user.capital or 0.0
+    risk_pct = _RISK_PCT.get(getattr(user, "risk_profile", "moderate"), 1.0)
+    risk_amount = capital * risk_pct / 100
+
+    conn_id = ensure_paper_connection(store, tenant_id)
+    opened: list[dict] = []
+    skipped: list[dict] = []
+
+    for p in ready:
+        symbol, direction = p["symbol"], p["direction"]
+        side = "buy" if direction == "BUY" else "sell"
+        entry, sl, tp = p["entry"], p["stop_loss"], p["take_profit_1"]
+        if not (entry and sl and tp):
+            skipped.append({"symbol": symbol, "reason": "niveaux incomplets"})
+            continue
+        if _already_open(store, tenant_id, symbol, side):
+            skipped.append({"symbol": symbol, "reason": "position identique déjà ouverte"})
+            continue
+        # Prix de référence = celui auquel le broker papier remplira réellement. On dimensionne
+        # dessus pour que le montant risqué au stop vaille EXACTEMENT le % voulu du capital.
+        fill = await _reference_price(symbol) or entry
+        # Le prix a-t-il déjà invalidé le plan pendant le calcul ? (stop franchi ou objectif atteint)
+        if (side == "buy" and (fill <= sl or fill >= tp)) or (side == "sell" and (fill >= sl or fill <= tp)):
+            skipped.append({
+                "symbol": symbol,
+                "reason": f"prix ({fill:.6g}) déjà sorti de la zone d'entrée (SL {sl:.6g} / TP {tp:.6g})",
+            })
+            continue
+        stop_dist = abs(fill - sl)
+        if stop_dist <= 0:
+            skipped.append({"symbol": symbol, "reason": "distance au stop nulle"})
+            continue
+        qty = round(risk_amount / stop_dist, 8)
+        if qty <= 0:
+            skipped.append({"symbol": symbol, "reason": "capital insuffisant pour dimensionner"})
+            continue
+        try:
+            order = await place_order(
+                store, tenant_id, conn_id=conn_id, symbol=symbol, side=side, qty=qty,
+                stop_loss=sl, take_profit=tp,
+            )
+        except ExecutionError as exc:
+            skipped.append({"symbol": symbol, "reason": str(exc)})
+            continue
+        opened.append({
+            "order_id": order["id"], "symbol": symbol, "side": side, "qty": qty,
+            "entry": order.get("filled_price"), "stop_loss": sl, "take_profit": tp,
+            "risk_reward": p.get("risk_reward"), "target_pips": p.get("reward_pips"),
+            "stop_pips": p.get("risk_pips"), "pips_label": p.get("pips_label"),
+            "risk_amount": order.get("risk_amount"), "potential_profit": order.get("potential_profit"),
+            "trigger": p.get("trigger"), "horizon_days": p.get("horizon_days"),
+        })
+
+    armed = [p for p in picks if p.get("tier") == "armed"]
+    return {
+        "mode": "paper",
+        "connection_id": conn_id,
+        "requested": count,
+        "opened": opened,
+        "skipped": skipped,
+        "armed_waiting": [{"symbol": p["symbol"], "direction": p["direction"],
+                           "reason": (p.get("reasons") or ["déclencheur 15 min non formé"])[0]}
+                          for p in armed],
+        "session": session,
+        "note": note,
+        "summary": (
+            f"{len(opened)} position(s) ouverte(s) en démo sur {len(ready)} setup(s) exécutable(s) ; "
+            f"{len(armed)} en attente du déclencheur 15 min."
+        ),
+    }
+
+
+async def positions_snapshot(store: AppStore, tenant_id: str, limit: int = 100) -> dict:
+    """Photo COMPLÈTE des positions, prête à afficher — sans aucun clic de vérification.
+
+    Pour chaque ordre : les niveaux CHOISIS à l'ouverture (entrée, stop, objectif, R/R, montant
+    risqué, gain visé), puis, pour les positions encore ouvertes, le prix actuel, le P&L latent et
+    la progression vers l'objectif. Les positions clôturées portent leur P&L réalisé.
+
+    Un seul appel réseau côté interface -> la page peut se rafraîchir toute seule.
+    """
+    orders = list_orders(store, tenant_id, limit)
+    prices: dict[str, float | None] = {}
+    out: list[dict] = []
+    open_pnl = realized_pnl = 0.0
+    wins = losses = 0
+
+    for rec in orders:
+        row = dict(rec)
+        entry = rec.get("entry") if rec.get("entry") is not None else rec.get("filled_price")
+        sl, tp = rec.get("stop_loss"), rec.get("take_profit")
+        side, qty = rec.get("side"), rec.get("qty") or 0.0
+        closed = rec.get("outcome") in {"won", "lost"}
+        row["closed"] = closed
+        if closed:
+            realized_pnl += float(rec.get("realized_pnl") or 0.0)
+            wins += 1 if rec.get("outcome") == "won" else 0
+            losses += 1 if rec.get("outcome") == "lost" else 0
+            out.append(row)
+            continue
+
+        symbol = rec.get("symbol", "")
+        if symbol not in prices:
+            prices[symbol] = await _reference_price(symbol)
+        price = prices[symbol]
+        if price and entry:
+            pnl = (price - entry) * qty if side == "buy" else (entry - price) * qty
+            row["current_price"] = round(price, 8)
+            row["unrealized_pnl"] = round(pnl, 2)
+            row["pnl_pct"] = round((price / entry - 1) * 100 * (1 if side == "buy" else -1), 3)
+            open_pnl += pnl
+            # Progression vers l'objectif (0 % à l'entrée, 100 % sur le TP, négatif vers le stop).
+            if tp is not None and abs(tp - entry) > 0:
+                row["progress_pct"] = round((price - entry) / (tp - entry) * 100, 1)
+            if sl is not None and abs(entry - sl) > 0:
+                row["r_multiple"] = round((price - entry) / (entry - sl), 2) if side == "buy" \
+                    else round((entry - price) / (sl - entry), 2)
+        row["outcome"] = "open"
+        out.append(row)
+
+    return {
+        "positions": out,
+        "open_count": sum(1 for o in out if not o["closed"]),
+        "closed_count": sum(1 for o in out if o["closed"]),
+        "unrealized_pnl": round(open_pnl, 2),
+        "realized_pnl": round(realized_pnl, 2),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else None,
+        "as_of": datetime.now(UTC).isoformat(),
+    }
 
 
 async def monitor_positions(store: AppStore) -> int:

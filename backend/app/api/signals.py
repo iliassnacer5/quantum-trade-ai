@@ -90,6 +90,58 @@ async def daily_picks(
     )
 
 
+@router.get("/top-trades")
+async def top_trades(
+    refresh: bool = False,
+    count: int = 5,
+    user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """LES trades du jour, produits par la STRATÉGIE du desk (playbook multi-unités de temps).
+
+    Cascade : Mensuel + Journalier (tendance de fond + supports/résistances majeurs) → Journalier
+    détaillé (RSI14, MA20/MA50, volume, tendance VWAP, divergences RSI/MACD, Fibonacci en cas de
+    correction) → 4 h (mêmes facteurs) → **entrée en 15 min uniquement**, avec R/R ≥ 1:2 et
+    objectif ≥ 100 pips. L'univers privilégie le chevauchement Londres / New York.
+
+    Chaque setup est étiqueté `ready` (déclencheur 15 min actif, exécutable) ou `armed` (contexte
+    validé, en attente du déclencheur). Recalculé automatiquement à chaque ouverture de session.
+    """
+    from datetime import UTC, datetime
+
+    from app.data import sessions as sessions_mod
+
+    today = datetime.now(UTC).date().isoformat()
+    cached = store.records.get("top_trades", today)
+    # Le cache n'est valable que TANT QU'ON EST DANS LA MÊME FENÊTRE de session : à l'ouverture de
+    # Londres ou de New York, le marché change de visage -> on recalcule.
+    if cached and not refresh:
+        now_zones = sessions_mod.session_context()["kill_zones"]
+        if ((cached.get("session") or {}).get("kill_zones") or []) == now_zones:
+            return cached
+    payload = await signal_service.daily_top_trades(max(1, min(count, 10)))
+    payload["date"] = today
+    return store.records.put("top_trades", today, payload)
+
+
+@router.get("/playbook/{symbol:path}")
+async def playbook_for_symbol(
+    symbol: str,
+    _user: User = Depends(current_user),
+) -> dict:
+    """Applique la stratégie complète à UN symbole et renvoie le détail des 4 étapes.
+
+    Retourne la checklist (chaque étape réussie/échouée avec sa valeur), les couches d'analyse
+    mensuelle/journalière/4 h/15 min, les niveaux majeurs, la fenêtre de session, et — si tout est
+    réuni — l'entrée, le stop, les objectifs, le R/R et le nombre de pips visés.
+    """
+    from app.data import symbols as symbols_catalog
+    from app.services import playbook_service
+
+    setup = await playbook_service.build_setup(symbols_catalog.normalize(symbol))
+    return {**setup.as_dict(), "summary": setup.summary()}
+
+
 @router.post("/verify")
 async def verify(
     body: VerifyRequest,

@@ -17,9 +17,10 @@ class RiskParams:
     capital: float
     risk_per_trade_pct: float = 1.0  # % du capital risqué par trade
     atr_sl_mult: float = 1.5  # SL = entrée -/+ atr_sl_mult * ATR
-    # TP1 plus éloigné que le SL -> R/R sain (TP1 = 2.5*ATR / SL = 1.5*ATR ≈ 1:1.67).
-    # Un bon trade coupe vite les pertes et laisse courir les gains (R/R >= 1.5).
-    atr_tp_mults: tuple[float, float, float] = (2.5, 4.0, 6.0)  # TP1/2/3
+    # TP1 = 1.875*ATR pour un SL de 1.5*ATR -> R/R 1:1.25, au centre de la bande imposée par la
+    # stratégie du desk (1,2 à 1,3 — cf. domain/playbook.py). TP2 et TP3 servent de sorties
+    # échelonnées pour laisser courir une fraction de la position.
+    atr_tp_mults: tuple[float, float, float] = (1.875, 2.7, 3.6)  # TP1/2/3
 
 
 @dataclass
@@ -66,6 +67,38 @@ def compute_levels(direction: Direction, entry: float, atr: float, p: RiskParams
         risk_reward=risk_reward,
         position_size=round(position_size, 8),
         position_value=round(position_value, 2),
+        risk_amount=round(risk_amount, 2),
+    )
+
+
+def compute_levels_from_prices(
+    direction: Direction,
+    entry: float,
+    stop_loss: float,
+    take_profits: tuple[float, float, float],
+    p: RiskParams,
+) -> RiskOutput:
+    """Dimensionne une position sur des niveaux DÉJÀ décidés (stop technique du playbook).
+
+    Le playbook place le stop derrière la structure 15 min et l'objectif à max(2×risque, 100 pips) :
+    ces niveaux ont un sens de marché, on ne les remplace pas par un multiple d'ATR. Ici on se
+    contente d'en déduire le R/R et la taille de position.
+    """
+    sl_dist = abs(entry - stop_loss)
+    if sl_dist <= 0:
+        raise ValueError("La distance au stop doit être strictement positive")
+    tp1, tp2, tp3 = take_profits
+    risk_reward = round(abs(tp1 - entry) / sl_dist, 2)
+    risk_amount = p.capital * (p.risk_per_trade_pct / 100)
+    position_size = risk_amount / sl_dist
+    return RiskOutput(
+        stop_loss=round(stop_loss, 8),
+        take_profit_1=round(tp1, 8),
+        take_profit_2=round(tp2, 8),
+        take_profit_3=round(tp3, 8),
+        risk_reward=risk_reward,
+        position_size=round(position_size, 8),
+        position_value=round(position_size * entry, 2),
         risk_amount=round(risk_amount, 2),
     )
 

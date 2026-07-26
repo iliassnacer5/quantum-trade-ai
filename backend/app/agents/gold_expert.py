@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 
-from app.agents.base import AgentOutput
+from app.agents.base import AgentOutput, apply_playbook
 from app.data import cross_asset
 from app.domain import ta
 from app.domain.indicators import Candle
@@ -87,6 +87,9 @@ async def run(candles: list[Candle], symbol: str = "XAU/USD", context: dict | No
     _, round_note = _round_level_bias(price)
     if round_note:
         notes.append(round_note)
+
+    # Cadre commun : la stratégie du desk (tendance de fond, niveaux majeurs, fenêtre de session).
+    score, conf = apply_playbook(score, conf, notes, metrics, context)
 
     score = max(-1.0, min(1.0, score))
     metrics["expert"] = True

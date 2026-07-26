@@ -197,6 +197,56 @@ def analyze(candles: list[Candle]) -> dict:
             signals.append(bias)
             notes.append(f"Prix dans la zone d'or Fibonacci (50-61.8%) du swing {fib['swing']}")
 
+    # --- FACTEURS DE LA STRATÉGIE DU DESK (playbook) ---------------------------------------
+    # MA20 / MA50 SIMPLES, divergences RSI & MACD, tendance VWAP, volume relatif : la stratégie
+    # les exige à chaque unité de temps. Comme tous les agents experts passent par `ta.analyze`,
+    # ils héritent automatiquement de ces facteurs.
+    ma20 = ind.sma(closes, 20)
+    ma50 = ind.sma(closes, 50)
+    if ma20 is not None:
+        metrics["ma20"] = round(ma20, 6)
+    if ma20 is not None and ma50 is not None:
+        metrics["ma50"] = round(ma50, 6)
+        if price > ma20 > ma50:
+            signals.append(0.35)
+            notes.append(f"Prix > MA20 ({ma20:.4g}) > MA50 ({ma50:.4g}) : empilement haussier")
+        elif price < ma20 < ma50:
+            signals.append(-0.35)
+            notes.append(f"Prix < MA20 ({ma20:.4g}) < MA50 ({ma50:.4g}) : empilement baissier")
+        else:
+            notes.append(f"MA20 ({ma20:.4g}) et MA50 ({ma50:.4g}) entremêlées : pas d'empilement net")
+
+    rsi_series = ind.rsi_series(closes, 14)
+    macd_all = ind.macd_series(closes)
+    rsi_div = ind.divergence(candles, rsi_series) if rsi_series else None
+    macd_div = ind.divergence(candles, macd_all[2]) if macd_all else None
+    metrics["rsi_divergence"] = rsi_div
+    metrics["macd_divergence"] = macd_div
+    for label, div in (("RSI", rsi_div), ("MACD", macd_div)):
+        if div:
+            signals.append(0.3 if div == "haussière" else -0.3)
+            notes.append(f"Divergence {div} {label} (essoufflement du mouvement en cours)")
+
+    vwap_slope = ind.slope_pct(ind.rolling_vwap(candles, 20), 5)
+    if vwap_slope is not None:
+        metrics["vwap_slope_pct"] = round(vwap_slope, 3)
+        if vwap_slope > 0.01:
+            signals.append(0.2)
+            notes.append("Tendance VWAP haussière")
+        elif vwap_slope < -0.01:
+            signals.append(-0.2)
+            notes.append("Tendance VWAP baissière")
+        else:
+            notes.append("Tendance VWAP plate")
+
+    rel_vol = ind.relative_volume(candles, 20)
+    if rel_vol is not None:
+        metrics["relative_volume"] = round(rel_vol, 2)
+        notes.append(
+            f"Volume {rel_vol:.1f}× la moyenne 20 "
+            f"({'participation soutenue' if rel_vol >= 1.2 else 'participation faible' if rel_vol < 0.8 else 'normale'})"
+        )
+
     # --- Position vs plus haut / plus bas 52 périodes (contexte long terme) ---
     if len(candles) >= 52:
         w52 = candles[-52:]

@@ -13,7 +13,8 @@ from app.agents.base import AgentOutput
 from app.agents.sentiment import NewsItem
 from app.domain import indicators as ind
 from app.domain.indicators import Candle
-from app.domain.risk import RiskParams, compute_levels
+from app.domain.playbook import PlaybookSetup
+from app.domain.risk import RiskParams, compute_levels, compute_levels_from_prices
 from app.models.signal import Direction, SignalCard, Timeframe
 
 
@@ -28,6 +29,11 @@ def _breakdown(outputs: list[AgentOutput]) -> list[dict]:
         d = dict(getattr(o, "details", None) or {})
         if o.name == "technical":
             d = {k: d[k] for k in ("funding_rate", "btc_lead", "spx_regime", "gap_pct", "dxy", "expert") if k in d}
+        elif o.name == "playbook":
+            # La version complète (couches + checklist) est déjà dans card.metrics["playbook"].
+            d = {k: d[k] for k in ("direction", "ready", "veto", "context_ok", "risk_reward",
+                                   "reward_pips", "risk_pips", "pips_label", "trigger", "reasons",
+                                   "insufficient", "expert") if k in d}
         out.append({"name": o.name, "score": o.score, "confidence": o.confidence,
                     "rationale": o.rationale, "details": d})
     return out
@@ -46,8 +52,14 @@ async def generate_signal(
     macro_data: dict | None = None,
     risk_context: dict | None = None,
     journal_multipliers: dict[str, float] | None = None,
+    playbook_setup: PlaybookSetup | None = None,
 ) -> SignalCard:
-    """Produit une Signal Card à partir des données de marché, sentiment, fondamentaux et macro."""
+    """Produit une Signal Card à partir des données de marché, sentiment, fondamentaux et macro.
+
+    `playbook_setup` : résultat de la stratégie du desk (mensuel+journalier -> 4h -> entrée 15 min).
+    S'il est fourni, il pilote la décision (droit de veto) et fournit les niveaux d'entrée/SL/TP.
+    Sinon il est calculé automatiquement à partir du symbole quand la stratégie est activée.
+    """
     news = news or []
     # Sans Fear & Greed externe, on dérive un indice de marché (momentum/volatilité) pour que
     # l'agent sentiment contribue au lieu de rester muet ("pas de news").
@@ -55,12 +67,39 @@ async def generate_signal(
         from app.domain import ta as _ta
         fear_greed = _ta.fear_greed_proxy(candles)
 
+    # 0. PLAYBOOK — la stratégie du desk s'exécute EN PREMIER : son verdict (et ses niveaux)
+    # cadrent tout le reste. Les autres agents reçoivent son contexte pour analyser dans le
+    # même cadre professionnel (biais de fond, niveaux majeurs, fenêtre de session).
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    pb_output: AgentOutput | None = None
+    if settings.playbook_enabled:
+        try:
+            if playbook_setup is None:
+                from app.services import playbook_service
+
+                playbook_setup = await playbook_service.build_setup(asset)
+            from app.agents import playbook as playbook_agent
+
+            pb_output = await playbook_agent.run(playbook_setup)
+        except Exception as exc:  # noqa: BLE001 — jamais bloquant : on retombe sur les autres agents
+            import logging
+
+            logging.getLogger(__name__).warning("Playbook indisponible pour %s (%s)", asset, exc)
+            playbook_setup = None
+
     # 1. Agents — l'agent technique est routé vers l'expert du marché (contexte = classe d'actif).
     from app.data.markets import asset_class as _asset_class
     _ctx = {"market_type": _asset_class(asset), "symbol": asset}
-    outputs: list[AgentOutput] = [
+    if playbook_setup is not None:
+        _ctx["playbook"] = playbook_setup.as_dict()
+    outputs: list[AgentOutput] = []
+    if pb_output is not None:
+        outputs.append(pb_output)
+    outputs += [
         await technical.run(candles, symbol=asset, context=_ctx),
-        await volume.run(candles),
+        await volume.run(candles, _ctx),
         await sentiment.run(news, fear_greed),
         await pattern.run(candles),
     ]
@@ -82,9 +121,10 @@ async def generate_signal(
         )
         outputs.append(risk_out)
 
-    # 2. Arbitrage Master (pondération dynamique + apprentissage)
+    # 2. Arbitrage Master (pondération dynamique + apprentissage + autorité du playbook)
     decision = master.decide(
-        outputs, weights=weights, journal_multipliers=journal_multipliers, risk_output=risk_out
+        outputs, weights=weights, journal_multipliers=journal_multipliers, risk_output=risk_out,
+        playbook_gate=settings.playbook_veto,
     )
 
     entry = candles[-1].close
@@ -99,7 +139,13 @@ async def generate_signal(
         "consensus": decision.consensus,
         "conflict": decision.conflict,
         "weights_used": decision.weights_used,  # poids effectif de chaque agent dans la décision
+        "playbook_veto": decision.playbook_veto,
     }
+    # La stratégie complète (4 étapes + checklist + niveaux majeurs + session) est exposée telle
+    # quelle : le trader peut relire chaque étape de la décision.
+    if playbook_setup is not None:
+        metrics["playbook"] = playbook_setup.as_dict()
+        metrics["session"] = playbook_setup.session
 
     if decision.direction == Direction.HOLD:
         return SignalCard(
@@ -117,7 +163,29 @@ async def generate_signal(
             consensus_pct=decision.consensus,
         )
 
-    levels = compute_levels(decision.direction, entry, atr_val, risk)
+    # Niveaux : ceux du PLAYBOOK en priorité (stop derrière la structure 15 min, objectif
+    # max(2×risque, 100 pips)) — ils ont un sens de marché, contrairement à un multiple d'ATR seul.
+    use_pb = (
+        playbook_setup is not None
+        and playbook_setup.ready
+        and playbook_setup.direction == decision.direction.value
+        and playbook_setup.entry is not None
+    )
+    if use_pb:
+        entry = playbook_setup.entry
+        levels = compute_levels_from_prices(
+            decision.direction, entry, playbook_setup.stop_loss,
+            (playbook_setup.take_profit_1, playbook_setup.take_profit_2, playbook_setup.take_profit_3),
+            risk,
+        )
+        metrics["levels_source"] = "playbook"
+        metrics["target_pips"] = round(playbook_setup.reward_pips, 1)
+        metrics["stop_pips"] = round(playbook_setup.risk_pips, 1)
+        metrics["pips_label"] = playbook_setup.pips_label
+    else:
+        levels = compute_levels(decision.direction, entry, atr_val, risk)
+        metrics["levels_source"] = "atr"
+
     return SignalCard(
         asset=asset,
         direction=decision.direction,

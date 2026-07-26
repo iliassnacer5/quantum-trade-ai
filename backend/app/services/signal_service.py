@@ -72,6 +72,25 @@ async def backtest_metrics(symbol: str, interval: str, limit: int = 500) -> dict
         return None
 
 
+async def daily_top_trades(count: int | None = None, *, now=None) -> dict:
+    """LES trades du jour, produits par la STRATÉGIE du desk (playbook).
+
+    Cascade appliquée à chaque symbole : Mensuel + Journalier (tendance de fond + niveaux majeurs)
+    → Journalier détaillé (RSI14, MA20/MA50, volume, VWAP, divergences RSI/MACD, Fibonacci si
+    correction) → 4 h (mêmes facteurs) → entrée 15 min UNIQUEMENT, avec R/R ≥ 1:2 et objectif
+    ≥ 100 pips. L'univers scanné privilégie le chevauchement Londres/New York.
+
+    Retourne au plus `count` setups, chacun étiqueté `ready` (exécutable) ou `armed` (contexte
+    validé, en attente du déclencheur 15 min). Aucun remplissage artificiel : s'il n'y a pas
+    5 setups conformes, on le dit.
+    """
+    from app.core.config import get_settings
+    from app.services import playbook_service
+
+    n = count or get_settings().daily_top_trades_count
+    return await playbook_service.top_trades(n, now=now)
+
+
 async def daily_picks(
     per_market: int = 3,
     classes: tuple[str, ...] = ("crypto", "forex", "stock", "commodity"),
@@ -132,7 +151,8 @@ async def verify_signal(
     checks.append({"label": "Consensus ≥ 70 %", "pass": consensus_pct >= 70, "value": f"{consensus_pct}%"})
     if mtf_total:
         checks.append({"label": "Multi-timeframe ≥ 2/3 alignés", "pass": mtf_aligned >= 2, "value": f"{mtf_aligned}/{mtf_total}"})
-    checks.append({"label": "R/R ≥ 1,5", "pass": risk_reward >= 1.5, "value": f"1 : {risk_reward}"})
+    # Bande de la stratégie : R/R entre 1,2 et 1,3 pour la prise de décision.
+    checks.append({"label": "R/R ≥ 1:1,2", "pass": risk_reward >= 1.2, "value": f"1 : {risk_reward}"})
     checks.append({"label": "Tendance forte (ADX > 25)", "pass": (adx or 0) > 25, "value": round(adx, 1) if adx else "—"})
 
     passed = sum(1 for c in checks if c["pass"])
@@ -206,11 +226,17 @@ def finalize_decision(card, mtf_res: dict, blackout: tuple[bool, str] | None = N
     card.metrics["signal_mode"] = mode
 
     adx = card.metrics.get("adx")
+    pb = card.metrics.get("playbook") or {}
+    session = card.metrics.get("session") or {}
+    # ★ Haute conviction : soit la voie classique (ADX + consensus + multi-TF), soit — et c'est la
+    # voie privilégiée — un setup de PLAYBOOK complet (4 étapes validées, déclencheur 15 min actif)
+    # pris dans une fenêtre à forte valeur (ouverture Londres/NY ou chevauchement).
     card.high_conviction = bool(
         card.direction.value != "HOLD"
-        and adx and adx > 25
-        and card.consensus_pct >= 70
-        and mtf_res.get("aligned", 0) >= 2
+        and (
+            (adx and adx > 25 and card.consensus_pct >= 70 and mtf_res.get("aligned", 0) >= 2)
+            or (pb.get("ready") and pb.get("direction") == card.direction.value and session.get("prime"))
+        )
     )
     # Scores explicatifs (contexte marché + timing) — informatifs, non bloquants.
     card.metrics["context_score"] = quality.context_score(card)

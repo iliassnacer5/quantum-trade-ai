@@ -21,10 +21,13 @@ from app.models.signal import Direction
 # Modes de sévérité : le trader choisit le curseur fiabilité <-> quantité de signaux.
 # strict = défaut mesuré ; équilibré = plus de signaux, filtres raisonnables ; agressif = biais
 # directionnel dès qu'il existe (à réserver au paper / aux traders expérimentés).
+# NB : `min_rr` reste à 1.2 dans TOUS les modes — c'est le plancher de la bande imposée par la
+# stratégie (1,2 à 1,3). Le curseur fiabilité/quantité joue sur la confiance, l'ADX et le
+# multi-timeframe, jamais sur le R/R.
 MODES: dict[str, dict] = {
-    "strict":     {"min_conf": 62, "min_adx": 22, "min_rr": 1.5, "mtf_min": 2},
+    "strict":     {"min_conf": 62, "min_adx": 22, "min_rr": 1.2, "mtf_min": 2},
     "balanced":   {"min_conf": 52, "min_adx": 18, "min_rr": 1.2, "mtf_min": 2},
-    "aggressive": {"min_conf": 42, "min_adx": 12, "min_rr": 1.0, "mtf_min": 1},
+    "aggressive": {"min_conf": 42, "min_adx": 12, "min_rr": 1.2, "mtf_min": 1},
 }
 
 

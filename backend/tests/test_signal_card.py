@@ -79,15 +79,33 @@ def test_signal_modes_change_strictness():
     """Le même setup passe en 'balanced' mais est filtré en 'strict' (curseur fiabilité/quantité)."""
     from app.services.signal_service import finalize_decision
 
-    def make():
+    def make(rr: float = 2.2):
         return SignalCard(asset="BTC/USDT", direction=Direction.BUY, entry=100, stop_loss=98,
-                          take_profit_1=103, risk_reward=1.3, confidence=55, timeframe=Timeframe.SWING,
+                          take_profit_1=104.4, risk_reward=rr, confidence=55, timeframe=Timeframe.SWING,
                           rationale="x", consensus_pct=70,
                           metrics={"adx": 20, "price": 100, "ema200": 99})
     strict = finalize_decision(make(), {"aligned": 2, "total": 3}, mode="strict")
     balanced = finalize_decision(make(), {"aligned": 2, "total": 3}, mode="balanced")
-    assert strict.direction == Direction.HOLD       # conf 55<62, ADX 20<22, RR 1.3<1.5
-    assert balanced.direction == Direction.BUY      # conf 55>=52, ADX 20>=18, RR 1.3>=1.2
+    assert strict.direction == Direction.HOLD       # conf 55<62, ADX 20<22
+    assert balanced.direction == Direction.BUY      # conf 55>=52, ADX 20>=18, RR 2.2>=2.0
+
+
+def test_risk_reward_floor_applies_to_every_mode():
+    """La stratégie impose R/R ≥ 1:1,2 : aucun mode, même agressif, ne laisse passer moins."""
+    from app.services.signal_service import finalize_decision
+
+    def make(rr: float):
+        return SignalCard(asset="BTC/USDT", direction=Direction.BUY, entry=100, stop_loss=98,
+                          take_profit_1=102, risk_reward=rr, confidence=90, timeframe=Timeframe.SWING,
+                          rationale="x", consensus_pct=90,
+                          metrics={"adx": 35, "price": 100, "ema200": 99})
+    for mode in ("strict", "balanced", "aggressive"):
+        refused = finalize_decision(make(1.0), {"aligned": 3, "total": 3}, mode=mode)
+        assert refused.direction == Direction.HOLD, f"R/R 1,0 doit être refusé en mode {mode}"
+        assert "R/R" in refused.rationale
+        # Dans la bande de la stratégie, le setup passe.
+        accepted = finalize_decision(make(1.25), {"aligned": 3, "total": 3}, mode=mode)
+        assert accepted.direction == Direction.BUY, f"R/R 1,25 doit passer en mode {mode}"
 
 
 def test_signal_mode_endpoint():

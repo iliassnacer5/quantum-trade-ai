@@ -27,10 +27,35 @@ class Settings(BaseSettings):
     live_interval: str = "1h"
     # Refuse de passer un ordre si les données du marché sont synthétiques (démo).
     block_synthetic_orders: bool = True
+    # --- PLAYBOOK (stratégie du desk) : Mensuel+Journalier -> 4h -> entrée 15 min -----------------
+    # C'est la stratégie de référence appliquée par TOUS les agents. Voir domain/playbook.py.
+    playbook_enabled: bool = True
+    playbook_veto: bool = True              # un refus du playbook force le HOLD (aucun contournement)
+    # Bande de risque/rendement imposée : ni moins de 1,2 (le gain doit dépasser le risque), ni plus
+    # de 1,3 (un R/R élevé vient d'un stop serré, que le marché fait sauter avant l'objectif).
+    playbook_min_rr: float = 1.2
+    playbook_max_rr: float = 1.3
+    playbook_min_target_pips: float = 200.0  # objectif minimum de 200 pips
+    # Conséquence : 200 pips avec un R/R plafonné à 1,3 impose un stop d'au moins ~154 pips.
+    playbook_max_stop_pips: float = 200.0
+    # Objectif <= N × ATR journalier. Un objectif de 200 pips vaut ~3 journées moyennes sur EUR/USD :
+    # c'est un SWING tenu plusieurs jours, et l'horizon estimé est affiché sur chaque setup.
+    playbook_max_atr_multiple: float = 4.0
+    playbook_require_real_data: bool = True  # jamais de trade affirmé sur données synthétiques
+    playbook_entry_timeframe: str = "15m"   # la seule unité de temps d'entrée
+    # Exécution automatique en compte DÉMO (papier) des setups prêts, avec leur SL/TP.
+    # N'agit que pour les utilisateurs ayant déjà connecté un broker papier (= opt-in explicite).
+    playbook_auto_paper_execute: bool = True
+    # Veille des sessions : top trades recalculés à l'ouverture de Londres, de New York et pendant
+    # le chevauchement (la fenêtre la plus liquide de la journée).
+    session_watch_enabled: bool = True
+    session_watch_interval: int = 900       # secondes entre deux vérifications de fenêtre
+    daily_top_trades_count: int = 5         # nombre de trades proposés chaque jour
+
     # Filtre de qualité d'entrée (principiel) : ne trader qu'en régime de tendance et setup solide.
     entry_min_confidence: int = 62      # confiance minimale du signal
     entry_min_adx: float = 22.0         # ADX minimal = tendance réelle (évite les ranges/whipsaw)
-    entry_min_rr: float = 1.5           # ratio risque/rendement minimal
+    entry_min_rr: float = 1.2           # ratio risque/rendement minimal (aligné sur la bande du playbook)
     entry_quality_gate: bool = True     # appliquer le filtre au live (le backtest l'applique toujours)
     entry_trend_filter: bool = True     # anti-couteau-qui-tombe : pas de trade contre l'EMA longue
     # Surveillance des positions papier : clôture auto au SL/TP atteint.

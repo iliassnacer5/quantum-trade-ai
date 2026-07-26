@@ -6,7 +6,7 @@ Déterministe par défaut.
 
 from __future__ import annotations
 
-from app.agents.base import AgentOutput, enrich
+from app.agents.base import AgentOutput, apply_playbook, enrich
 from app.domain import indicators as ind
 from app.domain.indicators import Candle
 
@@ -15,7 +15,7 @@ def _clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-async def run(candles: list[Candle]) -> AgentOutput:
+async def run(candles: list[Candle], context: dict | None = None) -> AgentOutput:
     name = "volume"
     if len(candles) < 20:
         return AgentOutput(name, 0.0, 0.1, "Données insuffisantes pour l'analyse de volume.")
@@ -42,7 +42,7 @@ async def run(candles: list[Candle]) -> AgentOutput:
             signals.append(-0.3)
             notes.append("OBV en baisse (pression vendeuse)")
             
-    # Analyse VWAP
+    # Analyse VWAP : position ET TENDANCE (la stratégie demande explicitement la tendance VWAP).
     if vwap_val is not None:
         if price > vwap_val:
             signals.append(0.2)
@@ -50,6 +50,16 @@ async def run(candles: list[Candle]) -> AgentOutput:
         else:
             signals.append(-0.2)
             notes.append(f"Prix en-dessous du VWAP ({vwap_val:.2f})")
+    vwap_slope = ind.slope_pct(ind.rolling_vwap(candles, 20), 5)
+    if vwap_slope is not None:
+        if vwap_slope > 0.01:
+            signals.append(0.25)
+            notes.append(f"Tendance VWAP haussière ({vwap_slope:+.2f}%)")
+        elif vwap_slope < -0.01:
+            signals.append(-0.25)
+            notes.append(f"Tendance VWAP baissière ({vwap_slope:+.2f}%)")
+        else:
+            notes.append("Tendance VWAP plate (pas de direction du flux)")
 
     # Divergence prix / OBV (simplifiée)
     if len(obv_line) >= 5:
@@ -83,6 +93,11 @@ async def run(candles: list[Candle]) -> AgentOutput:
 
     score = _clamp(sum(signals) / max(len(signals), 1))
     confidence = min(1.0, 0.4 + 0.15 * len(signals))
+    details = {"obv_current": obv_line[-1], "vwap": vwap_val, "vwap_slope_pct": vwap_slope,
+               "relative_volume": ind.relative_volume(candles, 20)}
+    # Cadre commun : la stratégie du desk (tendance de fond, niveaux majeurs, fenêtre de session).
+    score, confidence = apply_playbook(score, confidence, notes, details, context)
+    score = _clamp(score)
     rationale = "Analyse de volume : " + " ; ".join(notes) + "."
 
     # Enrichissement LLM optionnel (AJOUTÉ, jamais substitué)
@@ -103,5 +118,5 @@ async def run(candles: list[Candle]) -> AgentOutput:
         score=round(score, 3),
         confidence=round(confidence, 3),
         rationale=rationale,
-        details={"obv_current": obv_line[-1], "vwap": vwap_val},
+        details=details,
     )

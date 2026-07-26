@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from app.agents.base import AgentOutput
+from app.agents.base import AgentOutput, apply_playbook
 from app.data import cross_asset
 from app.domain import ta
 from app.domain.indicators import Candle
@@ -46,6 +46,9 @@ async def run(candles: list[Candle], symbol: str = "AAPL", context: dict | None 
             score += -0.15 if gap > 0 else 0.15  # gap haussier -> biais vers comblement (baissier)
             notes.append(f"Gap {gap * 100:+.1f}% → biais contrarien vers comblement")
             metrics["gap_pct"] = round(gap * 100, 2)
+
+    # Cadre commun : la stratégie du desk (tendance de fond, niveaux majeurs, fenêtre de session).
+    score, conf = apply_playbook(score, conf, notes, metrics, context)
 
     score = max(-1.0, min(1.0, score))
     metrics["expert"] = True

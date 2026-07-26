@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from app.agents.base import AgentOutput
+from app.agents.base import AgentOutput, apply_playbook
 from app.data import cross_asset
 from app.domain import ta
 from app.domain.indicators import Candle
@@ -44,6 +44,9 @@ async def run(candles: list[Candle], symbol: str = "EUR/USD", context: dict | No
                 score = 0.8 * score + 0.2 * max(-1.0, min(1.0, usd_effect))
                 notes.append(f"Filtre DXY ({dxy:+.2f}) appliqué à la paire USD")
                 metrics["dxy"] = round(dxy, 3)
+
+    # Cadre commun : la stratégie du desk (tendance de fond, niveaux majeurs, fenêtre de session).
+    score, conf = apply_playbook(score, conf, notes, metrics, context)
 
     score = max(-1.0, min(1.0, score))
     metrics["expert"] = True
