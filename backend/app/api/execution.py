@@ -140,6 +140,33 @@ async def orders(
     return execution_service.list_orders(store, user.tenant_id)
 
 
+@router.post("/playbook/execute-symbol/{symbol:path}", status_code=status.HTTP_201_CREATED)
+async def execute_playbook_one(
+    symbol: str,
+    user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """Ouvre EN COMPTE DÉMO le trade d'un seul symbole — le bouton d'une carte « trade du jour ».
+
+    La stratégie est recalculée côté serveur avant l'ouverture : les niveaux (entrée, stop,
+    objectif) sont ceux du playbook au moment du clic, jamais ceux affichés dans le navigateur.
+    Si le déclencheur 15 min n'est plus actif, rien n'est ouvert et la raison est renvoyée.
+    """
+    from app.data import symbols as symbols_catalog
+
+    try:
+        report = await execution_service.execute_playbook_symbol(
+            store, user.tenant_id, symbols_catalog.normalize(symbol),
+        )
+    except execution_service.ExecutionError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    audit.record(
+        "execution.playbook_symbol", actor=user.email, tenant_id=user.tenant_id,
+        detail=f"{symbol} -> {len(report['opened'])} ouverte(s)",
+    )
+    return report
+
+
 @router.get("/positions")
 async def positions(
     user: User = Depends(current_user),

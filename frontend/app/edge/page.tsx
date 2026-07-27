@@ -10,7 +10,7 @@
 import { useEffect, useState } from 'react';
 import { api, EdgeMap, EdgeRow } from '@/lib/api';
 import { PageHeader, Button, Segmented, RouteTabs, PROVE_TABS } from '@/components/ui';
-import { EdgeStatusDot } from '@/components/domain';
+import { EdgeStatusDot, PairVerdictsPanel } from '@/components/domain';
 
 const MARKET_LABEL: Record<string, string> = {
   crypto: '₿ Crypto', forex: '💱 Forex', stock: '📈 Actions', commodity: '🥇 Or & Métaux',
@@ -72,6 +72,10 @@ export default function EdgePage() {
         }
       />
       <RouteTabs items={PROVE_TABS} />
+
+      {/* Verdicts par paire de la STRATÉGIE DU DESK (plan 2.7) — c'est eux qui gouvernent
+          l'auto-entrée et le sizing, avec les chiffres qui les motivent. */}
+      <PairVerdictsPanel />
 
       {error && <p className="text-sell">{error}</p>}
 

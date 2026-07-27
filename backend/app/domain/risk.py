@@ -17,18 +17,21 @@ class RiskParams:
     capital: float
     risk_per_trade_pct: float = 1.0  # % du capital risqué par trade
     atr_sl_mult: float = 1.5  # SL = entrée -/+ atr_sl_mult * ATR
-    # TP1 = 1.875*ATR pour un SL de 1.5*ATR -> R/R 1:1.25, au centre de la bande imposée par la
-    # stratégie du desk (1,2 à 1,3 — cf. domain/playbook.py). TP2 et TP3 servent de sorties
-    # échelonnées pour laisser courir une fraction de la position.
-    atr_tp_mults: tuple[float, float, float] = (1.875, 2.7, 3.6)  # TP1/2/3
+    # Pour un SL de 1,5 × ATR : TP1 = 3,0 × ATR donne R/R 1:2 (le plancher de la bande imposée par
+    # la stratégie du desk) et TP2 = 4,5 × ATR donne R/R 1:3 (le plafond). Cf. domain/playbook.py.
+    # TP1 est aussi le niveau de SÉCURISATION : une fois touché, le stop y est remonté.
+    atr_tp_mults: tuple[float, float, float] = (3.0, 4.5, 6.0)  # TP1/2/3
 
 
 @dataclass
 class RiskOutput:
     stop_loss: float
     take_profit_1: float
-    take_profit_2: float
-    take_profit_3: float
+    # Objectifs supérieurs OPTIONNELS : la stratégie du desk n'en définit que deux (le R/R minimum,
+    # qui sert de niveau de sécurisation, et le R/R maximum). Inventer un troisième palier
+    # afficherait un niveau auquel personne ne vise réellement.
+    take_profit_2: float | None
+    take_profit_3: float | None
     risk_reward: float
     position_size: float  # quantité d'actif
     position_value: float  # valeur en devise de cotation
@@ -75,14 +78,15 @@ def compute_levels_from_prices(
     direction: Direction,
     entry: float,
     stop_loss: float,
-    take_profits: tuple[float, float, float],
+    take_profits: tuple[float, float | None, float | None],
     p: RiskParams,
 ) -> RiskOutput:
-    """Dimensionne une position sur des niveaux DÉJÀ décidés (stop technique du playbook).
+    """Dimensionne une position sur des niveaux DÉJÀ décidés (stop structurel du playbook).
 
-    Le playbook place le stop derrière la structure 15 min et l'objectif à max(2×risque, 100 pips) :
+    Le playbook place le stop derrière la structure et l'objectif à max(2 × risque, 200 pips) :
     ces niveaux ont un sens de marché, on ne les remplace pas par un multiple d'ATR. Ici on se
-    contente d'en déduire le R/R et la taille de position.
+    contente d'en déduire le R/R et la taille de position. Les objectifs supérieurs peuvent être
+    absents (`None`) : la stratégie n'en définit pas toujours.
     """
     sl_dist = abs(entry - stop_loss)
     if sl_dist <= 0:
@@ -94,8 +98,8 @@ def compute_levels_from_prices(
     return RiskOutput(
         stop_loss=round(stop_loss, 8),
         take_profit_1=round(tp1, 8),
-        take_profit_2=round(tp2, 8),
-        take_profit_3=round(tp3, 8),
+        take_profit_2=round(tp2, 8) if tp2 is not None else None,
+        take_profit_3=round(tp3, 8) if tp3 is not None else None,
         risk_reward=risk_reward,
         position_size=round(position_size, 8),
         position_value=round(position_size * entry, 2),

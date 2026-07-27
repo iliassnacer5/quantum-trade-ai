@@ -25,11 +25,14 @@ logger = logging.getLogger(__name__)
 # Profil de risque -> % du capital risqué par trade
 _RISK_PCT = {"conservative": 0.5, "moderate": 1.0, "aggressive": 2.0}
 
+# Unité de temps demandée -> intervalle du connecteur de données.
 _TF_INTERVAL = {
-    Timeframe.SCALP: "5m",
-    Timeframe.INTRADAY: "15m",
-    Timeframe.SWING: "1h",
-    Timeframe.POSITION: "4h",
+    Timeframe.M15: "15m",
+    Timeframe.H1: "1h",
+    Timeframe.H4: "4h",
+    Timeframe.D1: "1d",
+    Timeframe.W1: "1w",
+    Timeframe.MN: "1M",
 }
 
 
@@ -38,7 +41,7 @@ async def _load_candles(symbol: str, timeframe: Timeframe) -> list[Candle]:
     return await markets.load_candles(symbol, interval=_TF_INTERVAL.get(timeframe, "1h"), limit=200)
 
 
-_TF_TO_INTERVAL = {"scalp": "5m", "intraday": "15m", "swing": "1h", "position": "4h"}
+_TF_TO_INTERVAL = {"15min": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "1week": "1w", "1month": "1M"}
 
 
 async def backtest_metrics(symbol: str, interval: str, limit: int = 500) -> dict | None:
@@ -70,6 +73,24 @@ async def backtest_metrics(symbol: str, interval: str, limit: int = 500) -> dict
     except Exception as exc:  # noqa: BLE001
         logger.warning("Backtest %s échoué (%s)", symbol, exc)
         return None
+
+
+def learning_multipliers(store: AppStore | None, tenant_id: str | None, market: str | None) -> dict[str, float]:
+    """Poids d'apprentissage des agents = expérience VÉCUE × expertise ENTRAÎNÉE.
+
+    Deux sources, multiplicatives et complémentaires :
+    - le **Journal** : ce qui a réellement gagné ou perdu sur le compte de cet utilisateur ;
+    - l'**entraînement quotidien** : la justesse mesurée de chaque agent quand la stratégie du desk
+      est rejouée sur l'historique (cf. `training_service`). C'est ce qui fait des agents des
+      experts DE CETTE stratégie plutôt que de bons généralistes.
+    """
+    from app.services import training_service
+
+    base = dict(journal_service.compute_multipliers(store, tenant_id, market=market) or {}) \
+        if (store is not None and tenant_id) else {}
+    for agent, mult in training_service.agent_multipliers().items():
+        base[agent] = round(base.get(agent, 1.0) * mult, 3)
+    return base
 
 
 async def daily_top_trades(count: int | None = None, *, now=None) -> dict:
@@ -316,17 +337,52 @@ async def scan_market(
         for row in results:
             if row["symbol"] in consolidated_syms:
                 # Apprentissage PAR MARCHÉ (comme l'analyse) -> cohérence préservée.
-                jmult = journal_service.compute_multipliers(store, tenant, market=row["asset_class"]) if (store and tenant) else None
+                jmult = learning_multipliers(store, tenant, row["asset_class"])
                 await _consolidate_row(row, candle_cache[row["symbol"]], macro_ctx, ctx, jmult, capital, rpt, scan_mode)
             else:
                 # Non consolidé : lead technique seul -> on n'affirme NI ★ NI verdict (à analyser).
                 row["high_conviction"] = False
                 row["consolidated"] = False
 
+    # 3e passe : LA STRATÉGIE DU DESK a le dernier mot, pour TOUTES les lignes.
+    # Le scanner ne peut pas afficher « BUY » sur une paire que le playbook refuse : c'est la même
+    # méthode qui doit gouverner le scanner, les trades du jour et l'analyse détaillée.
+    _apply_playbook_verdicts(results)
+
     if high_conviction_only:
         results = [r for r in results if r["high_conviction"]]
-    results.sort(key=lambda r: (r["high_conviction"], r["conviction"]), reverse=True)
+    results.sort(key=lambda r: (r["high_conviction"], r.get("playbook_edge", 0.0), r["conviction"]),
+                 reverse=True)
     return results
+
+
+def _apply_playbook_verdicts(rows: list[dict]) -> None:
+    """Superpose à chaque ligne le verdict de la stratégie, calculé par la boucle de fond.
+
+    Aucun calcul supplémentaire : on lit l'instantané que la boucle produit déjà pour les trades du
+    jour. Conséquence directe : un symbole ne peut plus être noté différemment selon la page.
+    """
+    from app.services import live_snapshot
+
+    verdicts = live_snapshot.verdicts()
+    if not verdicts:
+        return
+    for row in rows:
+        v = verdicts.get(row["symbol"])
+        if not v:
+            row["playbook_tier"] = "non balayé"
+            continue
+        row["playbook_tier"] = v["tier"]
+        row["playbook_direction"] = v["direction"]
+        row["playbook_reason"] = v["reason"]
+        row["playbook_edge"] = v.get("edge_score", 0.0)
+        row["reliability_score"] = v.get("reliability_score") or v.get("context_reliability") or 0
+        # La stratégie refuse le trade, ou le veut dans l'autre sens -> le scanner n'affirme rien.
+        if v["tier"] not in ("ready", "armed") or (
+            v["direction"] in ("BUY", "SELL") and row["direction"] != v["direction"]
+        ):
+            row["direction"] = "HOLD"
+            row["high_conviction"] = False
 
 
 _CONSOLIDATE_TOP = 8  # nb de meilleurs candidats évalués À L'IDENTIQUE de l'analyse (LLM inclus)
@@ -351,7 +407,7 @@ async def _consolidate_row(
     card = await generate_signal(
         asset=sym, candles=candles, news=news,
         risk=RiskParams(capital=capital, risk_per_trade_pct=risk_pct),
-        timeframe=Timeframe.SWING, ratios=ratios, macro_data=macro_ctx,
+        timeframe=Timeframe.H1, ratios=ratios, macro_data=macro_ctx,
         risk_context=risk_context, journal_multipliers=journal_mult,
     )
     from app.data import economic_calendar
@@ -371,7 +427,7 @@ async def generate_for_user(
     store: AppStore,
     *,
     asset: str,
-    timeframe: Timeframe = Timeframe.SWING,
+    timeframe: Timeframe = Timeframe.H1,
     notify: bool = True,
 ) -> SignalCard:
     """Génère, persiste, diffuse et notifie un signal pour un utilisateur."""
@@ -393,7 +449,7 @@ async def generate_for_user(
     # L'agent risque se base sur l'exposition RÉELLE (ordres exécutés), pas sur l'accumulation des
     # analyses générées — sinon générer des signaux pénaliserait injustement la confiance.
     risk_context = {"exposure_pct": risk_service.real_exposure_pct(user, store), "drawdown_pct": 0.0}
-    journal_mult = journal_service.compute_multipliers(store, user.tenant_id, market=markets.asset_class(asset))
+    journal_mult = learning_multipliers(store, user.tenant_id, markets.asset_class(asset))
 
     card = await generate_signal(
         asset=asset,

@@ -18,14 +18,14 @@ import {
   type Signal,
 } from '@/lib/api';
 
-const TIMEFRAMES = ['scalp', 'intraday', 'swing', 'position'];
+const TIMEFRAMES = ['15min', '1h', '4h', '1d', '1week', '1month'];
 
 export default function DashboardPage() {
   const router = useRouter();
   const [me, setMe] = useState<Me | null>(null);
   const [signals, setSignals] = useState<Signal[]>([]);
   const [asset, setAsset] = useState('BTC/USDT');
-  const [timeframe, setTimeframe] = useState('swing');
+  const [timeframe, setTimeframe] = useState('1h');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [live, setLive] = useState(false);
@@ -68,8 +68,9 @@ export default function DashboardPage() {
     }
   }, [heatMix]);
 
-  // Portefeuille, risque et variations 24 h rafraîchis TOUT SEULS (les prix bougent en continu).
-  const autoPanels = useAutoRefresh(loadPanels, 30_000);
+  // Portefeuille, risque et variations 24 h rafraîchis TOUT SEULS toutes les 10 s : les prix
+  // bougent en continu, et aucune de ces lectures ne déclenche de recalcul lourd côté serveur.
+  const autoPanels = useAutoRefresh(loadPanels, 10_000);
 
   const load = useCallback(async () => {
     try {

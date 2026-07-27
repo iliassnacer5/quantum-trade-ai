@@ -25,9 +25,16 @@ export const MARKET_BADGE: Record<string, string> = {
 
 export type Timeframe = { tf: string; interval: string; label: string };
 
+/**
+ * Unités de temps du desk, nommées par leur DURÉE et non par un style de trading.
+ * « Scalp », « intraday », « swing » décrivent une façon de trader, pas une échelle de temps.
+ * Ce sont exactement les unités de la stratégie : mensuel/journalier → 4 h → 1 h → entrée 15 min.
+ */
 export const TIMEFRAMES: Timeframe[] = [
-  { tf: 'scalp', interval: '5m', label: 'Scalp (5m)' },
-  { tf: 'intraday', interval: '15m', label: 'Intraday (15m)' },
-  { tf: 'swing', interval: '1h', label: 'Swing (1h)' },
-  { tf: 'position', interval: '4h', label: 'Position (4h)' },
+  { tf: '15min', interval: '15m', label: '15 min' },
+  { tf: '1h', interval: '1h', label: '1 h' },
+  { tf: '4h', interval: '4h', label: '4 h' },
+  { tf: '1d', interval: '1d', label: '1 jour' },
+  { tf: '1week', interval: '1w', label: '1 semaine' },
+  { tf: '1month', interval: '1M', label: '1 mois' },
 ];

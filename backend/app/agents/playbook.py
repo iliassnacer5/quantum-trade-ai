@@ -40,8 +40,18 @@ _STEP_TITLES = {
 
 def _rationale(setup: PlaybookSetup) -> str:
     """Note de desk : verdict, puis la checklist complète étape par étape."""
+    from app.agents import expertise
+
     head = setup.summary()
     lines = [head]
+    # Ce que l'entraînement de la nuit a mesuré SUR CE SYMBOLE : on le dit avant tout le reste,
+    # parce que c'est de l'historique et pas une opinion.
+    edge = _measured_edge(setup)
+    if edge:
+        lines.append(edge)
+    exp_note = expertise.note(NAME)
+    if exp_note:
+        lines.append("🎓 " + exp_note)
     for c in setup.checklist:
         mark = "✅" if c["pass"] else "❌"
         lines.append(f"{mark} {_STEP_TITLES.get(c['step'], '')} · {c['label']} → {c['value']}")
@@ -70,6 +80,18 @@ def _rationale(setup: PlaybookSetup) -> str:
     return "\n".join(lines)
 
 
+def _measured_edge(setup: PlaybookSetup) -> str:
+    """Ce que le walk-forward nocturne a constaté pour ce symbole et ce type de déclencheur."""
+    from app.services import training_service
+
+    trigger = (setup.trigger or "").split(" — ", 1)[0].strip() or None
+    edge = training_service.edge_for(setup.symbol, trigger_type=trigger)
+    if not edge or not edge.get("trades"):
+        return ""
+    verdict = "favorable" if edge["score"] > 0 else "défavorable" if edge["score"] < 0 else "neutre"
+    return f"📊 Historique rejoué ({verdict}) : {edge['status']}."
+
+
 def _confidence(setup: PlaybookSetup) -> float:
     if setup.insufficient:
         return 0.1
@@ -81,14 +103,16 @@ async def run(setup: PlaybookSetup, *, use_llm: bool = True) -> AgentOutput:
     rationale = _rationale(setup)
 
     if use_llm and setup.direction != "NO_TRADE":
-        from app.agents import llm
+        from app.agents import expertise, llm
 
         if llm.available():
             try:
                 prompt = (
-                    "Tu es trader professionnel sur un desk. En UNE phrase complète en français, "
+                    expertise.prompt_prefix(NAME)
+                    + "Tu es trader professionnel sur un desk. En UNE phrase complète en français, "
                     "sans conseil en investissement, commente ce setup issu d'une stratégie "
-                    "multi-unités de temps (mensuel/journalier → 4h → entrée 15 min) :\n"
+                    "multi-unités de temps (mensuel/journalier → 4 h → entrée 15 min, stop sur la "
+                    "structure 15 min, objectif borné par le prochain niveau 1 h) :\n"
                     f"{setup.summary()}"
                 )
                 rationale = enrich(rationale, await llm.complete(prompt, role="reasoning", max_tokens=200))

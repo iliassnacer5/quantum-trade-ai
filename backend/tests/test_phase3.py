@@ -99,7 +99,7 @@ def test_journal_lifecycle(monkeypatch):
     h = _register(client)
     _upgrade(client, h, "pro")
     client.post("/api/signals/mode?mode=aggressive", headers=h)
-    client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "swing", "notify": False}, headers=h)
+    client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "1h", "notify": False}, headers=h)
     entries = client.get("/api/journal", headers=h).json()
     assert len(entries) >= 1, "un signal directionnel doit créer une entrée journal"
     entry_id = entries[0]["id"]

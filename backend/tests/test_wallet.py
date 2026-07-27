@@ -37,8 +37,12 @@ def test_wallet_reflects_closed_trade(monkeypatch):
     ).json()
     entry = order["filled_price"]
 
-    async def _won(symbol, direction, e, sl, tp, since, interval="1h"):  # noqa: ANN001
-        return "won", tp, 1_700_000_000
+    # Le rejeu renvoie un VERDICT motivé (et non plus un tuple) : il doit pouvoir dire « je ne sais
+    # pas » sans que l'appelant clôture au hasard. Ici on simule un objectif réellement atteint,
+    # avec une clôture POSTÉRIEURE à l'ouverture (une clôture antérieure serait rejetée).
+    async def _won(symbol, direction, e, sl, tp, since, interval="15m"):  # noqa: ANN001
+        return {"outcome": "won", "exit_price": tp, "closed_ts": replay.iso_to_unix(since) + 900,
+                "reason": "objectif atteint", "data_real": True, "covered_until": None, "bars": 1}
     monkeypatch.setattr(replay, "replay_outcome", _won)
     client.post(f"/api/execution/orders/{order['id']}/check", headers=h)  # clôture en 'won'
 

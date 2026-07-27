@@ -12,14 +12,14 @@ from app.models.entities import User
 from app.models.schemas import GenerateSignalRequest
 from app.models.signal import SignalCard
 from app.repositories.store import AppStore
-from app.services import risk_service, signal_service
+from app.services import live_snapshot, risk_service, signal_service
 
 router = APIRouter(prefix="/api/signals", tags=["signals"])
 
 
 class VerifyRequest(BaseModel):
     symbol: str
-    timeframe: str = "swing"
+    timeframe: str = "1h"
     direction: str = "HOLD"
     confidence: int = 0
     consensus_pct: int = 0
@@ -59,7 +59,7 @@ async def generate(
     )
 
 
-_DAILY_TF = {"scalp": "5m", "intraday": "15m", "swing": "1h", "position": "4h", "daily": "1d"}
+_DAILY_TF = {"15min": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "1week": "1w", "1month": "1M"}
 
 
 @router.get("/daily-picks")
@@ -71,7 +71,7 @@ async def daily_picks(
 ) -> dict:
     """Sélection du jour par marché (graduée, mise en cache par timeframe).
 
-    `timeframe` : 5m | 15m | 1h | 4h | 1d (ou alias scalp/intraday/swing/position/daily).
+    `timeframe` : 15m | 1h | 4h | 1d | 1w | 1M (ou les libellés 15min/1h/4h/1d/1week/1month).
     Les unités plus longues (4h, 1d) filtrent le bruit -> signaux généralement plus fiables.
     """
     from datetime import UTC, datetime
@@ -101,27 +101,66 @@ async def top_trades(
 
     Cascade : Mensuel + Journalier (tendance de fond + supports/résistances majeurs) → Journalier
     détaillé (RSI14, MA20/MA50, volume, tendance VWAP, divergences RSI/MACD, Fibonacci en cas de
-    correction) → 4 h (mêmes facteurs) → **entrée en 15 min uniquement**, avec R/R ≥ 1:2 et
-    objectif ≥ 100 pips. L'univers privilégie le chevauchement Londres / New York.
+    correction) → 4 h (mêmes facteurs) → **entrée en 15 min uniquement**. Le stop vient de la
+    structure 15 min, l'objectif est borné par le prochain niveau 1 h, le R/R tient dans la bande
+    1:1,2 – 1:1,3.
+
+    **Réponse immédiate** : cette route ne calcule rien, elle sert l'instantané produit en continu
+    par la boucle de fond (cf. `services.live_snapshot`). C'est ce qui permet à la page de se
+    rafraîchir toutes les 10 secondes au lieu d'attendre un recalcul complet. Chaque réponse porte
+    son âge (`age_seconds`, `stale`). `refresh=true` force un recalcul synchrone.
 
     Chaque setup est étiqueté `ready` (déclencheur 15 min actif, exécutable) ou `armed` (contexte
-    validé, en attente du déclencheur). Recalculé automatiquement à chaque ouverture de session.
+    validé) — les setups armés sont ouverts AUTOMATIQUEMENT en compte démo dès que le déclencheur
+    15 min se forme, sans aucune action de l'utilisateur.
     """
-    from datetime import UTC, datetime
+    return await live_snapshot.get(store, count=max(1, min(count, 10)), force=refresh)
 
-    from app.data import sessions as sessions_mod
 
-    today = datetime.now(UTC).date().isoformat()
-    cached = store.records.get("top_trades", today)
-    # Le cache n'est valable que TANT QU'ON EST DANS LA MÊME FENÊTRE de session : à l'ouverture de
-    # Londres ou de New York, le marché change de visage -> on recalcule.
-    if cached and not refresh:
-        now_zones = sessions_mod.session_context()["kill_zones"]
-        if ((cached.get("session") or {}).get("kill_zones") or []) == now_zones:
-            return cached
-    payload = await signal_service.daily_top_trades(max(1, min(count, 10)))
-    payload["date"] = today
-    return store.records.put("top_trades", today, payload)
+@router.get("/auto-entry")
+async def auto_entry_status(
+    user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """État de l'AUTO-ENTRÉE : ce que le robot surveille, et ce qu'il a ouvert tout seul.
+
+    L'auto-entrée n'engage QUE le compte démo (papier) : aucune position réelle ne peut être
+    ouverte sans action humaine, quelle que soit la configuration.
+    """
+    from app.core.config import get_settings
+    from app.services import auto_entry_service
+
+    s = get_settings()
+    snap = live_snapshot.current() or {}
+    watching = [
+        {"symbol": p["symbol"], "direction": p.get("direction"), "tier": p.get("tier"),
+         "reason": (p.get("reasons") or [""])[0]}
+        for p in (snap.get("picks") or []) if p.get("tier") in ("ready", "armed")
+    ]
+    return {
+        "enabled": auto_entry_service.enabled(),
+        "mode": "paper",
+        "interval_seconds": s.playbook_auto_entry_interval,
+        "watching": watching,
+        "recent": auto_entry_service.recent_events(store, user.tenant_id),
+        "note": (
+            "Les setups armés sont ouverts automatiquement en COMPTE DÉMO dès que le déclencheur "
+            "15 min se forme. Aucun clic, aucun argent réel."
+            if auto_entry_service.enabled()
+            else "Auto-entrée désactivée : les setups armés attendent une ouverture manuelle."
+        ),
+    }
+
+
+@router.post("/auto-entry/run")
+async def auto_entry_run(
+    _user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """Force un passage de veille immédiat (utile pour vérifier le câblage sans attendre la boucle)."""
+    from app.services import auto_entry_service
+
+    return await auto_entry_service.run_auto_entry(store)
 
 
 @router.get("/playbook/{symbol:path}")
@@ -250,10 +289,12 @@ async def signals_track_record(
         if p.get("direction") != "HOLD" or not m.get("blocked_direction"):
             continue
         try:
-            outcome, _, _ = await replay.replay_outcome(
+            # Un verdict `undetermined` retombe dans « encore ouvert » : on ne compte jamais un
+            # trade évité comme gagnant ou perdant sans données réelles pour le prouver.
+            outcome = (await replay.replay_outcome(
                 p.get("asset", ""), m["blocked_direction"], m.get("blocked_entry"),
                 m.get("blocked_sl"), m.get("blocked_tp"), p.get("created_at"),
-            )
+            ))["outcome"]
         except Exception:  # noqa: BLE001
             continue
         if outcome == "lost":

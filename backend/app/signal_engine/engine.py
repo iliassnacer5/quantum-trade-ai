@@ -46,7 +46,7 @@ async def generate_signal(
     news: list[NewsItem] | None = None,
     fear_greed: int | None = None,
     risk: RiskParams,
-    timeframe: Timeframe = Timeframe.SWING,
+    timeframe: Timeframe = Timeframe.H1,
     weights: dict[str, float] | None = None,
     ratios: dict | None = None,
     macro_data: dict | None = None,

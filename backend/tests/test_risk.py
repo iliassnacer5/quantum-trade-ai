@@ -11,7 +11,7 @@ def test_buy_levels_ordering():
     out = compute_levels(Direction.BUY, entry=100.0, atr=2.0, p=p)
     assert out.stop_loss < 100 < out.take_profit_1 < out.take_profit_2 < out.take_profit_3
     # tp1=1.875*atr, sl=1.5*atr -> R/R 1:1,25, au centre de la bande imposée (1,2 à 1,3).
-    assert out.risk_reward == 1.25
+    assert out.risk_reward == 2.0   # bande de la stratégie : R/R 1:2 minimum
 
 
 def test_default_levels_land_inside_the_strategy_rr_band():

@@ -144,7 +144,7 @@ def test_quality_scores_present():
     from app.models.signal import SignalCard, Timeframe
     from app.signal_engine import quality
     card = SignalCard(asset="BTC/USDT", direction=Direction.BUY, entry=100, stop_loss=98,
-                      take_profit_1=104, risk_reward=2.0, confidence=80, timeframe=Timeframe.SWING,
+                      take_profit_1=104, risk_reward=2.0, confidence=80, timeframe=Timeframe.H1,
                       rationale="x", consensus_pct=80, metrics={"adx": 30, "atr_pct": 1.2, "adx_state": "tendance forte"},
                       mtf={"aligned": 3, "total": 3})
     assert 0 <= quality.context_score(card) <= 100
@@ -188,7 +188,7 @@ def test_finalize_decision_blackout_forces_hold():
     from app.services.signal_service import finalize_decision
 
     card = SignalCard(asset="BTC/USDT", direction=Direction.BUY, entry=100, stop_loss=98,
-                      take_profit_1=104, risk_reward=2.0, confidence=80, timeframe=Timeframe.SWING,
+                      take_profit_1=104, risk_reward=2.0, confidence=80, timeframe=Timeframe.H1,
                       rationale="x", consensus_pct=80, metrics={"adx": 30})
     finalize_decision(card, {"aligned": 3, "total": 3}, blackout=(True, "earnings AAPL"))
     assert card.direction == Direction.HOLD and "EVENT_LOCK" in card.rationale

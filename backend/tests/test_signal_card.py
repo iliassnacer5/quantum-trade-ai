@@ -19,7 +19,7 @@ def test_prediction_detail_endpoint():
         return {"Authorization": f"Bearer {r.json()['access_token']}"}
 
     h = reg()
-    sig = client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "swing", "notify": False}, headers=h).json()
+    sig = client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "1h", "notify": False}, headers=h).json()
     assert sig.get("id"), "la réponse doit porter l'id de la prédiction"
     detail = client.get(f"/api/signals/{sig['id']}", headers=h)
     assert detail.status_code == 200
@@ -35,7 +35,7 @@ def test_blocked_trade_is_memorized():
     from app.services.signal_service import finalize_decision
 
     card = SignalCard(asset="BTC/USDT", direction=Direction.BUY, entry=100, stop_loss=98,
-                      take_profit_1=104, risk_reward=2.0, confidence=80, timeframe=Timeframe.SWING,
+                      take_profit_1=104, risk_reward=2.0, confidence=80, timeframe=Timeframe.H1,
                       rationale="x", consensus_pct=80, metrics={"adx": 30})
     finalize_decision(card, {"aligned": 0, "total": 3})  # MTF non aligné -> HOLD
     assert card.direction == Direction.HOLD
@@ -50,7 +50,7 @@ def test_track_record_endpoint(monkeypatch):
     client = TestClient(app)
     r = client.post("/api/auth/register", json={"email": f"u{uuid.uuid4().hex[:8]}@t.co", "password": "password123"})
     h = {"Authorization": f"Bearer {r.json()['access_token']}"}
-    client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "swing", "notify": False}, headers=h)
+    client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "1h", "notify": False}, headers=h)
 
     async def _lost(*a, **k):
         return "lost", 1.0, 1_700_000_000
@@ -65,7 +65,7 @@ def test_prediction_contains_full_decision_details():
     client = TestClient(app)
     r = client.post("/api/auth/register", json={"email": f"u{uuid.uuid4().hex[:8]}@t.co", "password": "password123"})
     h = {"Authorization": f"Bearer {r.json()['access_token']}"}
-    sig = client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "swing", "notify": False}, headers=h).json()
+    sig = client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "1h", "notify": False}, headers=h).json()
     detail = client.get(f"/api/signals/{sig['id']}", headers=h).json()
     md = detail["metrics"].get("master_decision")
     assert md and "weights_used" in md and "score" in md and md["threshold"] == 0.12
@@ -81,7 +81,7 @@ def test_signal_modes_change_strictness():
 
     def make(rr: float = 2.2):
         return SignalCard(asset="BTC/USDT", direction=Direction.BUY, entry=100, stop_loss=98,
-                          take_profit_1=104.4, risk_reward=rr, confidence=55, timeframe=Timeframe.SWING,
+                          take_profit_1=104.4, risk_reward=rr, confidence=55, timeframe=Timeframe.H1,
                           rationale="x", consensus_pct=70,
                           metrics={"adx": 20, "price": 100, "ema200": 99})
     strict = finalize_decision(make(), {"aligned": 2, "total": 3}, mode="strict")
@@ -96,7 +96,7 @@ def test_risk_reward_floor_applies_to_every_mode():
 
     def make(rr: float):
         return SignalCard(asset="BTC/USDT", direction=Direction.BUY, entry=100, stop_loss=98,
-                          take_profit_1=102, risk_reward=rr, confidence=90, timeframe=Timeframe.SWING,
+                          take_profit_1=102, risk_reward=rr, confidence=90, timeframe=Timeframe.H1,
                           rationale="x", consensus_pct=90,
                           metrics={"adx": 35, "price": 100, "ema200": 99})
     for mode in ("strict", "balanced", "aggressive"):
@@ -104,8 +104,8 @@ def test_risk_reward_floor_applies_to_every_mode():
         assert refused.direction == Direction.HOLD, f"R/R 1,0 doit être refusé en mode {mode}"
         assert "R/R" in refused.rationale
         # Dans la bande de la stratégie, le setup passe.
-        accepted = finalize_decision(make(1.25), {"aligned": 3, "total": 3}, mode=mode)
-        assert accepted.direction == Direction.BUY, f"R/R 1,25 doit passer en mode {mode}"
+        accepted = finalize_decision(make(2.0), {"aligned": 3, "total": 3}, mode=mode)
+        assert accepted.direction == Direction.BUY, f"R/R 1:2 doit passer en mode {mode}"
 
 
 def test_signal_mode_endpoint():
@@ -129,7 +129,7 @@ def test_signal_card_valid():
         take_profit_3=71000,
         risk_reward=3.2,
         confidence=82,
-        timeframe=Timeframe.SWING,
+        timeframe=Timeframe.H1,
         rationale="Cassure de résistance + sentiment positif + momentum haussier",
     )
     assert card.direction == Direction.BUY
@@ -146,6 +146,6 @@ def test_confidence_out_of_range():
             take_profit_1=1,
             risk_reward=1,
             confidence=150,  # invalide
-            timeframe=Timeframe.SWING,
+            timeframe=Timeframe.H1,
             rationale="x",
         )

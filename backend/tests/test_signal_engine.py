@@ -14,7 +14,7 @@ async def test_generate_signal_buy_has_valid_levels():
     candles = generate_candles(n=200, trend=0.004, seed=7)
     risk = RiskParams(capital=10000, risk_per_trade_pct=1.0)
     card = await generate_signal(
-        asset="BTC/USDT", candles=candles, news=[], risk=risk, timeframe=Timeframe.SWING
+        asset="BTC/USDT", candles=candles, news=[], risk=risk, timeframe=Timeframe.H1
     )
     assert card.asset == "BTC/USDT"
     assert 0 <= card.confidence <= 100

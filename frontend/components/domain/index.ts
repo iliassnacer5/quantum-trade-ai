@@ -15,3 +15,5 @@ export { AgentScoreBar } from './AgentScoreBar';
 export { AgentProgress } from './AgentProgress';
 export { UpgradeGate, isPlanError } from './UpgradeGate';
 export { TopTrades } from './TopTrades';
+export { PlaybookBacktestReport } from './PlaybookBacktest';
+export { PairVerdictsPanel } from './PairVerdicts';

@@ -34,12 +34,14 @@ from app.api import (
     strategies,
     wallet,
 )
-from app.core.config import get_settings
+from app.core.config import enforce_prod_secrets, get_settings
 from app.core.observability import ObservabilityMiddleware, init_sentry
 from app.core.ratelimit import RateLimitMiddleware
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level)
+# En production, un secret par défaut est un refus de démarrage — pas un simple avertissement.
+enforce_prod_secrets(settings)
 init_sentry()
 
 
@@ -105,6 +107,37 @@ async def lifespan(_app: FastAPI):
 
         edge_task = asyncio.create_task(edge_sweep_loop())
 
+    # Instantané temps réel : la stratégie tourne en fond, les pages ne font que LIRE le résultat.
+    # C'est ce qui remplace un recalcul de 150 s par une réponse en quelques millisecondes.
+    snapshot_task = None
+    if get_settings().playbook_snapshot_enabled:
+        from app.services.scheduler import snapshot_loop
+
+        snapshot_task = asyncio.create_task(snapshot_loop())
+
+    # Auto-entrée : ouvre en COMPTE DÉMO dès qu'un setup armé voit son déclencheur 15 min se former.
+    auto_entry_task = None
+    if get_settings().playbook_auto_entry_enabled:
+        from app.services.scheduler import auto_entry_loop
+
+        auto_entry_task = asyncio.create_task(auto_entry_loop())
+
+    # Entraînement quotidien des agents sur la stratégie (walk-forward + fiches d'expertise).
+    training_task = None
+    if get_settings().playbook_training_enabled:
+        from app.services import training_service
+        from app.services.scheduler import training_loop
+
+        training_service.load_from_store(get_store())   # réutilise l'entraînement de la veille
+        training_task = asyncio.create_task(training_loop())
+
+    # Backtest hebdomadaire de la stratégie sur toutes les paires du desk (classement des paires).
+    backtest_task = None
+    if get_settings().playbook_backtest_enabled:
+        from app.services.scheduler import backtest_loop
+
+        backtest_task = asyncio.create_task(backtest_loop())
+
     logging.getLogger(__name__).info(
         "Démarrage OK (in_memory=%s, redis=%s, digest=%s)",
         get_settings().use_in_memory_db,
@@ -124,6 +157,14 @@ async def lifespan(_app: FastAPI):
         session_task.cancel()
     if edge_task:
         edge_task.cancel()
+    if snapshot_task:
+        snapshot_task.cancel()
+    if auto_entry_task:
+        auto_entry_task.cancel()
+    if training_task:
+        training_task.cancel()
+    if backtest_task:
+        backtest_task.cancel()
     if get_settings().live_ingestion_enabled:
         from app.realtime import market_stream
 

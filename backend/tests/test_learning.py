@@ -55,7 +55,7 @@ async def test_auto_resolve_closes_open_signals(monkeypatch):
     client = TestClient(app)
     h = _pro(client)
     # Génère un signal (crée une entrée de journal 'open' liée au signal stocké).
-    client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "swing", "notify": False}, headers=h)
+    client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "1h", "notify": False}, headers=h)
 
     # Rejeu mocké -> le TP est touché (won), indépendamment de la direction réelle du signal.
     async def _won(symbol, direction, entry, sl, tp, since_iso, interval="1h"):  # noqa: ANN001

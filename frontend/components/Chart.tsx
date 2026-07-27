@@ -55,10 +55,17 @@ export function Chart({ asset, timeframe, signal }: { asset: string; timeframe: 
     setError('');
     api
       .ohlcv(asset, timeframe)
-      .then((candles: Candle[]) => {
+      .then((res) => {
         if (cancelled || !seriesRef.current) return;
+        // Aucune donnée RÉELLE : on affiche un graphique vide et on le DIT, plutôt que de tracer
+        // une courbe inventée qui aurait l'air d'un vrai marché.
+        if (!res.real || res.candles.length === 0) {
+          seriesRef.current.setData([]);
+          setError(res.note || `Aucune donnée de marché disponible pour ${asset}.`);
+          return;
+        }
         seriesRef.current.setData(
-          candles.map((c) => ({
+          res.candles.map((c: Candle) => ({
             time: c.time as UTCTimestamp,
             open: c.open,
             high: c.high,

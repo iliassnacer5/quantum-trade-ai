@@ -50,7 +50,9 @@ def format_top_trades(payload: dict) -> str:
         else:
             lines.append(
                 f"{i}. 🟡 {p['symbol']} {p['direction']} — contexte validé (mensuel/journalier/4 h), "
-                f"en attente du déclencheur 15 min"
+                + ("ouverture AUTOMATIQUE en démo dès le déclencheur 15 min"
+                   if get_settings().playbook_auto_entry_enabled
+                   else "en attente du déclencheur 15 min")
             )
     lines.append("")
     lines.append(payload.get("note", ""))
@@ -74,48 +76,29 @@ async def run_daily_top_trades(store, *, notify: bool = True) -> dict:  # noqa: 
 
 
 async def _auto_execute_paper(store, payload: dict) -> str:  # noqa: ANN001
-    """Ouvre automatiquement les setups prêts en COMPTE DÉMO, pour les tenants qui l'ont activé.
+    """Ouvre automatiquement les setups prêts en COMPTE DÉMO à l'entrée d'une fenêtre de session.
 
-    L'activation est explicite : seuls les tenants ayant DÉJÀ connecté un broker papier sont
-    concernés (connecter le compte démo une fois = donner son accord). Aucun argent réel n'est
-    jamais engagé ici, et les garde-fous de portefeuille (positions max, risque total) s'appliquent.
+    Délègue à `auto_entry_service` — la MÊME veille que celle qui tourne en continu, avec les mêmes
+    garde-fous (papier uniquement, recalcul de la stratégie, pas de doublon). Dupliquer cette
+    logique ici ferait vivre deux chemins d'exécution qui finiraient par diverger.
     """
-    from app.core.config import get_settings
-    from app.services import execution_service
+    from app.services import auto_entry_service
 
-    if not get_settings().playbook_auto_paper_execute:
+    candidates = [p for p in (payload.get("picks") or []) if p.get("tier") in ("ready", "armed")]
+    if not candidates:
         return ""
-    if not any(p.get("tier") == "ready" for p in (payload.get("picks") or [])):
-        return ""
-
-    lines: list[str] = []
     try:
-        tenants = {u.tenant_id for u in store.users.list_all()}
-    except Exception:  # noqa: BLE001
+        report = await auto_entry_service.run_auto_entry(store, candidates=candidates)
+    except Exception as exc:  # noqa: BLE001 — l'exécution ne doit pas casser la veille de session
+        logger.warning("Auto-exécution démo échouée à l'ouverture de session (%s)", exc)
         return ""
-    for tid in tenants:
-        has_paper = any(
-            c.get("mode") == "paper" for c in execution_service.list_connections(store, tid)
-        )
-        if not has_paper:
-            continue  # pas d'opt-in : on ne touche pas au compte
-        try:
-            report = await execution_service.execute_playbook_trades(
-                store, tid, count=get_settings().daily_top_trades_count,
-                picks=payload.get("picks"),
-            )
-        except Exception as exc:  # noqa: BLE001 — un tenant en échec ne bloque pas les autres
-            logger.warning("Auto-exécution démo échouée pour %s (%s)", tid, exc)
-            continue
-        if report["opened"]:
-            logger.info("Auto-exécution démo (%s) : %s", tid, report["summary"])
-            for o in report["opened"]:
-                lines.append(
-                    f"📥 {o['symbol']} {o['side'].upper()} {o['qty']} @ {o['entry']} — "
-                    f"SL {o['stop_loss']} · TP {o['take_profit']} (R/R 1:{o['risk_reward']})"
-                )
-    if not lines:
+    if not report.get("opened"):
         return ""
+    lines = [
+        f"📥 {o['symbol']} {o['side'].upper()} {o['qty']} @ {o['entry']} — "
+        f"SL {o['stop_loss']} · TP {o['take_profit']} (R/R 1:{o['risk_reward']})"
+        for o in report["opened"]
+    ]
     return "🧪 Ouvert automatiquement en COMPTE DÉMO :\n" + "\n".join(lines)
 
 
@@ -223,10 +206,12 @@ async def session_watch_loop() -> None:
             if not fresh:
                 continue
             store = get_store()
-            payload = await signal_service.daily_top_trades()
-            payload["date"] = today
+            # On passe par l'INSTANTANÉ plutôt que de recalculer dans notre coin : sinon la veille
+            # de session et les pages afficheraient deux sélections différentes au même moment.
+            from app.services import live_snapshot
+
+            payload = await live_snapshot.refresh(store)
             payload["trigger_window"] = fresh
-            store.records.put("top_trades", today, payload)
             zone_labels = {
                 "london_open": "🇬🇧 Ouverture de Londres",
                 "newyork_open": "🇺🇸 Ouverture de New York",
@@ -306,6 +291,132 @@ async def edge_sweep_loop() -> None:
         await asyncio.sleep(max(3600, s.edge_sweep_interval_hours * 3600))
 
 
+async def snapshot_loop() -> None:
+    """INSTANTANÉ TEMPS RÉEL — recalcule la stratégie en fond pour que les pages soient instantanées.
+
+    C'est cette boucle qui absorbe le coût (40 symboles × 5 unités de temps). Les pages ne font plus
+    que lire le résultat : elles peuvent donc se rafraîchir toutes les 10 secondes sans jamais
+    attendre. Sans elle, chaque ouverture de page relancerait le calcul complet.
+    """
+    from app.repositories.store import get_store
+    from app.services import live_snapshot
+
+    await asyncio.sleep(5)  # laisser l'API finir de démarrer
+    while True:
+        s = get_settings()
+        if not s.playbook_snapshot_enabled:
+            await asyncio.sleep(60)
+            continue
+        started = datetime.now(UTC)
+        try:
+            payload = await live_snapshot.refresh(get_store())
+            logger.info(
+                "Instantané stratégie : %d setup(s) dont %d exécutable(s) en %.1f s",
+                len(payload.get("picks") or []), payload.get("ready", 0),
+                (datetime.now(UTC) - started).total_seconds(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Échec du rafraîchissement de l'instantané (%s)", exc)
+        # Repos GARANTI entre deux cycles. Si un cycle dure plus longtemps que l'intervalle (réseau
+        # lent, fournisseur qui limite le débit), repartir aussitôt saturerait la machine en continu
+        # — c'est exactement ce qui rendait l'API inutilisable. On laisse toujours respirer.
+        elapsed = (datetime.now(UTC) - started).total_seconds()
+        rest = max(30.0, s.playbook_snapshot_interval - elapsed)
+        if elapsed > s.playbook_snapshot_interval:
+            logger.warning(
+                "Cycle d'instantané plus long que son intervalle (%.0f s > %d s) — "
+                "réduis l'univers ou allonge `playbook_snapshot_interval`",
+                elapsed, s.playbook_snapshot_interval,
+            )
+        await asyncio.sleep(rest)
+
+
+async def auto_entry_loop() -> None:
+    """AUTO-ENTRÉE — surveille les setups ARMÉS et ouvre en démo dès le déclencheur 15 min.
+
+    C'est ce qui remplace le clic : le contexte est déjà validé, il ne manque que le timing, et le
+    timing arrive sans prévenir. Compte DÉMO uniquement (cf. `auto_entry_service`).
+    """
+    from app.repositories.store import get_store
+    from app.services import auto_entry_service
+
+    await asyncio.sleep(20)  # laisser un premier instantané se former
+    while True:
+        s = get_settings()
+        await asyncio.sleep(max(15, s.playbook_auto_entry_interval))
+        if not auto_entry_service.enabled():
+            continue
+        try:
+            report = await auto_entry_service.run_auto_entry(get_store())
+            if report.get("opened"):
+                logger.info("Auto-entrée : %s", report["note"])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Échec de la veille d'auto-entrée (%s)", exc)
+
+
+async def training_loop() -> None:
+    """ENTRAÎNEMENT QUOTIDIEN des agents sur la stratégie (walk-forward + fiches d'expertise).
+
+    Premier passage peu après le démarrage (pour que le classement dispose tout de suite de
+    statistiques mesurées), puis chaque jour à `playbook_training_hour` UTC.
+    """
+    from app.repositories.store import get_store
+    from app.services import training_service
+
+    await asyncio.sleep(120)  # ne pas concurrencer le démarrage
+    store = get_store()
+    training_service.load_from_store(store)
+    if not training_service.is_trained():
+        try:
+            await training_service.run_training(store)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Échec de l'entraînement initial (%s)", exc)
+
+    while True:
+        s = get_settings()
+        now = datetime.now(UTC)
+        target = now.replace(hour=s.playbook_training_hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep(max(60, (target - now).total_seconds()))
+        if not get_settings().playbook_training_enabled:
+            continue
+        try:
+            await training_service.run_training(get_store())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Échec de l'entraînement quotidien (%s)", exc)
+
+
+async def backtest_loop() -> None:
+    """BACKTEST HEBDOMADAIRE de la stratégie sur toutes les paires du desk.
+
+    Beaucoup plus lourd que l'entraînement quotidien (toute la profondeur d'historique × toutes les
+    paires) : il tourne une fois par semaine, le week-end, quand les marchés sont fermés et que la
+    boucle d'instantané n'a rien d'urgent à calculer. C'est lui qui produit le classement des paires
+    par fiabilité, réutilisé ensuite par le classement des trades du jour.
+    """
+    from app.repositories.store import get_store
+    from app.services import training_service
+
+    await asyncio.sleep(300)  # laisser le démarrage se stabiliser
+    while True:
+        s = get_settings()
+        now = datetime.now(UTC)
+        target = now.replace(hour=s.playbook_backtest_hour, minute=0, second=0, microsecond=0)
+        days_ahead = (s.playbook_backtest_weekday - now.weekday()) % 7
+        target += timedelta(days=days_ahead)
+        if target <= now:
+            target += timedelta(days=7)
+        await asyncio.sleep(max(60, (target - now).total_seconds()))
+        if not get_settings().playbook_backtest_enabled:
+            continue
+        try:
+            payload = await training_service.run_backtest_training(get_store())
+            logger.info("Backtest hebdomadaire : %s", payload["conclusion"]["headline"])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Échec du backtest hebdomadaire (%s)", exc)
+
+
 async def positions_loop() -> None:
     """Surveillance continue des positions papier : clôture auto dès qu'un SL/TP est atteint."""
     from app.repositories.store import get_store
@@ -315,8 +426,28 @@ async def positions_loop() -> None:
         interval = max(15, get_settings().position_monitor_interval)
         await asyncio.sleep(interval)
         try:
-            closed = await execution_service.monitor_positions(get_store())
+            store = get_store()
+            # 0) Quarantaine : neutralise les clôtures impossibles (résultat que le marché n'a
+            #    jamais produit). Sans ça, un P&L inventé contaminerait le portefeuille et
+            #    l'apprentissage des agents.
+            report = execution_service.quarantine_impossible_closures(store)
+            if report["count"]:
+                logger.warning("Quarantaine : %d position(s) invalidée(s)", report["count"])
+            # 1) Sécuriser AVANT de vérifier les clôtures : un trade qui a atteint +2R doit voir son
+            #    stop remonté au même passage, sinon un repli dans la même minute le rendrait perdant.
+            secured = await execution_service.secure_open_profits(store)
+            if secured:
+                logger.info("Profit sécurisé : %d position(s) — stop remonté sur +2R", secured)
+            closed = await execution_service.monitor_positions(store)
             if closed:
                 logger.info("Moniteur positions : %d position(s) clôturée(s) automatiquement", closed)
+            # 2) Gel des entrées (plan, Phase 3.3) : si les clôtures du passage viennent de faire
+            #    franchir −3 % (jour) ou −6 % (semaine), on l'annonce UNE fois — le gel lui-même
+            #    est appliqué au moment d'ouvrir (execute_playbook_trades).
+            from app.services import risk_service
+
+            frozen = await risk_service.notify_freezes(store)
+            if frozen:
+                logger.warning("Gel des entrées annoncé à %d tenant(s)", frozen)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Échec du moniteur de positions (%s)", exc)

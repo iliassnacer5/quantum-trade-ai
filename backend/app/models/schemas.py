@@ -55,7 +55,7 @@ class OnboardingRequest(BaseModel):
 
 class GenerateSignalRequest(BaseModel):
     asset: str = "BTC/USDT"
-    timeframe: Timeframe = Timeframe.SWING
+    timeframe: Timeframe = Timeframe.H1
     notify: bool = False
 
 

@@ -9,7 +9,7 @@ import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { api, MarketRegime, SignalsTrackRecord, Wallet } from '@/lib/api';
 import { PageHeader, Card, Stat, Skeleton } from '@/components/ui';
-import { DirectionBadge, UpgradeGate } from '@/components/domain';
+import { DirectionBadge, UpgradeGate, PairVerdictsPanel } from '@/components/domain';
 import { staggerContainer, staggerItem } from '@/lib/motion';
 
 const usd = (n: number) => `${n.toLocaleString('fr-FR', { maximumFractionDigits: 0 })} $`;
@@ -118,6 +118,9 @@ export default function TodayPage() {
           </motion.div>
         )}
       </Card>
+
+      {/* 3 bis. Verdicts par paire de la stratégie (🟢 auto-tradées / 🟡 analysées / 🔴 exclues) */}
+      <PairVerdictsPanel compact />
 
       {/* 4. Track record réel + ce que les filtres t'ont évité */}
       <section className="grid gap-4 md:grid-cols-2">

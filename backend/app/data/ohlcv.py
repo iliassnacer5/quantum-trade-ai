@@ -56,18 +56,40 @@ def _synthetic_ohlcv(interval: str, limit: int) -> list[dict]:
     ]
 
 
-async def get_ohlcv(symbol: str, interval: str = "1h", limit: int = 200) -> list[dict]:
-    """OHLCV horodaté selon la classe d'actif : Binance (crypto), Yahoo (actions/forex), synthétique."""
+async def get_ohlcv_with_source(symbol: str, interval: str = "1h", limit: int = 200) -> dict:
+    """OHLCV horodaté AVEC sa provenance — la fonction de référence du module.
+
+    La source est déterminée par le chargement lui-même, jamais déduite d'un état global posé
+    ailleurs : un appelant qui doit décider si de l'argent a été gagné ne peut pas s'appuyer sur la
+    trace laissée par un autre chargeur, pour un autre symbole, à un autre moment.
+
+    Si la source réelle est indisponible, on ne FABRIQUE rien par défaut : `candles` est vide et
+    `real` vaut False. Une bougie inventée présentée comme réelle est pire qu'une page vide
+    (cf. `data_allow_synthetic`).
+    """
+    from app.core.config import get_settings
     from app.data import markets, yahoo
 
     cls = markets.asset_class(symbol)
     try:
         if cls == "crypto":
             data = await _binance_ohlcv(symbol, interval, limit)
-        else:  # actions / forex -> Yahoo Finance (réel, sans clé)
+        else:  # actions / forex / métaux -> Yahoo Finance (réel, sans clé)
             data = await yahoo.fetch_ohlcv(symbol, interval, limit)
         if len(data) >= 10:
-            return data
+            return {"candles": data, "source": "real", "real": True, "note": ""}
     except Exception as exc:  # noqa: BLE001
-        logger.warning("OHLCV %s (%s) indisponible (%s), repli synthétique", symbol, cls, exc)
-    return _synthetic_ohlcv(interval, limit)
+        logger.warning("OHLCV %s (%s) indisponible (%s)", symbol, cls, exc)
+
+    if not get_settings().data_allow_synthetic:
+        logger.warning("OHLCV %s (%s) : aucune donnée RÉELLE — série vide (pas de fabrication)",
+                       symbol, cls)
+        return {"candles": [], "source": "unavailable", "real": False,
+                "note": f"Aucune donnée réelle disponible pour {symbol} en {interval}."}
+    return {"candles": _synthetic_ohlcv(interval, limit), "source": "synthetic", "real": False,
+            "note": "Données de démonstration — non exploitables pour trader."}
+
+
+async def get_ohlcv(symbol: str, interval: str = "1h", limit: int = 200) -> list[dict]:
+    """Bougies seules. Préférer `get_ohlcv_with_source` dès qu'une DÉCISION en dépend."""
+    return (await get_ohlcv_with_source(symbol, interval, limit))["candles"]

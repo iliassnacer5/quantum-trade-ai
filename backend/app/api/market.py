@@ -18,29 +18,34 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/market", tags=["market"])
 
 _TF_INTERVAL = {
-    Timeframe.SCALP: "5m",
-    Timeframe.INTRADAY: "15m",
-    Timeframe.SWING: "1h",
-    Timeframe.POSITION: "4h",
+    Timeframe.M15: "15m",
+    Timeframe.H1: "1h",
+    Timeframe.H4: "4h",
+    Timeframe.D1: "1d",
 }
 
 
 @router.get("/ohlcv")
 async def ohlcv(
     asset: str = Query("BTC/USDT"),
-    timeframe: Timeframe = Query(Timeframe.SWING),
+    timeframe: Timeframe = Query(Timeframe.H1),
     limit: int = Query(200, ge=20, le=500),
     _user: User = Depends(current_user),
     store: AppStore = Depends(store_dep),
-) -> list[dict]:
+) -> dict:
+    """Bougies d'un actif. La réponse porte sa SOURCE : le graphique ne peut pas afficher des
+    données inventées en les faisant passer pour du marché réel."""
+    from app.data.ohlcv import get_ohlcv_with_source
+
     interval = _TF_INTERVAL.get(timeframe, "1h")
-    data = await get_ohlcv(asset, interval=interval, limit=limit)
-    # Ingestion best-effort vers TimescaleDB (no-op en mode in-memory).
-    try:
-        store.market.upsert_ohlcv(asset, interval, data)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Ingestion OHLCV échouée (%s)", exc)
-    return data
+    payload = await get_ohlcv_with_source(asset, interval=interval, limit=limit)
+    # Ingestion best-effort vers TimescaleDB (no-op en mode in-memory) — jamais de données fictives.
+    if payload["real"]:
+        try:
+            store.market.upsert_ohlcv(asset, interval, payload["candles"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Ingestion OHLCV échouée (%s)", exc)
+    return payload
 
 
 @router.get("/regime")
@@ -72,7 +77,7 @@ async def market_regime(_user: User = Depends(current_user)) -> dict:
 @router.get("/data-source")
 async def data_source(
     asset: str = Query("BTC/USDT"),
-    timeframe: Timeframe = Query(Timeframe.SWING),
+    timeframe: Timeframe = Query(Timeframe.H1),
     _user: User = Depends(current_user),
 ) -> dict:
     """Qualité des données de `asset` : réelles (live/REST) ou synthétiques (démo).

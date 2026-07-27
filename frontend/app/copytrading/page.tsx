@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { api, CopyFollow, PlanInfo, Trader } from '@/lib/api';
 import { PageHeader, Button } from '@/components/ui';
+import { UpgradeGate } from '@/components/domain';
 
 export default function CopyTradingPage() {
   const [plan, setPlan] = useState<PlanInfo | null>(null);
@@ -46,13 +47,20 @@ export default function CopyTradingPage() {
     }
   }
 
+  // Barrière de plan : on utilise le composant PARTAGÉ plutôt qu'un encadré maison, sinon chaque
+  // page finit par avoir sa propre façon d'annoncer la même chose.
   if (locked)
     return (
-      <div className="p-8">
-        <div className="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-6 text-yellow-200">
-          Le copy-trading est réservé au plan <b>Elite</b>.{' '}
-          <a href="/plans" className="underline">Mettre à niveau</a>
-        </div>
+      <div className="space-y-6 p-8">
+        <PageHeader
+          title="Copy-trading"
+          subtitle="Suivre automatiquement les trades d'un trader public."
+        />
+        <UpgradeGate
+          feature="Le copy-trading"
+          plan="Elite"
+          description="Répliquer automatiquement les positions d'un trader public, avec ton propre dimensionnement et tes propres garde-fous de risque."
+        />
       </div>
     );
 

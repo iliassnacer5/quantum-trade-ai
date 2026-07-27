@@ -15,7 +15,7 @@ export default function ScannerPage() {
   const [cls, setCls] = useState('crypto');
   const [symbols, setSymbols] = useState<{ symbol: string; asset_class: string }[]>([]);
   const [symbol, setSymbol] = useState('BTC/USDT');
-  const [tf, setTf] = useState('swing');
+  const [tf, setTf] = useState('1h');
   const [hcOnly, setHcOnly] = useState(false);
 
   const [results, setResults] = useState<any[]>([]);
@@ -82,9 +82,9 @@ export default function ScannerPage() {
     }
   }
 
-  // Rescan AUTOMATIQUE toutes les 3 min une fois le premier scan lancé : les marchés bougent,
-  // l'analyse affichée ne doit pas dater.
-  const autoScan = useAutoRefresh(scan, 180_000, scanned);
+  // Rescan AUTOMATIQUE toutes les 10 s une fois le premier scan lancé : les marchés bougent, et
+  // le verdict de la stratégie est lu dans l'instantané pré-calculé (aucun recalcul lourd ici).
+  const autoScan = useAutoRefresh(scan, 10_000, scanned);
 
   // Lance un trade PAPIER directement depuis une carte de scan : génère le signal complet (SL/TP)
   // puis ouvre la position. Refuse si le signal consolidé est HOLD (cohérent avec l'analyse).

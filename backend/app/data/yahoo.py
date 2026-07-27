@@ -17,7 +17,23 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; QuantumTradeAI/1.0)"}
 # Yahoo ne propose pas 4h : on rabat sur 1h (position trading reste pertinent).
 # "1M" = MENSUEL (étape 1 du playbook) — 10 ans d'historique pour des niveaux majeurs solides.
 _INTERVAL = {"5m": "5m", "15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d", "1w": "1wk", "1M": "1mo"}
+# Plage par défaut : assez pour l'analyse courante, sans télécharger des années inutilement.
 _RANGE = {"5m": "5d", "15m": "1mo", "1h": "3mo", "4h": "3mo", "1d": "2y", "1w": "5y", "1M": "10y"}
+
+# Plage MAXIMALE réellement servie par Yahoo, par intervalle. Mesuré, pas supposé : au-delà, l'API
+# répond 422 « data not available for startTime=… ». C'est ce qui borne la profondeur d'un backtest
+# intraday — le 15 min ne remonte pas au-delà de ~60 jours, quoi qu'on demande.
+_RANGE_DEEP = {"5m": "60d", "15m": "60d", "1h": "730d", "4h": "730d",
+               "1d": "10y", "1w": "10y", "1M": "10y"}
+# Au-delà de ce nombre de bougies demandées, on bascule sur la plage maximale (mode backtest).
+_DEEP_THRESHOLD = 1200
+
+
+def _range_for(interval: str, limit: int) -> str:
+    """Plage à demander : la plus courte qui couvre `limit` bougies, pour ne pas surcharger l'API."""
+    if limit >= _DEEP_THRESHOLD:
+        return _RANGE_DEEP.get(interval, _RANGE.get(interval, "3mo"))
+    return _RANGE.get(interval, "3mo")
 
 
 # Métaux précieux -> futures COMEX Yahoo (réels, AVEC volume, sans clé).
@@ -40,7 +56,7 @@ async def fetch_ohlcv(symbol: str, interval: str = "1h", limit: int = 200) -> li
     import httpx
 
     ysym = to_yahoo_symbol(symbol)
-    params = {"interval": _INTERVAL.get(interval, "1h"), "range": _RANGE.get(interval, "3mo")}
+    params = {"interval": _INTERVAL.get(interval, "1h"), "range": _range_for(interval, limit)}
     async with httpx.AsyncClient(timeout=12, headers=_HEADERS) as client:
         resp = await client.get(_CHART_URL.format(symbol=ysym), params=params)
         resp.raise_for_status()
@@ -63,4 +79,35 @@ async def fetch_ohlcv(symbol: str, interval: str = "1h", limit: int = 200) -> li
             "time": int(t), "open": float(o), "high": float(h), "low": float(low),
             "close": float(c), "volume": float(vols[i] or 0) if i < len(vols) else 0.0,
         })
+    # Yahoo ne sert pas de 4 h : on AGRÈGE les bougies horaires au lieu de les renvoyer telles
+    # quelles. Sans cette étape, l'étape 3 de la stratégie (« le 4 h confirme ») analyserait en
+    # réalité du 1 h — deux unités de temps différentes portant le même nom.
+    if interval == "4h":
+        rows = resample(rows, 4 * 3600)
     return rows[-limit:]
+
+
+def resample(rows: list[dict], bucket_seconds: int) -> list[dict]:
+    """Agrège des bougies en bougies plus longues, alignées sur l'horloge UTC.
+
+    L'alignement sur l'horloge (00:00, 04:00, 08:00…) et non sur la première bougie reçue est
+    important : c'est le découpage que voient les autres intervenants, donc celui sur lequel se
+    forment les niveaux que l'on cherche à lire.
+    """
+    out: list[dict] = []
+    current: dict | None = None
+    for r in rows:
+        bucket = (r["time"] // bucket_seconds) * bucket_seconds
+        if current is None or current["time"] != bucket:
+            if current is not None:
+                out.append(current)
+            current = {"time": bucket, "open": r["open"], "high": r["high"],
+                       "low": r["low"], "close": r["close"], "volume": r["volume"]}
+            continue
+        current["high"] = max(current["high"], r["high"])
+        current["low"] = min(current["low"], r["low"])
+        current["close"] = r["close"]
+        current["volume"] += r["volume"]
+    if current is not None:
+        out.append(current)
+    return out

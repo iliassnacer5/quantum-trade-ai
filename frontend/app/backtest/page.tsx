@@ -1,161 +1,273 @@
 'use client';
 
-import { useState } from 'react';
-import { api, BacktestConfig, BacktestReport } from '@/lib/api';
-import { PageHeader, RouteTabs, PROVE_TABS } from '@/components/ui';
+/**
+ * MOTEUR DE BACKTEST — tester une configuration précise sur l'historique d'une paire.
+ *
+ * Mêmes sélecteurs que le Scanner (marché → paire → unité de temps) : on ne devrait pas avoir à
+ * taper un symbole à la main ici et le choisir dans une liste ailleurs.
+ *
+ * À ne pas confondre avec le RAPPORT (`/backtest/rapport`), qui présente le backtest de la
+ * stratégie du desk sur toutes les paires : ici on teste UNE configuration, là-bas on mesure LA
+ * méthode.
+ */
+
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { api, type BacktestConfig, type BacktestReport } from '@/lib/api';
+import { MarketSelector } from '@/components/domain';
+import {
+  Button, Card, EmptyState, PageHeader, PROVE_TABS, RouteTabs,
+  Table, TBody, TD, TH, THead, TR,
+} from '@/components/ui';
+import { TIMEFRAMES } from '@/lib/markets';
+
+const PERIODS = [
+  { days: 30, label: '30 jours' },
+  { days: 90, label: '3 mois' },
+  { days: 180, label: '6 mois' },
+  { days: 365, label: '1 an' },
+];
+
+function iso(daysAgo: number): string {
+  return new Date(Date.now() - daysAgo * 86_400_000).toISOString();
+}
+
+function Kpi({ label, value, tone, help }: { label: string; value: string; tone?: 'buy' | 'sell'; help?: string }) {
+  return (
+    <Card className="p-4" title={help}>
+      <div className="text-xs text-muted">{label}</div>
+      <div className={`text-2xl font-bold ${tone === 'buy' ? 'text-buy' : tone === 'sell' ? 'text-sell' : 'text-white'}`}>
+        {value}
+      </div>
+    </Card>
+  );
+}
 
 export default function BacktestPage() {
   const [report, setReport] = useState<BacktestReport | null>(null);
   const [loading, setLoading] = useState(false);
-  const [config, setConfig] = useState<BacktestConfig>({
-    symbol: 'BTC/USDT',
-    timeframe: '1h',
-    start_time: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
-    end_time: new Date().toISOString(),
-    initial_capital: 10000,
-    risk_per_trade_pct: 1.0,
-    use_llm: false
-  });
+  const [error, setError] = useState<string | null>(null);
 
-  const handleRun = async () => {
+  // Sélecteurs — identiques au Scanner.
+  const [cls, setCls] = useState('forex');
+  const [symbols, setSymbols] = useState<{ symbol: string; asset_class: string }[]>([]);
+  const [symbol, setSymbol] = useState('EUR/USD');
+  const [tf, setTf] = useState('1h');
+  const [days, setDays] = useState(90);
+  const [capital, setCapital] = useState(10_000);
+  const [riskPct, setRiskPct] = useState(1.0);
+  const [useLlm, setUseLlm] = useState(false);
+
+  // Catalogue filtré par marché : on choisit une paire dans une liste, jamais à la main.
+  useEffect(() => {
+    api.symbols(undefined, cls || undefined)
+      .then((d) => {
+        setSymbols(d.results);
+        if (d.results.length && !d.results.some((s) => s.symbol === symbol)) {
+          setSymbol(d.results[0].symbol);
+        }
+      })
+      .catch(() => setSymbols([]));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cls]);
+
+  const config: BacktestConfig = useMemo(() => ({
+    symbol,
+    timeframe: TIMEFRAMES.find((t) => t.tf === tf)?.interval ?? tf,
+    start_time: iso(days),
+    end_time: new Date().toISOString(),
+    initial_capital: capital,
+    risk_per_trade_pct: riskPct,
+    use_llm: useLlm,
+  }), [symbol, tf, days, capital, riskPct, useLlm]);
+
+  const run = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
-      const res = await api.runBacktest(config);
-      setReport(res);
-    } catch (e) {
-      console.error(e);
-      alert('Erreur lors du backtest');
+      setReport(await api.runBacktest(config));
+    } catch (e: any) {
+      setError(e.message ?? 'Le backtest a échoué.');
+      setReport(null);
     } finally {
       setLoading(false);
     }
-  };
+  }, [config]);
+
+  const m = report?.metrics;
 
   return (
-    <div className="p-8 space-y-6 text-white">
-      <PageHeader title="Moteur de Backtesting" subtitle="Teste une configuration sur l’historique — frais et slippage inclus." />
+    <div className="space-y-6 p-8">
+      <PageHeader
+        title="Moteur de backtest"
+        subtitle="Teste UNE configuration sur l'historique d'une paire — frais et slippage inclus."
+      />
       <RouteTabs items={PROVE_TABS} />
 
-      <div className="bg-[#1A1A1A] p-6 rounded-xl border border-white/5 space-y-4">
-        <h2 className="text-xl font-semibold">Configuration</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Actif</label>
-            <input 
-              type="text" 
-              className="w-full bg-[#2A2A2A] rounded px-3 py-2 text-white"
-              value={config.symbol}
-              onChange={e => setConfig({...config, symbol: e.target.value})}
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Timeframe</label>
-            <input 
-              type="text" 
-              className="w-full bg-[#2A2A2A] rounded px-3 py-2 text-white"
-              value={config.timeframe}
-              onChange={e => setConfig({...config, timeframe: e.target.value})}
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Capital Initial ($)</label>
-            <input 
-              type="number" 
-              className="w-full bg-[#2A2A2A] rounded px-3 py-2 text-white"
-              value={config.initial_capital}
-              onChange={e => setConfig({...config, initial_capital: Number(e.target.value)})}
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Risque / Trade (%)</label>
-            <input 
-              type="number" 
-              step="0.1"
-              className="w-full bg-[#2A2A2A] rounded px-3 py-2 text-white"
-              value={config.risk_per_trade_pct}
-              onChange={e => setConfig({...config, risk_per_trade_pct: Number(e.target.value)})}
-            />
-          </div>
-        </div>
-        
-        <div className="flex items-center space-x-2 pt-2">
-          <input 
-            type="checkbox" 
-            id="use_llm"
-            checked={config.use_llm}
-            onChange={e => setConfig({...config, use_llm: e.target.checked})}
-            className="rounded bg-[#2A2A2A] border-transparent"
-          />
-          <label htmlFor="use_llm" className="text-sm">Activer les LLM (Grounding, Sentiment)</label>
-        </div>
-        
-        <button 
-          onClick={handleRun} 
-          disabled={loading}
-          className="mt-4 px-6 py-2 bg-blue-600 hover:bg-blue-700 rounded font-medium disabled:opacity-50"
-        >
-          {loading ? 'Simulation en cours...' : 'Lancer le Backtest'}
-        </button>
-      </div>
+      <Card className="border-accent/40 bg-accent/5 p-4">
+        <p className="text-sm text-white">
+          Tu cherches le backtest de <strong>la stratégie du desk</strong> sur toutes les paires ?
+        </p>
+        <p className="mt-0.5 text-[11px] text-muted">
+          Il est sur la page <a href="/backtest/rapport" className="text-accent underline">Rapport de backtest</a> :
+          classement des paires par fiabilité, profil des trades perdants, méthode et limites.
+          Ici, on teste une configuration ponctuelle.
+        </p>
+      </Card>
 
-      {report && (
-        <div className="space-y-6">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="bg-[#1A1A1A] p-4 rounded-xl border border-white/5">
-              <div className="text-sm text-gray-400">Total PnL</div>
-              <div className={`text-2xl font-bold ${report.metrics.total_pnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                ${report.metrics.total_pnl.toFixed(2)} ({report.metrics.total_pnl_pct.toFixed(2)}%)
+      {/* ---- Sélecteurs (mêmes que le Scanner) ---- */}
+      <Card className="space-y-4 p-6">
+        <h2 className="text-lg font-semibold text-white">Configuration</h2>
+        <div className="flex flex-wrap items-end gap-4">
+          <div>
+            <label className="mb-1 block text-xs text-muted">Marché</label>
+            <MarketSelector value={cls} onChange={setCls} label={null} />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-muted">Paire / Symbole</label>
+            <select
+              value={symbol}
+              onChange={(e) => setSymbol(e.target.value)}
+              className="rounded-lg border border-border bg-background px-3 py-2 font-mono text-sm outline-none focus:border-accent"
+            >
+              {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-muted">Unité de temps</label>
+            <select
+              value={tf}
+              onChange={(e) => setTf(e.target.value)}
+              className="rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-accent"
+            >
+              {TIMEFRAMES.map((t) => <option key={t.tf} value={t.tf}>{t.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-muted">Période</label>
+            <select
+              value={days}
+              onChange={(e) => setDays(Number(e.target.value))}
+              className="rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-accent"
+            >
+              {PERIODS.map((p) => <option key={p.days} value={p.days}>{p.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-muted">Capital initial</label>
+            <input
+              type="number"
+              value={capital}
+              onChange={(e) => setCapital(Number(e.target.value))}
+              className="w-32 rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-accent"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-muted">Risque / trade (%)</label>
+            <input
+              type="number"
+              step="0.1"
+              value={riskPct}
+              onChange={(e) => setRiskPct(Number(e.target.value))}
+              className="w-24 rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-accent"
+            />
+          </div>
+          <Button onClick={run} loading={loading}>
+            {loading ? 'Simulation…' : 'Lancer le backtest'}
+          </Button>
+        </div>
+        <label className="flex items-center gap-2 text-sm text-muted">
+          <input type="checkbox" checked={useLlm} onChange={(e) => setUseLlm(e.target.checked)} />
+          Activer les agents LLM (plus lent, et coûte des appels — le résultat déterministe suffit
+          dans la plupart des cas)
+        </label>
+      </Card>
+
+      {error && <p className="text-sell">{error}</p>}
+
+      {!report && !loading && (
+        <EmptyState
+          title="Aucun backtest lancé"
+          description="Choisis un marché, une paire et une période, puis lance la simulation."
+        />
+      )}
+
+      {report && m && (
+        <div className="space-y-4">
+          <p className="text-xs text-muted">
+            <span className="font-mono text-white/80">{report.config.symbol}</span> ·{' '}
+            {report.config.timeframe} · capital {report.config.initial_capital} ·
+            risque {report.config.risk_per_trade_pct} % par trade
+          </p>
+
+          <div className="grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-6">
+            <Kpi
+              label="P&L total"
+              value={`${m.total_pnl.toFixed(2)} (${m.total_pnl_pct.toFixed(2)} %)`}
+              tone={m.total_pnl >= 0 ? 'buy' : 'sell'}
+            />
+            <Kpi label="Trades" value={`${m.total_trades}`} />
+            <Kpi
+              label="Taux de réussite"
+              value={`${(m.win_rate * 100).toFixed(1)} %`}
+              help="Seul, ce chiffre ne dit rien : il doit se lire avec le profit factor."
+            />
+            <Kpi
+              label="Profit factor"
+              value={m.profit_factor.toFixed(2)}
+              tone={m.profit_factor >= 1.5 ? 'buy' : m.profit_factor < 1 ? 'sell' : undefined}
+              help="Somme des gains ÷ somme des pertes. Sous 1, la stratégie perd de l'argent."
+            />
+            <Kpi
+              label="Drawdown max"
+              value={`${m.max_drawdown_pct.toFixed(2)} %`}
+              tone="sell"
+              help="Pire perte cumulée depuis un sommet — ce qu'il faut pouvoir encaisser."
+            />
+            <Kpi label="Sharpe" value={m.sharpe_ratio.toFixed(2)} />
+          </div>
+
+          <Card className="p-6">
+            <h2 className="mb-3 text-lg font-semibold text-white">
+              Historique des trades ({m.total_trades})
+            </h2>
+            {report.trades.length === 0 ? (
+              <p className="text-sm text-muted">
+                Aucun trade sur cette période : les filtres de qualité n&apos;ont jamais été
+                entièrement satisfaits. C&apos;est un résultat, pas une panne.
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <Table>
+                  <THead>
+                    <TR>
+                      <TH>Entrée</TH><TH>Sens</TH>
+                      <TH className="text-right">Prix entrée</TH>
+                      <TH className="text-right">Prix sortie</TH>
+                      <TH className="text-right">P&L</TH>
+                    </TR>
+                  </THead>
+                  <TBody>
+                    {report.trades.map((t: any, i: number) => (
+                      <TR key={i}>
+                        <TD className="text-muted">{new Date(t.entry_time).toLocaleString('fr-FR')}</TD>
+                        <TD className={t.direction === 'BUY' ? 'text-buy' : 'text-sell'}>{t.direction}</TD>
+                        <TD className="text-right font-mono">{t.entry_price?.toFixed(5)}</TD>
+                        <TD className="text-right font-mono">{t.exit_price?.toFixed(5)}</TD>
+                        <TD className={`text-right font-medium ${t.pnl >= 0 ? 'text-buy' : 'text-sell'}`}>
+                          {t.pnl?.toFixed(2)} ({t.pnl_pct?.toFixed(2)} %)
+                        </TD>
+                      </TR>
+                    ))}
+                  </TBody>
+                </Table>
               </div>
-            </div>
-            <div className="bg-[#1A1A1A] p-4 rounded-xl border border-white/5">
-              <div className="text-sm text-gray-400">Win Rate</div>
-              <div className="text-2xl font-bold">{(report.metrics.win_rate * 100).toFixed(1)}%</div>
-            </div>
-            <div className="bg-[#1A1A1A] p-4 rounded-xl border border-white/5">
-              <div className="text-sm text-gray-400">Profit Factor</div>
-              <div className="text-2xl font-bold">{report.metrics.profit_factor.toFixed(2)}</div>
-            </div>
-            <div className="bg-[#1A1A1A] p-4 rounded-xl border border-white/5">
-              <div className="text-sm text-gray-400">Max Drawdown</div>
-              <div className="text-2xl font-bold text-red-500">{report.metrics.max_drawdown_pct.toFixed(2)}%</div>
-            </div>
-          </div>
-          
-          <div className="bg-[#1A1A1A] p-6 rounded-xl border border-white/5">
-            <h2 className="text-xl font-semibold mb-4">Historique des Trades ({report.metrics.total_trades})</h2>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm text-left">
-                <thead className="text-xs text-gray-400 uppercase bg-[#2A2A2A]">
-                  <tr>
-                    <th className="px-4 py-3">Date Entry</th>
-                    <th className="px-4 py-3">Sens</th>
-                    <th className="px-4 py-3">Prix Entrée</th>
-                    <th className="px-4 py-3">Prix Sortie</th>
-                    <th className="px-4 py-3">PnL</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {report.trades.map((t, i) => (
-                    <tr key={i} className="border-b border-white/5">
-                      <td className="px-4 py-3">{new Date(t.entry_time).toLocaleString()}</td>
-                      <td className={`px-4 py-3 font-medium ${t.direction === 'BUY' ? 'text-green-500' : 'text-red-500'}`}>
-                        {t.direction}
-                      </td>
-                      <td className="px-4 py-3">${t.entry_price.toFixed(2)}</td>
-                      <td className="px-4 py-3">${t.exit_price.toFixed(2)}</td>
-                      <td className={`px-4 py-3 font-medium ${t.pnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                        ${t.pnl.toFixed(2)} ({t.pnl_pct.toFixed(2)}%)
-                      </td>
-                    </tr>
-                  ))}
-                  {report.trades.length === 0 && (
-                    <tr>
-                      <td colSpan={5} className="px-4 py-4 text-center text-gray-500">Aucun trade exécuté</td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
+            )}
+          </Card>
+
+          <p className="text-[11px] text-muted">
+            Frais et slippage sont inclus dans la simulation. Un résultat passé ne prédit pas le
+            futur — il décrit ce qu&apos;aurait donné cette configuration sur la période choisie.
+          </p>
         </div>
       )}
     </div>

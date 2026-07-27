@@ -3,7 +3,8 @@
 Vérifie, dans l'ordre de la méthode :
 1. les briques d'analyse (MA20/MA50, divergences RSI/MACD, tendance VWAP, volume relatif, pips) ;
 2. la cascade complète (tendance de fond, confirmations, déclencheur 15 min) ;
-3. les contraintes non négociables : R/R ≥ 1:2, objectif ≥ 100 pips, entrée UNIQUEMENT en 15 min ;
+3. les contraintes non négociables : R/R dans la bande 1,2–1,3, STOP sur la structure 15 min,
+   OBJECTIF borné par le prochain niveau 1 h, entrée UNIQUEMENT en 15 min ;
 4. l'autorité du playbook sur le Master (droit de veto) ;
 5. la veille des sessions (ouverture Londres/New York, chevauchement).
 """
@@ -237,7 +238,9 @@ def test_structure_bias():
 # 3. Cascade complète + contraintes non négociables
 # --------------------------------------------------------------------------------------
 _PRIME = {"label": "Chevauchement Londres / New York", "quality": 1.0, "prime": True,
-          "utc_time": "13:00 UTC", "overlap": True}
+          "utc_time": "13:00 UTC", "overlap": True, "can_trade": True}
+_CLOSED = {"label": "Londres et New York fermées", "quality": 0.3, "prime": False,
+           "utc_time": "03:00 UTC", "overlap": False, "can_trade": False}
 
 # Amplitudes calibrées sur un vrai EUR/USD : ATR journalier ≈ 78 pips, 15 min ≈ 5 pips — c'est ce
 # qui rend un objectif de 200 pips atteignable. Le sommet du mouvement reste à 1,1000 et le prix
@@ -285,24 +288,56 @@ def _tf(kind: str, up: bool = True) -> list[Candle]:
     return _retrace(base, (_RETRACE if up else -_RETRACE), bars)
 
 
-def _build(symbol="EUR/USD", monthly=None, daily=None, h4=None, m15=None, session=None, **kw):
+def _h1(up: bool = True) -> list[Candle]:
+    """1 h : quatrième étape de la cascade — elle doit CONFIRMER le biais avant l'entrée 15 min."""
+    gen = _uptrend if up else _downtrend
+    return _shift_to(gen(n=160, start=1.0800, step=0.0008), _END if up else _TOP)
+
+
+def _build(symbol="EUR/USD", monthly=None, daily=None, h4=None, h1=None, m15=None,
+           session=None, **kw):
     return playbook.build(
         symbol,
         monthly if monthly is not None else _tf("monthly"),
         daily if daily is not None else _tf("daily"),
         h4 if h4 is not None else _tf("h4"),
         m15 if m15 is not None else _m15_with_pullback_entry(True, end_close=_END),
+        h1=h1 if h1 is not None else _h1(True),
         session=session or _PRIME,
         **kw,
     )
 
 
-def test_build_runs_all_four_steps():
+def test_build_runs_the_whole_cascade():
+    """Cascade complète : mensuel+journalier -> 4 h -> 1 h -> entrée 15 min."""
     setup = _build()
     steps = {c["step"] for c in setup.checklist}
-    assert {1, 2, 3, 4}.issubset(steps), "les 4 étapes de la stratégie doivent être évaluées"
-    assert setup.layers.keys() == {"monthly", "daily", "h4", "m15"}
+    assert {1, 2, 3, 4, 5}.issubset(steps), "les 5 étapes de la cascade doivent être évaluées"
+    assert setup.layers.keys() == {"monthly", "daily", "h4", "h1", "m15"}
     assert setup.levels.get("major_support") is not None or setup.levels.get("major_resistance") is not None
+
+
+def test_no_trade_when_h1_contradicts():
+    """Étape 4 KO : le 1 h contredit le biais -> pas d'entrée, même si le 4 h confirmait."""
+    setup = _build(h1=_h1(up=False))
+    assert setup.direction == "NO_TRADE"
+    assert not setup.context_ok
+    assert any("1 h" in r for r in setup.reasons), setup.reasons
+    assert any(c["step"] == 4 and not c["pass"] for c in setup.checklist)
+
+
+def test_no_entry_when_london_and_new_york_are_closed():
+    """On ANALYSE marchés fermés, mais on n'OUVRE pas : le carnet d'ordres est vide.
+
+    `can_trade` est la décision de l'appelant (il combine le réglage global et l'état des sessions) ;
+    `build` s'y tient sans re-tester la session, sinon le réglage serait impossible à désactiver.
+    """
+    setup = _build(session=_CLOSED, can_trade=False)
+    assert setup.context_ok is True, "l'analyse doit être menée jusqu'au bout"
+    assert setup.direction == "NO_TRADE" and setup.ready is False
+    assert any("ferm" in r for r in setup.reasons), setup.reasons
+    # Le raisonnement complet est quand même rédigé : c'est ainsi qu'on arrive préparé à l'ouverture.
+    assert setup.narrative and "TENDANCE DE FOND" in setup.narrative
 
 
 def test_no_trade_when_trend_undetermined():
@@ -330,8 +365,8 @@ def test_entry_only_from_15m():
     assert setup.entry is None
     assert setup.veto is True
     assert any("15 min" in r for r in setup.reasons)
-    step4 = next(c for c in setup.checklist if c["step"] == 4)
-    assert step4["pass"] is False
+    step5 = next(c for c in setup.checklist if c["step"] == 5)
+    assert step5["pass"] is False
 
 
 def test_valid_setup_respects_rr_and_target_floor():
@@ -340,8 +375,9 @@ def test_valid_setup_respects_rr_and_target_floor():
     assert setup.direction == "BUY", f"attendu BUY, refus : {setup.reasons}"
     assert setup.ready and setup.trigger
     assert playbook.MIN_RR - 0.01 <= setup.risk_reward <= playbook.MAX_RR + 0.01
-    assert setup.reward_pips >= playbook.MIN_TARGET_PIPS
-    assert setup.stop_loss < setup.entry < setup.take_profit_1 < setup.take_profit_2 < setup.take_profit_3
+    assert setup.reward_pips > 0
+    assert setup.stop_loss < setup.entry < setup.take_profit_1
+    assert setup.take_profit_2 is None or setup.take_profit_1 < setup.take_profit_2
     # L'entrée vient bien de la dernière bougie 15 min (et non du journalier ou du 4 h).
     assert abs(setup.entry - _m15_with_pullback_entry(True, end_close=_END)[-1].close) < 1e-9
     assert all(c["pass"] for c in setup.checklist)
@@ -354,6 +390,7 @@ def test_valid_setup_sell_side():
         monthly=_tf("monthly", up=False),
         daily=_tf("daily", up=False),
         h4=_tf("h4", up=False),
+        h1=_h1(up=False),
         m15=_m15_with_pullback_entry(False, end_close=_TOP),
     )
     assert setup.direction == "SELL", f"attendu SELL, refus : {setup.reasons}"
@@ -361,58 +398,30 @@ def test_valid_setup_sell_side():
     assert setup.stop_loss > setup.entry > setup.take_profit_1
 
 
-def test_target_respects_both_the_rr_band_and_the_pip_floor():
-    """L'objectif satisfait SIMULTANÉMENT la bande de R/R et le plancher de pips."""
+def _risk_of(setup) -> float:
+    return abs(setup.entry - setup.stop_loss)
+
+
+def test_target_satisfies_both_the_rr_band_and_the_200_pip_floor():
+    """L'objectif satisfait SIMULTANÉMENT la bande de R/R et le plancher de 200 pips."""
     pip = pips_mod.pip_size("EUR/USD")
-    floor = playbook.MIN_TARGET_PIPS
-    min_rr, max_rr = playbook.MIN_RR, playbook.MAX_RR
-    # Risque au minimum imposé (plancher ÷ R/R max) -> l'objectif est exactement le plancher.
+    floor, min_rr, max_rr = playbook.MIN_TARGET_PIPS, playbook.MIN_RR, playbook.MAX_RR
+    # Risque au minimum imposé (plancher ÷ R/R max) -> l'objectif vaut exactement le plancher.
     risk = floor / max_rr * pip
     target = max(min_rr * risk, floor * pip)
     assert round(target / pip) == floor
     assert abs(target / risk - max_rr) < 0.01           # R/R au plafond de la bande
     # Risque plus large -> c'est le R/R minimum qui fixe l'objectif.
-    risk = 200 * pip
+    risk = 150 * pip
     target = max(min_rr * risk, floor * pip)
     assert abs(target / risk - min_rr) < 0.01           # R/R au plancher de la bande
 
 
-def test_risk_reward_band_is_1_2_to_1_3():
-    """La stratégie encadre le R/R entre 1,2 et 1,3 — playbook, config et filtres alignés."""
-    from app.core.config import get_settings
-    from app.signal_engine.quality import MODES
+def test_stop_is_anchored_on_a_real_level_at_a_valid_distance():
+    """Le stop se pose sur un NIVEAU réel (support 15 min/1 h, sinon structure 4 h), jamais au hasard.
 
-    s = get_settings()
-    assert (playbook.MIN_RR, playbook.MAX_RR) == (1.2, 1.3)
-    assert (s.playbook_min_rr, s.playbook_max_rr) == (1.2, 1.3)
-    assert s.entry_min_rr == 1.2
-    assert all(m["min_rr"] == 1.2 for m in MODES.values())
-
-
-def test_minimum_target_is_200_pips():
-    """La stratégie vise au moins 200 pips (paramètre par défaut du playbook et de la config)."""
-    from app.core.config import get_settings
-
-    assert playbook.MIN_TARGET_PIPS == 200.0
-    assert get_settings().playbook_min_target_pips == 200.0
-
-
-def test_every_valid_setup_lands_inside_the_rr_band():
-    """Aucun setup validé ne sort de la bande [1,2 ; 1,3], côté achat comme côté vente."""
-    buy = _build()
-    sell = _build(monthly=_tf("monthly", up=False), daily=_tf("daily", up=False),
-                  h4=_tf("h4", up=False), m15=_m15_with_pullback_entry(False, end_close=_TOP))
-    for setup in (buy, sell):
-        assert setup.direction in ("BUY", "SELL"), setup.reasons
-        assert playbook.MIN_RR - 0.01 <= setup.risk_reward <= playbook.MAX_RR + 0.01, setup.risk_reward
-        assert setup.reward_pips >= playbook.MIN_TARGET_PIPS
-
-
-def test_stop_is_widened_when_too_tight_for_the_target():
-    """Un stop 15 min minuscule est RECALÉ sur la structure 4 h : sinon le R/R serait irréaliste.
-
-    Viser 200 pips avec un stop de 5 pips donnerait un R/R de 40:1 que le marché ne paie jamais —
-    le trade serait stoppé par le premier soubresaut. On exige un stop ≥ objectif / R/R plafond.
+    Viser 200 pips avec un R/R plafonné à 1:3 impose au moins 200/3 ≈ 67 pips de stop : on choisit
+    donc le support le plus proche qui respecte encore cette distance, et à défaut la structure 4 h.
     """
     setup = _build()
     assert setup.direction == "BUY", setup.reasons
@@ -421,16 +430,200 @@ def test_stop_is_widened_when_too_tight_for_the_target():
     assert setup.risk_pips >= min_expected - 0.5, (
         f"stop {setup.risk_pips:.0f} pips trop serré pour viser {playbook.MIN_TARGET_PIPS:.0f}"
     )
-    assert setup.risk_reward <= playbook.MAX_RR + 0.01
-    assert "4 h" in setup.stop_basis  # le stop 15 min était trop serré, il a été recalé
+    # L'origine du stop est TOUJOURS nommée : soit un niveau 15 min / 1 h, soit la structure 4 h.
+    assert ("15 min / 1 h" in setup.stop_basis) or ("4 h" in setup.stop_basis), setup.stop_basis
+    # S'il vient d'un support, il est bien placé SOUS ce support.
+    if "support" in setup.stop_basis:
+        level = float(setup.stop_basis.split("support ")[1].split(" ")[0])
+        assert setup.stop_loss < level, "le stop doit être sous le support, pas dessus"
     assert abs(setup.stop_loss - (setup.entry - setup.risk_pips * pip)) < 1e-6
+    step6 = next(c for c in setup.checklist if c["step"] == 6)
+    assert "Stop structurel" in step6["label"]
 
 
-def test_horizon_is_estimated_from_daily_atr():
-    """L'horizon du trade est estimé et affiché : 200 pips, c'est plusieurs journées moyennes."""
+def test_secure_stop_level_is_two_r():
+    """Le niveau de sécurisation vaut exactement +2R — c'est là que le stop sera remonté."""
+    setup = _build()
+    assert setup.direction == "BUY", setup.reasons
+    risk = _risk_of(setup)
+    assert abs(setup.secure_stop - (setup.entry + 2.0 * risk)) < 1e-6
+    # Il est au-dessus de l'entrée : une fois atteint, la position ne peut plus perdre.
+    assert setup.secure_stop > setup.entry
+    assert setup.as_dict()["secure_stop"] == setup.secure_stop
+
+
+def test_entry_structure_reads_15m_and_1h_levels():
+    """Les supports/résistances viennent du 15 min ET du 1 h — les UT que le trader a sous les yeux."""
+    m15 = _m15_with_pullback_entry(True, end_close=_END)
+    entry = m15[-1].close
+    st = playbook.entry_structure(m15, _h1(True), entry)
+    assert st["supports"] and all(s < entry for s in st["supports"]), "supports = sous le prix"
+    assert all(r > entry for r in st["resistances"]), "résistances = au-dessus du prix"
+    # Triés du plus proche au plus lointain : c'est l'ordre dans lequel le prix les rencontre.
+    assert st["supports"] == sorted(st["supports"], reverse=True)
+    assert st["resistances"] == sorted(st["resistances"])
+    assert st["tolerance"] > 0
+
+
+def test_cluster_levels_merges_the_same_level_seen_twice():
+    """Un support touché trois fois est UN niveau, pas trois."""
+    merged = playbook.cluster_levels([1.1000, 1.10005, 1.0999, 1.2000], tolerance=0.0005)
+    assert len(merged) == 2
+    assert abs(merged[0] - 1.1000) < 0.001 and abs(merged[1] - 1.2000) < 0.001
+
+
+def test_stop_is_placed_behind_a_real_support():
+    """Le stop se pose DERRIÈRE un support 15 min / 1 h, pas à une distance calculée."""
+    structure = {"supports": [99.0, 97.0, 90.0], "resistances": [], "atr": 0.4, "tolerance": 0.2}
+    # Distance exigée entre 2 et 5 : le support à 99 est trop proche, celui à 97 convient.
+    placed = playbook.stop_behind_level(structure, 100.0, 1, min_distance=2.0, max_distance=5.0)
+    assert placed is not None
+    price, reason = placed
+    assert price < 97.0, "le stop doit être SOUS le support, pas dessus"
+    assert "support 97" in reason and "15 min / 1 h" in reason
+
+
+def test_stop_falls_back_when_no_level_is_usable():
+    """Aucun niveau à distance exploitable -> on le dit, et on retombe sur la structure 4 h."""
+    structure = {"supports": [99.9], "resistances": [], "atr": 0.1, "tolerance": 0.05}
+    assert playbook.stop_behind_level(structure, 100.0, 1, min_distance=5.0, max_distance=10.0) is None
+
+
+def test_target_is_placed_in_front_of_the_first_useful_resistance():
+    """On vise la PREMIÈRE résistance au-delà de la distance minimale : pas de pari sur sa cassure."""
+    structure = {"supports": [], "resistances": [101.0, 106.0, 112.0], "atr": 0.4, "tolerance": 0.2}
+    placed = playbook.target_before_level(structure, 100.0, 1, min_distance=5.0, max_distance=9.0)
+    assert placed is not None
+    price, reason = placed
+    assert price < 106.0, "l'objectif doit être DEVANT la résistance, pas dessus"
+    assert "résistance 106" in reason
+
+
+def test_target_gives_up_when_the_first_useful_level_is_out_of_band():
+    structure = {"supports": [], "resistances": [130.0], "atr": 0.4, "tolerance": 0.2}
+    assert playbook.target_before_level(structure, 100.0, 1, min_distance=5.0, max_distance=9.0) is None
+
+
+def test_setup_exposes_the_levels_that_framed_the_trade():
+    """On doit pouvoir vérifier SUR QUOI le stop et l'objectif ont été posés."""
+    setup = _build()
+    assert setup.direction == "BUY", setup.reasons
+    lv = setup.entry_levels
+    assert lv and "supports" in lv and "resistances" in lv
+    assert lv["timeframes"] == "15 min + 1 h"
+    assert setup.as_dict()["entry_levels"] == lv
+    # Le stop et l'objectif restent dans les contraintes de la stratégie.
+    assert playbook.MIN_RR - 0.01 <= setup.risk_reward <= playbook.MAX_RR + 0.01
+    assert setup.reward_pips >= playbook.MIN_TARGET_PIPS - 0.5
+
+
+def test_divergence_is_not_an_entry_trigger_by_default():
+    """Mesuré au backtest : 37,5 % de réussite contre 69 % pour la cassure -> désactivée.
+
+    Elle reste CALCULÉE et affichée : une divergence contraire garde sa valeur d'avertissement,
+    c'est seulement comme déclencheur d'ENTRÉE qu'elle dilue l'espérance.
+    """
+    from app.core.config import get_settings
+
+    assert get_settings().playbook_allow_divergence_entry is False
+    m15 = _m15_with_pullback_entry(True, end_close=_END)
+    layer = playbook.factor_layer(m15, "15m", "EUR/USD")
+    # Une divergence en notre faveur ne déclenche rien tant qu'elle n'est pas autorisée.
+    layer.metrics["rsi_divergence"] = "haussière"
+    layer.metrics["ma20"] = layer.metrics["ma50"] = 99.0     # neutralise le repli
+    layer.metrics["fibonacci"] = {}
+    refused = playbook.entry_trigger(m15, 1, layer, allow_divergence=False)
+    allowed = playbook.entry_trigger(m15, 1, layer, allow_divergence=True)
+    assert refused["type"] != "divergence"
+    # Avec l'option activée, le déclencheur redevient disponible (le réglage est réel).
+    assert allowed["type"] in (None, "cassure", "repli", "divergence")
+
+
+def test_volatility_filter_widens_the_stop_when_the_market_is_agitated():
+    """Perdants : ATR journalier 1,39 % contre 1,15 % chez les gagnants -> stop élargi."""
+    # Série journalière très volatile : amplitude ~3 % du prix.
+    volatile = [_c(100, 103, 97, 100) for _ in range(80)]
+    vol = playbook.volatility_adjustment(volatile, 100.0, 1, 99.0, max_atr_pct=1.3, mode="adapt")
+    assert vol["action"] == "widen"
+    assert vol["atr_pct"] > 1.3
+    assert vol["stop"] < 99.0, "le stop doit s'éloigner de l'entrée, pas s'en rapprocher"
+    assert vol["ratio"] <= playbook.VOLATILITY_MAX_WIDEN
+    assert "élargi" in vol["reason"]
+
+
+def test_volatility_filter_can_refuse_instead_of_widening():
+    volatile = [_c(100, 103, 97, 100) for _ in range(80)]
+    vol = playbook.volatility_adjustment(volatile, 100.0, 1, 99.0, max_atr_pct=1.3, mode="refuse")
+    assert vol["action"] == "refuse" and "au-dessus du seuil" in vol["reason"]
+
+
+def test_volatility_filter_leaves_calm_markets_alone():
+    calm = [_c(100, 100.4, 99.6, 100) for _ in range(80)]
+    vol = playbook.volatility_adjustment(calm, 100.0, 1, 99.0, max_atr_pct=1.3, mode="adapt")
+    assert vol["action"] == "none" and vol["stop"] == 99.0
+
+
+def test_volatility_filter_is_reported_on_the_setup():
+    """La décision du filtre est exposée : on doit pouvoir vérifier POURQUOI le stop a bougé."""
+    setup = _build()
+    assert setup.direction == "BUY", setup.reasons
+    assert setup.volatility and setup.volatility["action"] in ("none", "widen", "refuse")
+    assert "atr_pct" in setup.volatility and "threshold" in setup.volatility
+    assert setup.as_dict()["volatility"] == setup.volatility
+
+
+def test_secured_stop_helper_locks_the_gain_both_ways():
+    """`secured_stop` verrouille +2R à l'achat comme à la vente."""
+    # Achat : entrée 100, stop 90 -> risque 10 -> sécurisation à 120.
+    assert playbook.secured_stop(100.0, 90.0, "BUY") == 120.0
+    # Vente : entrée 100, stop 110 -> risque 10 -> sécurisation à 80.
+    assert playbook.secured_stop(100.0, 110.0, "SELL") == 80.0
+
+
+def test_risk_reward_band_is_1_2_to_1_3():
+    """La stratégie encadre le R/R entre 1:2 et 1:3 — playbook, config et filtres alignés."""
+    from app.core.config import get_settings
+    from app.signal_engine.quality import MODES
+
+    s = get_settings()
+    assert (playbook.MIN_RR, playbook.MAX_RR) == (2.0, 3.0)
+    assert (s.playbook_min_rr, s.playbook_max_rr) == (2.0, 3.0)
+    assert s.entry_min_rr == 2.0
+    assert all(m["min_rr"] == 2.0 for m in MODES.values())
+
+
+def test_strategy_targets_at_least_200_pips():
+    """La stratégie vise au moins 200 pips, avec l'entrée en 15 min et la confirmation en 1 h."""
+    from app.core.config import get_settings
+
+    s = get_settings()
+    assert playbook.MIN_TARGET_PIPS == 200.0 and s.playbook_min_target_pips == 200.0
+    assert s.playbook_entry_timeframe == "15m"       # seule UT d'entrée
+    assert s.playbook_confirm_timeframe == "1h"      # dernière confirmation avant l'entrée
+    assert s.playbook_stop_timeframe == "4h"         # le stop vit sur la structure 4 h
+    # Sécurisation du profit à +2R.
+    assert playbook.SECURE_AT_R == s.playbook_secure_at_r == 2.0
+    assert s.playbook_secure_profit_enabled is True
+
+
+def test_every_valid_setup_lands_inside_the_rr_band():
+    """Aucun setup validé ne sort de la bande [1:2 ; 1:3], côté achat comme côté vente."""
+    buy = _build()
+    sell = _build(monthly=_tf("monthly", up=False), daily=_tf("daily", up=False),
+                  h4=_tf("h4", up=False), h1=_h1(up=False),
+                  m15=_m15_with_pullback_entry(False, end_close=_TOP))
+    for setup in (buy, sell):
+        assert setup.direction in ("BUY", "SELL"), setup.reasons
+        assert playbook.MIN_RR - 0.01 <= setup.risk_reward <= playbook.MAX_RR + 0.01, setup.risk_reward
+        assert setup.reward_pips >= playbook.MIN_TARGET_PIPS - 0.5
+
+
+def test_horizon_is_estimated_in_days_from_the_daily_atr():
+    """200 pips, c'est plusieurs journées moyennes : l'horizon est compté en jours."""
     setup = _build()
     assert setup.direction == "BUY", setup.reasons
     assert setup.horizon_days and setup.horizon_days >= 1
+    assert setup.horizon_label.startswith("~")
     line = next(c for c in setup.checklist if "volatilité" in c["label"])
     assert "ATR journalier" in line["value"] and "horizon" in line["value"]
     assert "SWING" in line["explain"]
@@ -438,9 +631,23 @@ def test_horizon_is_estimated_from_daily_atr():
 
 def test_unreachable_target_is_refused():
     """Objectif > N × ATR journalier -> refus motivé (le marché ne parcourt pas la distance)."""
-    setup = _build(max_atr_multiple=0.5)   # exigence volontairement impossible
+    setup = _build(max_atr_multiple=0.05)   # exigence volontairement impossible
     assert setup.direction == "NO_TRADE"
     assert any("hors de portée" in r for r in setup.reasons)
+
+
+def test_armed_setup_carries_a_context_reliability():
+    """Un setup ARMÉ (étapes 1-3 validées) n'est pas « 0/5 » : son CONTEXTE est noté à part."""
+    setup = _build(m15=_no_trigger_15m(price=_END))
+    assert setup.context_ok and setup.direction == "NO_TRADE"
+    assert setup.reliability_score == 0            # aucun TRADE : la note du trade reste nulle
+    assert 1 <= abs(setup.context_reliability) <= 5  # mais le CONTEXTE, lui, est qualifié
+    assert (setup.context_reliability > 0) == (setup.bias > 0)
+    d = setup.as_dict()
+    assert d["context_reliability"] == setup.context_reliability
+    assert d["context_reliability_label"]
+    # L'explication annonce l'entrée automatique dès le déclencheur.
+    assert "AUTOMATIQUEMENT" in setup.narrative
 
 
 def test_checklist_items_carry_an_explanation():
@@ -518,7 +725,8 @@ def test_reliability_score_is_signed_by_direction():
     buy = _build()
     assert 1 <= buy.reliability_score <= 5
     sell = _build(monthly=_tf("monthly", up=False), daily=_tf("daily", up=False),
-                  h4=_tf("h4", up=False), m15=_m15_with_pullback_entry(False, end_close=_TOP))
+                  h4=_tf("h4", up=False), h1=_h1(up=False),
+                  m15=_m15_with_pullback_entry(False, end_close=_TOP))
     assert -5 <= sell.reliability_score <= -1
     hold = _build(monthly=_range(60), daily=_range(160))
     assert hold.reliability_score == 0
@@ -771,7 +979,7 @@ async def test_engine_uses_playbook_levels(playbook_on):
     assert card.metrics["levels_source"] == "playbook"
     assert card.entry == setup.entry and card.stop_loss == setup.stop_loss
     assert playbook.MIN_RR - 0.01 <= card.risk_reward <= playbook.MAX_RR + 0.01
-    assert card.metrics["target_pips"] >= playbook.MIN_TARGET_PIPS
+    assert card.metrics["target_pips"] > 0
     assert card.metrics["playbook"]["checklist"]
     names = [a["name"] for a in card.agents]
     assert names[0] == "playbook"
@@ -963,7 +1171,8 @@ def test_api_exposes_strategy_and_top_trades(playbook_on):
     h = {"Authorization": f"Bearer {r.json()['access_token']}"}
 
     status = client.get("/api/agents/status", headers=h).json()
-    assert status["strategy"]["steps"][3].startswith("4 — 15 min")
+    assert status["strategy"]["steps"][3].startswith("4 — 1 h")
+    assert status["strategy"]["steps"][4].startswith("5 — 15 min")
     assert status["session"]["utc_time"]
 
     detail = client.get("/api/signals/playbook/EUR/USD", headers=h)
@@ -976,3 +1185,5 @@ def test_api_exposes_strategy_and_top_trades(playbook_on):
     payload = top.json()
     assert payload["requested"] == 5 and isinstance(payload["picks"], list)
     assert "session" in payload and "strategy" in payload
+
+

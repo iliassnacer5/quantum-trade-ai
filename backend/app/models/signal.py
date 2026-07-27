@@ -16,10 +16,20 @@ class Direction(str, Enum):
 
 
 class Timeframe(str, Enum):
-    SCALP = "scalp"
-    INTRADAY = "intraday"
-    SWING = "swing"
-    POSITION = "position"
+    """Unités de temps, nommées par leur DURÉE et non par un style de trading.
+
+    « Scalp », « intraday », « swing » décrivent une façon de trader, pas une échelle de temps :
+    deux personnes ne mettent pas la même durée derrière ces mots. Le desk ne raisonne qu'en unités
+    de temps explicites — ce sont exactement celles de la stratégie (mensuel/journalier → 4 h → 1 h
+    → entrée 15 min).
+    """
+
+    M15 = "15min"
+    H1 = "1h"
+    H4 = "4h"
+    D1 = "1d"
+    W1 = "1week"
+    MN = "1month"
 
 
 class SignalCard(BaseModel):

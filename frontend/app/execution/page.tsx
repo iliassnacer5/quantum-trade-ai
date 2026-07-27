@@ -8,8 +8,9 @@ import { refreshLabel, useAutoRefresh } from '@/lib/useAutoRefresh';
 
 type Ticket = { connId: string; side: 'buy' | 'sell' };
 
-/** Le P&L latent est recalculé côté serveur toutes les 15 s — aucun clic nécessaire. */
-const REFRESH_MS = 15_000;
+/** Le P&L latent est recalculé côté serveur toutes les 10 s — aucun clic nécessaire.
+ *  C'est aussi ce qui fait apparaître les positions ouvertes AUTOMATIQUEMENT par le robot. */
+const REFRESH_MS = 10_000;
 
 export default function ExecutionPage() {
   const [plan, setPlan] = useState<PlanInfo | null>(null);
@@ -76,8 +77,12 @@ export default function ExecutionPage() {
     if (!ticket) return;
     setPrice(null);
     setDataSrc(null);
-    api.ohlcv(symbol, 'swing')
-      .then((candles) => setPrice(candles.length ? candles[candles.length - 1].close : null))
+    // Prix de référence : uniquement s'il vient de données RÉELLES. Sans source réelle, on laisse
+    // le champ vide plutôt que de proposer un prix d'entrée qui n'existe pas.
+    api.ohlcv(symbol, '1h')
+      .then((res) =>
+        setPrice(res.real && res.candles.length ? res.candles[res.candles.length - 1].close : null),
+      )
       .catch(() => setPrice(null));
     api.dataSource(symbol).then(setDataSrc).catch(() => setDataSrc(null));
   }, [ticket, symbol]);

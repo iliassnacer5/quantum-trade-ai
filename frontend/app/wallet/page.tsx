@@ -25,7 +25,7 @@ export default function WalletPage() {
   }
   useEffect(() => {
     load();
-    const id = setInterval(load, 30000); // suit les clôtures auto
+    const id = setInterval(load, 10000); // suit les clôtures auto et les entrées automatiques
     return () => clearInterval(id);
   }, []);
 

@@ -131,9 +131,9 @@ _DISCLAIMER = (
 async def build_context(user: User, store: AppStore, asset: str) -> dict:
     """Génère un instantané d'analyse pour `asset` (réutilise le pipeline de signaux, sans notif)."""
     card = await signal_service.generate_for_user(
-        user, store, asset=asset, timeframe=Timeframe.SWING, notify=False
+        user, store, asset=asset, timeframe=Timeframe.H1, notify=False
     )
-    candles = await signal_service._load_candles(asset, Timeframe.SWING)
+    candles = await signal_service._load_candles(asset, Timeframe.H1)
     last = candles[-1].close if candles else 0.0
     rsi = ind.rsi([c.close for c in candles], 14) if len(candles) > 14 else None
     return {

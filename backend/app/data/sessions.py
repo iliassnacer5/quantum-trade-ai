@@ -81,6 +81,40 @@ def is_overlap(now: datetime | None = None) -> bool:
     return any(z["id"] == "overlap" for z in active_kill_zones(now))
 
 
+def is_weekend(now: datetime | None = None) -> bool:
+    """Marché forex fermé : du vendredi 21:00 UTC (clôture de New York) au dimanche 21:00 UTC."""
+    now = now or datetime.now(timezone.utc)
+    h = now.hour + now.minute / 60
+    wd = now.weekday()          # 0 = lundi … 5 = samedi, 6 = dimanche
+    if wd == 5:
+        return True
+    if wd == 6:
+        return h < 21           # réouverture de Sydney le dimanche soir
+    if wd == 4:
+        return h >= 21          # clôture de New York le vendredi soir
+    return False
+
+
+def can_trade(now: datetime | None = None) -> tuple[bool, str]:
+    """Peut-on OUVRIR une position maintenant ? (Londres ou New York doit être ouverte.)
+
+    L'analyse, elle, tourne en permanence — y compris marchés fermés, c'est ainsi qu'on arrive
+    préparé à l'ouverture. Mais on n'engage pas de position quand les deux grandes places sont
+    fermées : le carnet d'ordres est vide, les écarts s'élargissent et les mouvements ne sont pas
+    représentatifs. La session asiatique seule ne suffit pas pour cette stratégie, qui est calibrée
+    sur les paires et les horaires de Londres / New York.
+    """
+    now = now or datetime.now(timezone.utc)
+    if is_weekend(now):
+        return False, "week-end : marché des changes fermé (réouverture dimanche 21:00 UTC)"
+    active = current_sessions(now)
+    open_desks = [d for d in ("london", "newyork") if d in active]
+    if not open_desks:
+        return False, "Londres et New York fermées — analyse seule, aucune ouverture de position"
+    labels = " + ".join(SESSIONS[d]["label"] for d in open_desks)
+    return True, f"{labels} ouverte(s)"
+
+
 def session_context(now: datetime | None = None) -> dict:
     """Contexte de timing utilisé par le playbook et par tous les agents.
 
@@ -101,6 +135,7 @@ def session_context(now: datetime | None = None) -> dict:
     else:
         quality = _QUALITY_OFF_SESSION
         label = "hors sessions majeures (liquidité faible)" if not active else "session asiatique seule"
+    tradable, trade_reason = can_trade(now)
     return {
         "utc_time": now.strftime("%H:%M UTC"),
         "active": active,
@@ -110,6 +145,10 @@ def session_context(now: datetime | None = None) -> dict:
         "quality": quality,
         "prime": quality >= 0.85,          # ouverture Londres, ouverture NY ou chevauchement
         "label": label,
+        # Peut-on OUVRIR une position ? L'analyse tourne toujours ; l'exécution, non.
+        "can_trade": tradable,
+        "trade_window": trade_reason,
+        "weekend": is_weekend(now),
         "next_window": _next_window(now),
     }
 

@@ -5,8 +5,8 @@ import { Segmented } from '@/components/ui';
 
 /**
  * Sélecteur de timeframe partagé. `by` choisit la clé de valeur :
- * - 'tf' → scalp/intraday/swing/position
- * - 'interval' → 5m/15m/1h/4h
+ * - 'tf' → 15min/1h/4h/1d/1week/1month (libellés exposés par l'API)
+ * - 'interval' → 15m/1h/4h/1d/1w/1M (intervalles du connecteur de données)
  */
 export function TimeframePicker({
   value,

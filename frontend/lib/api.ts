@@ -41,6 +41,20 @@ export type EdgeMap = {
   generated_at?: string; rows: EdgeRow[]; greens: number; yellows: number; reds: number; note: string;
 };
 
+/** Verdict 🟢/🟡/🔴 d'une paire, issu du backtest hebdomadaire de la stratégie du desk. */
+export type PairVerdict = {
+  symbol: string; status: 'green' | 'yellow' | 'red'; emoji: string;
+  expectancy_r: number | null; trades: number | null; win_rate: number | null;
+  profit_factor: number | null; green_streak: number; reason: string; measured_at?: string;
+};
+export type PairVerdicts = {
+  available: boolean; date?: string; updated_at?: string; note?: string;
+  criteria?: Record<string, number>;
+  pairs: Record<string, PairVerdict>;
+  disabled_triggers?: Record<string, string[]>;
+  refusals?: { symbol: string; reason: string; at: string; direction?: string }[];
+};
+
 export type MarketRegime = {
   utc_time: string; sessions: { id: string; label: string; window_utc: string; open: boolean }[];
   open_sessions: string[]; vix: number | null; regime: 'on' | 'off' | 'neutral'; regime_label: string;
@@ -54,6 +68,15 @@ export type Candle = {
   low: number;
   close: number;
   volume?: number;
+};
+
+/** Bougies + provenance. `real: false` signifie qu'AUCUNE donnée de marché n'a pu être obtenue —
+ *  la page doit le dire, pas afficher une courbe inventée. */
+export type OhlcvResponse = {
+  candles: Candle[];
+  source: 'live' | 'real' | 'synthetic' | 'unavailable' | string;
+  real: boolean;
+  note?: string;
 };
 
 export type Me = {
@@ -238,7 +261,20 @@ export type StrategySignal = {
   risk_reward?: number; position_size?: number; data_source?: string; rationale: string;
 };
 
-export type AgentInfo = { name: string; role: string; desc: string; model: string };
+export type AgentInfo = {
+  name: string;
+  role: string;
+  desc: string;
+  model: string;
+  weight?: number | null;
+  /** Compétence MESURÉE de l'agent sur la stratégie (issue du walk-forward nocturne). */
+  competence?: {
+    accuracy: number; observations: number; multiplier: number; trained_on: string;
+    factors: Record<string, { observations: number; accuracy: number }>;
+  } | null;
+  /** Fiche d'expertise du jour : les règles que l'agent a tirées de ses résultats mesurés. */
+  expertise?: string | null;
+};
 
 export type AgentStatus = {
   status: string;
@@ -247,7 +283,22 @@ export type AgentStatus = {
   agents: AgentInfo[];
   strategy?: {
     name: string; enabled: boolean; veto: boolean; steps: string[];
-    min_risk_reward: number; min_target_pips: number; entry_timeframe: string; daily_trades: number;
+    min_risk_reward: number; max_risk_reward?: number; min_target_pips: number;
+    entry_timeframe: string; daily_trades: number;
+    /** Unité de temps qui fixe le stop (15m) et celle qui borne l'objectif (1h). */
+    stop_timeframe?: string; target_timeframe?: string;
+    min_target_atr15?: number; max_stop_atr15?: number;
+    /** Niveau (en multiples du risque) où le stop est remonté pour verrouiller le gain. */
+    secure_at_r?: number; secure_profit?: boolean;
+    /** Vrai si aucune position n'est ouverte quand Londres ET New York sont fermées. */
+    trade_only_when_open?: boolean;
+    auto_entry?: boolean; auto_entry_mode?: string;
+  };
+  /** Résumé du dernier entraînement quotidien des agents sur la stratégie. */
+  training?: {
+    trained: boolean; note?: string; date?: string;
+    trades_replayed?: number; symbols?: number; duration_s?: number;
+    overall?: TrainingMetrics; agent_multipliers?: Record<string, number>;
   };
   session?: SessionContext;
 };
@@ -321,8 +372,19 @@ export type PlaybookTrade = {
   risk_reward: number;
   pips_label: string;
   trigger: string | null;
+  /** D'où vient le stop — toujours la structure 15 min (l'unité d'entrée). */
   stop_basis: string;
+  /** D'où vient l'objectif : bande de R/R, ou bornage par le prochain niveau 1 h. */
+  target_basis: string;
+  /** Le niveau 1 h qui borne l'objectif (on sort DEVANT lui). */
+  target_level: number | null;
   horizon_days: number | null;
+  /** Horizon en heures : l'échelle naturelle d'un trade dont l'entrée est en 15 min. */
+  horizon_hours: number | null;
+  /** Horizon prêt à afficher (« ~3.5 h », « ~1.2 j »). */
+  horizon_label: string;
+  /** Rang dans le classement des trades du jour (1 = le plus fiable). */
+  rank?: number;
   confidence: number;
   strength: string;
   ready: boolean;
@@ -335,6 +397,12 @@ export type PlaybookTrade = {
   /** Score de fiabilité du trade : +1..+5 pour un achat, -1..-5 pour une vente, 0 = pas de trade. */
   reliability_score: number;
   reliability: string;
+  /** Fiabilité du CONTEXTE (étapes 1-3) — c'est elle qui qualifie un setup ARMÉ. */
+  context_reliability: number;
+  context_reliability_label: string;
+  /** Fiabilité MESURÉE par le walk-forward nocturne sur ce symbole / ce déclencheur. */
+  edge: { score: number; win_rate?: number; trades: number; status: string } | null;
+  edge_score: number;
   checklist: { step: number; label: string; pass: boolean; value: string; explain?: string }[];
   levels: Record<string, any>;
   layers: Record<string, PlaybookLayer>;
@@ -377,18 +445,156 @@ export type PaperExecutionReport = {
   skipped: { symbol: string; reason: string }[];
   armed_waiting: { symbol: string; direction: string; reason: string }[];
   summary: string;
+  symbol?: string;        // renseigné quand l'ouverture ne concerne qu'un symbole
 };
 
 export type TopTrades = {
   date?: string;
   generated_at: string;
+  /** Instant du calcul de fond (l'instantané est servi tel quel, sans recalcul). */
+  computed_at?: string;
+  /** Âge de l'instantané en secondes — la fraîcheur fait partie de la donnée. */
+  age_seconds?: number | null;
+  /** Vrai si l'instantané est trop vieux pour être présenté comme à jour. */
+  stale?: boolean;
+  /** Cadence de recalcul côté serveur (secondes). */
+  refresh_interval?: number;
   strategy: string;
   session: SessionContext;
   scanned: number;
   ready: number;
+  armed?: number;
   requested: number;
   picks: PlaybookTrade[];
+  /** Verdict de la stratégie pour CHAQUE symbole balayé (pas seulement les 5 retenus). */
+  verdicts?: Record<string, PlaybookVerdict>;
+  /** Vrai si l'auto-entrée en compte démo est active. */
+  auto_entry?: boolean;
   note: string;
+};
+
+/** Verdict léger de la stratégie pour un symbole — partagé par toutes les pages d'analyse. */
+export type PlaybookVerdict = {
+  symbol: string;
+  asset_class: string;
+  tier: 'ready' | 'armed' | 'none' | 'insufficient';
+  direction: 'BUY' | 'SELL' | 'NO_TRADE';
+  context_ok: boolean;
+  veto: boolean;
+  reliability_score: number;
+  context_reliability: number;
+  confidence: number;
+  risk_reward: number;
+  edge_score: number;
+  reason: string;
+};
+
+/** État de l'AUTO-ENTRÉE : ce que le robot surveille et ce qu'il a ouvert seul (compte démo). */
+export type AutoEntryStatus = {
+  enabled: boolean;
+  mode: 'paper';
+  interval_seconds: number;
+  watching: { symbol: string; direction: string; tier: string; reason: string }[];
+  recent: {
+    id: string; symbol: string; side: string; entry: number | null;
+    stop_loss: number | null; take_profit: number | null; trigger: string | null;
+    message: string; created_at?: string;
+  }[];
+  note: string;
+};
+
+/** Entraînement quotidien des agents sur la stratégie (walk-forward + fiches d'expertise). */
+export type TrainingReport = {
+  trained: boolean;
+  note?: string;
+  date?: string;
+  generated_at?: string;
+  duration_s?: number;
+  symbols_trained?: number;
+  trades?: number;
+  min_trades?: number;
+  strategy?: string;
+  overall?: TrainingMetrics;
+  by_symbol?: Record<string, TrainingMetrics>;
+  by_trigger?: Record<string, TrainingMetrics>;
+  by_session?: Record<string, TrainingMetrics>;
+  factor_competence?: Record<string, { observations: number; accuracy: number; aligned_win_rate: number | null }>;
+  agent_multipliers?: Record<string, number>;
+  expertise?: Record<string, string>;
+  failures?: { symbol: string; error: string }[];
+};
+
+/** Métriques complètes d'un lot de trades rejoués par le backtest de la stratégie. */
+export type PlaybookBacktestMetrics = {
+  trades: number; wins: number; losses: number; expired: number;
+  win_rate: number; expectancy_r: number; profit_factor: number | null; total_r: number;
+  avg_win_r: number; avg_loss_r: number; avg_planned_rr: number;
+  avg_reward_pips?: number; avg_risk_pips?: number;
+  avg_bars_held: number; secured_rate: number; max_drawdown_r: number;
+};
+
+/** Une paire dans le classement de fiabilité. `rank: null` = échantillon insuffisant, non classée. */
+export type PlaybookPairRank = PlaybookBacktestMetrics & {
+  symbol: string; rank: number | null; verdict: string;
+};
+
+/** Une passe de backtest (portée 1 h, ou fidélité 15 min). */
+export type PlaybookBacktestPass = {
+  entry_timeframe: string;
+  years_covered: number;
+  pairs_tested: number;
+  trades: number;
+  duration_s: number;
+  overall: PlaybookBacktestMetrics;
+  ranking: PlaybookPairRank[];
+  by_trigger: Record<string, PlaybookBacktestMetrics>;
+  by_session: Record<string, PlaybookBacktestMetrics>;
+  by_direction: Record<string, PlaybookBacktestMetrics>;
+  losers_profile: {
+    sample?: number; note?: string; findings?: string[];
+    avg_bars_to_stop?: number | null;
+    comparisons?: Record<string, { label: string; perdants: number; gagnants: number; ecart_pct: number }>;
+  };
+  failures: { symbol: string; error: string }[];
+  coverage: Record<string, string>;
+  min_trades: number;
+};
+
+/** État d'exécution du backtest — il tourne en arrière-plan, pas dans la requête HTTP. */
+export type BacktestRunState = {
+  running: boolean;
+  started_at: string | null;
+  phase: string | null;
+  done: number;
+  total: number;
+  elapsed_s?: number;
+};
+
+/** Backtest COMPLET de la stratégie du desk sur le forex et l'or. */
+export type PlaybookBacktest = {
+  available: boolean;
+  run_state?: BacktestRunState;
+  note?: string;
+  date?: string;
+  strategy?: string;
+  universe?: string[];
+  scope?: PlaybookBacktestPass;
+  fidelity?: PlaybookBacktestPass;
+  data_limits?: { note: string; m15_days: number; h1_years: number; daily_years: number };
+  conclusion?: {
+    headline: string; verdict: string; lines: string[];
+    markets: Record<string, { pairs: number; trades: number; win_rate: number; expectancy_r: number; best: string | null }>;
+  };
+};
+
+export type TrainingMetrics = {
+  trades: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  expectancy_r: number;
+  profit_factor: number | null;
+  total_r: number;
 };
 
 function token(): string | null {
@@ -414,6 +620,37 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Transforme un corps d'erreur d'API en TEXTE lisible — toujours une chaîne, jamais un objet.
+ *
+ * FastAPI renvoie sur une 422 un `detail` qui est un TABLEAU d'objets
+ * `[{type, loc, msg, input, ctx}]`. Le passer tel quel à React déclenche l'erreur #31
+ * (« Objects are not valid as a React child ») et casse la page au lieu d'afficher le problème.
+ * On le met donc à plat ici, une bonne fois pour toutes, pour tous les appels.
+ */
+export function errorMessage(body: any, status: number): string {
+  const detail = body?.detail;
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((d) => {
+        if (typeof d === 'string') return d;
+        // `loc` = chemin du champ fautif, ex. ["query", "timeframe"] -> "timeframe".
+        const field = Array.isArray(d?.loc) ? d.loc.filter((x: unknown) => x !== 'body' && x !== 'query').join('.') : '';
+        const msg = d?.msg ?? d?.type ?? 'valeur invalide';
+        return field ? `${field} : ${msg}` : String(msg);
+      })
+      .filter(Boolean);
+    if (parts.length) return `Requête invalide — ${parts.join(' · ')}`;
+  }
+  if (detail && typeof detail === 'object') {
+    const msg = (detail as any).msg ?? (detail as any).message;
+    if (typeof msg === 'string') return msg;
+  }
+  if (typeof body?.message === 'string' && body.message.trim()) return body.message;
+  return `Erreur ${status}`;
+}
+
 async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(opts.headers as object) };
   const t = token();
@@ -421,7 +658,7 @@ async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(`${API}${path}`, { ...opts, headers });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    const message = body.detail ?? `Erreur ${res.status}`;
+    const message = errorMessage(body, res.status);
     // Signal global : le Toaster décide s'il l'affiche (il ignore 401/402/404, gérés inline).
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('qta:api-error', { detail: { message, status: res.status } }));
@@ -452,6 +689,8 @@ export const api = {
   setSignalMode: (mode: string) => req<{ mode: string }>(`/api/signals/mode?mode=${mode}`, { method: 'POST' }),
   marketRegime: () => req<MarketRegime>('/api/market/regime'),
   edgeMap: () => req<EdgeMap>('/api/backtest/edge-map'),
+  /** Verdicts 🟢/🟡/🔴 par paire du backtest hebdo — seules les 🟢 sont auto-tradées. */
+  pairVerdicts: () => req<PairVerdicts>('/api/backtest/playbook/verdicts'),
   runEdgeSweep: (timeframe?: string, market?: string) => {
     const p = new URLSearchParams();
     if (timeframe) p.set('timeframe', timeframe);
@@ -460,8 +699,9 @@ export const api = {
   },
   clearJournal: () => req<{ cleared: number }>('/api/journal', { method: 'DELETE' }),
   clearSignals: () => req<{ deleted: number }>('/api/signals', { method: 'DELETE' }),
+  /** Bougies d'un actif AVEC leur source : une page ne doit jamais afficher du fictif comme du réel. */
   ohlcv: (asset: string, timeframe: string) =>
-    req<Candle[]>(`/api/market/ohlcv?asset=${encodeURIComponent(asset)}&timeframe=${timeframe}`),
+    req<OhlcvResponse>(`/api/market/ohlcv?asset=${encodeURIComponent(asset)}&timeframe=${timeframe}`),
   symbols: (q?: string, asset_class?: string, session?: string) => {
     const p = new URLSearchParams();
     if (q) p.set('q', q);
@@ -473,15 +713,36 @@ export const api = {
     req<{ date: string; timeframe?: string; picks: any[]; generated_at: string }>(
       `/api/signals/daily-picks?timeframe=${timeframe}${refresh ? '&refresh=true' : ''}`,
     ),
-  /** Les trades du jour issus de la STRATÉGIE (mensuel+journalier → 4h → entrée 15 min). */
+  /** Les trades du jour issus de la STRATÉGIE (mensuel+journalier → 4 h → entrée 15 min).
+   *  Sans `refresh`, la réponse est l'instantané déjà calculé par la boucle de fond : elle arrive
+   *  en quelques millisecondes, ce qui autorise un rafraîchissement toutes les 10 secondes. */
   topTrades: (refresh = false, count = 5) =>
     req<TopTrades>(`/api/signals/top-trades?count=${count}${refresh ? '&refresh=true' : ''}`),
+  /** État de l'auto-entrée en compte démo (ce que le robot surveille et ce qu'il a ouvert seul). */
+  autoEntry: () => req<AutoEntryStatus>('/api/signals/auto-entry'),
+  /** Force un passage de veille de l'auto-entrée. */
+  runAutoEntry: () => req<{ opened: any[]; note: string }>('/api/signals/auto-entry/run', { method: 'POST' }),
+  /** Dernier backtest de LA STRATÉGIE sur le forex et l'or : classement des paires + conclusion. */
+  playbookBacktest: () => req<PlaybookBacktest>('/api/backtest/playbook'),
+  /** LANCE le backtest en arrière-plan et rend la main aussitôt (il dure une dizaine de minutes).
+   *  L'avancement se suit via `playbookBacktest().run_state`. */
+  runPlaybookBacktest: () =>
+    req<{ started: boolean; run_state: BacktestRunState; note: string }>(
+      '/api/backtest/playbook/run', { method: 'POST' },
+    ),
+  /** Entraînement quotidien des agents sur la stratégie (walk-forward mesuré + fiches). */
+  training: () => req<TrainingReport>('/api/agents/training'),
+  /** Relance un entraînement complet (opération longue). */
+  runTraining: () => req<TrainingReport>('/api/agents/training/run', { method: 'POST' }),
   /** Détail des 4 étapes de la stratégie pour un symbole. */
   playbook: (symbol: string) =>
     req<PlaybookTrade & { summary: string }>(`/api/signals/playbook/${symbol}`),
   /** Ouvre les trades prêts du playbook en COMPTE DÉMO, avec leur SL/TP. */
   executePlaybook: (count = 5) =>
     req<PaperExecutionReport>(`/api/execution/playbook/execute?count=${count}`, { method: 'POST' }),
+  /** Ouvre en démo le trade d'UN symbole (bouton d'une carte). La stratégie est recalculée. */
+  executePlaybookSymbol: (symbol: string) =>
+    req<PaperExecutionReport>(`/api/execution/playbook/execute-symbol/${symbol}`, { method: 'POST' }),
   /** Positions + P&L latent calculé côté serveur (pour un rafraîchissement automatique). */
   positions: () => req<PositionsSnapshot>('/api/execution/positions'),
   verifySignal: (s: Signal) =>
@@ -512,7 +773,7 @@ export const api = {
         high_conviction_only: String(high_conviction_only),
       })}`,
     ),
-  dataSource: (asset: string, timeframe = 'swing') =>
+  dataSource: (asset: string, timeframe = '1h') =>
     req<{ asset: string; source: string; real: boolean; label: string }>(
       `/api/market/data-source?asset=${encodeURIComponent(asset)}&timeframe=${timeframe}`,
     ),

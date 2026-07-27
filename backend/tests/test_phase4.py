@@ -116,9 +116,17 @@ def test_paper_order_rejects_invalid_sl():
 
 
 def _fake_candles(high: float, low: float):
-    """Fabrique un get_ohlcv mocké renvoyant une bougie postérieure à l'entrée (time futur)."""
-    async def _fake(symbol, interval="1h", limit=400):  # noqa: ANN001
-        return [{"time": 2_000_000_000, "open": high, "high": high, "low": low, "close": (high + low) / 2, "volume": 1.0}]
+    """Bougie RÉELLE postérieure à l'entrée (time futur), au format `get_ohlcv_with_source`.
+
+    On mocke la fonction qui porte la PROVENANCE, pas seulement les bougies : le rejeu refuse de
+    conclure sans données réelles, il faut donc lui dire explicitement qu'elles le sont.
+    """
+    async def _fake(symbol, interval="15m", limit=500):  # noqa: ANN001
+        return {
+            "candles": [{"time": 2_000_000_000, "open": high, "high": high, "low": low,
+                         "close": (high + low) / 2, "volume": 1.0}],
+            "source": "real", "real": True, "note": "",
+        }
     return _fake
 
 
@@ -137,7 +145,7 @@ def test_check_order_outcome_won(monkeypatch):
     client = TestClient(app)
     h, _ = _register(client)
     order = _place_bracket(client, h)
-    monkeypatch.setattr("app.data.ohlcv.get_ohlcv", _fake_candles(high=2_000_000.0, low=500_000.0))
+    monkeypatch.setattr("app.data.ohlcv.get_ohlcv_with_source", _fake_candles(high=2_000_000.0, low=500_000.0))
     body = client.post(f"/api/execution/orders/{order['id']}/check", headers=h).json()
     assert body["outcome"] == "won" and body["status"] == "closed"
     assert body["exit_price"] == 1_000_000.0 and body["realized_pnl"] is not None
@@ -148,7 +156,7 @@ def test_check_order_outcome_lost(monkeypatch):
     client = TestClient(app)
     h, _ = _register(client)
     order = _place_bracket(client, h)
-    monkeypatch.setattr("app.data.ohlcv.get_ohlcv", _fake_candles(high=200_000.0, low=0.5))
+    monkeypatch.setattr("app.data.ohlcv.get_ohlcv_with_source", _fake_candles(high=200_000.0, low=0.5))
     body = client.post(f"/api/execution/orders/{order['id']}/check", headers=h).json()
     assert body["outcome"] == "lost" and body["realized_pnl"] < 0
 
@@ -175,7 +183,7 @@ def test_check_order_outcome_open(monkeypatch):
     client = TestClient(app)
     h, _ = _register(client)
     order = _place_bracket(client, h)
-    monkeypatch.setattr("app.data.ohlcv.get_ohlcv", _fake_candles(high=100_000.0, low=10_000.0))
+    monkeypatch.setattr("app.data.ohlcv.get_ohlcv_with_source", _fake_candles(high=100_000.0, low=10_000.0))
     body = client.post(f"/api/execution/orders/{order['id']}/check", headers=h).json()
     assert body["outcome"] == "open" and "unrealized_pnl" in body
 
@@ -210,7 +218,7 @@ async def test_monitor_positions_auto_closes(monkeypatch):
     h, _ = _register(client)
     order = _place_bracket(client, h)  # SL=1, TP=1e6 sur BTC
     # Le high atteint le TP -> doit clôturer en 'won'.
-    monkeypatch.setattr("app.data.ohlcv.get_ohlcv", _fake_candles(high=2_000_000.0, low=500_000.0))
+    monkeypatch.setattr("app.data.ohlcv.get_ohlcv_with_source", _fake_candles(high=2_000_000.0, low=500_000.0))
     closed = await svc.monitor_positions(get_store())
     assert closed >= 1
     after = client.get("/api/execution/orders", headers=h).json()
@@ -226,7 +234,7 @@ def test_data_source_endpoint(monkeypatch):
     monkeypatch.setattr(markets, "is_real", lambda s: False)
     client = TestClient(app)
     h, _ = _register(client)
-    r = client.get("/api/market/data-source?asset=BTC/USDT&timeframe=swing", headers=h).json()
+    r = client.get("/api/market/data-source?asset=BTC/USDT&timeframe=1h", headers=h).json()
     assert r["source"] == "synthetic" and r["real"] is False
 
 

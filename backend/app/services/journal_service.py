@@ -94,12 +94,15 @@ async def auto_resolve(store, tenant_id: str) -> int:
         if direction in (None, "HOLD") or not entry or sl is None:
             continue
         try:
-            outcome, exit_price, _ = await replay.replay_outcome(
+            verdict = await replay.replay_outcome(
                 p.get("asset", e.get("symbol")), direction, entry, sl, tp, p.get("created_at"),
             )
         except Exception as exc:  # noqa: BLE001 — l'apprentissage ne doit jamais casser
             logger.warning("Auto-résolution %s échouée (%s)", sig_id, exc)
             continue
+        outcome, exit_price = verdict["outcome"], verdict["exit_price"]
+        # Un verdict indéterminé (données non réelles, marché fermé) ne doit RIEN apprendre :
+        # entraîner les agents sur un résultat inventé est pire que ne rien apprendre du tout.
         if outcome in ("won", "lost"):
             mapped = "win" if outcome == "won" else "loss"
             pnl = (exit_price - entry) if str(direction).lower() == "buy" else (entry - exit_price)

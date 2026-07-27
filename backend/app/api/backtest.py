@@ -23,6 +23,124 @@ router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 _STEP = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
 
+# ---------------------------------------------------------------------------------------
+# Backtest de LA STRATÉGIE DU DESK (playbook) — forex et or, plusieurs paires
+# ---------------------------------------------------------------------------------------
+@router.get("/playbook")
+async def playbook_backtest_report(
+    _user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """Dernier backtest de la STRATÉGIE du desk : classement des paires + conclusion rédigée.
+
+    Deux passes complémentaires : une passe PORTÉE (déclencheur évalué en 1 h, toute la profondeur
+    disponible) et une passe FIDÉLITÉ (le vrai déclencheur 15 min, sur les ~80 jours réellement
+    disponibles). Les limites de données sont exposées telles quelles dans `data_limits`.
+    """
+    from app.backtest import playbook_backtest as pbt
+
+    rec = store.records.get(pbt.COLLECTION, pbt.LATEST)
+    state = pbt.run_state()
+    if not rec:
+        return {"available": False, "run_state": state,
+                "note": ("Backtest en cours…" if state["running"]
+                         else "Aucun backtest de la stratégie n'a encore été exécuté."),
+                "universe": pbt.DEFAULT_UNIVERSE}
+    return {"available": True, "run_state": state, **rec}
+
+
+@router.post("/playbook/run")
+async def playbook_backtest_run(
+    _user: User = Depends(require_feature("backtesting")),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """LANCE le backtest complet en arrière-plan et rend la main IMMÉDIATEMENT.
+
+    Un backtest complet dure une dizaine de minutes : le tenir dans le fil d'une requête HTTP
+    laisserait le navigateur attendre indéfiniment et bloquerait un worker. On démarre donc une
+    tâche de fond et l'interface suit l'avancement via `GET /api/backtest/playbook` (`run_state`).
+    """
+    import asyncio
+
+    from app.backtest import playbook_backtest as pbt
+
+    state = pbt.run_state()
+    if state["running"]:
+        return {"started": False, "run_state": state,
+                "note": "Un backtest est déjà en cours — inutile d'en lancer un second."}
+
+    async def _job() -> None:
+        try:
+            await pbt.run_backtest(store)
+        except Exception as exc:  # noqa: BLE001 — une tâche de fond ne doit jamais faire tomber l'API
+            logger.exception("Backtest de la stratégie échoué (%s)", exc)
+
+    asyncio.create_task(_job())
+    return {"started": True, "run_state": pbt.run_state(),
+            "note": ("Backtest lancé en arrière-plan (une dizaine de minutes). "
+                     "Cette page se met à jour toute seule.")}
+
+
+@router.get("/playbook/verdicts")
+async def playbook_pair_verdicts(
+    _user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """VERDICT PAR PAIRE (🟢/🟡/🔴) issu du backtest hebdomadaire + matrice des déclencheurs.
+
+    🟢 = espérance ≥ +0,4 R sur n ≥ 20 trades, confirmée sur deux passages consécutifs — seules
+    ces paires sont auto-tradées. 🟡 = analysée mais non auto-tradée. 🔴 = exclue (la stratégie
+    perd ici). Les critères exacts sont dans `criteria` ; les refus récents dans `refusals`.
+    """
+    from app.services import verdict_service
+
+    out = verdict_service.report(store)
+    out["refusals"] = verdict_service.recent_refusals(store, limit=30)
+    return out
+
+
+@router.get("/playbook/volatility-ab")
+async def playbook_volatility_ab_report(
+    _user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """Résultat du dernier A/B volatilité (adapt / refuse / stop k×ATR 4 h)."""
+    from app.backtest import playbook_backtest as pbt
+
+    rec = store.records.get(pbt.AB_COLLECTION, pbt.LATEST)
+    if not rec:
+        return {"available": False, "run_state": pbt.run_state(),
+                "variants": list(pbt.VOLATILITY_VARIANTS),
+                "note": "A/B volatilité jamais exécuté — lance-le via POST /playbook/volatility-ab/run."}
+    return {"available": True, "run_state": pbt.run_state(), **rec}
+
+
+@router.post("/playbook/volatility-ab/run")
+async def playbook_volatility_ab_run(
+    _user: User = Depends(require_feature("backtesting")),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """LANCE l'A/B volatilité en arrière-plan (3 passes complètes ≈ 30 min)."""
+    import asyncio
+
+    from app.backtest import playbook_backtest as pbt
+
+    state = pbt.run_state()
+    if state["running"]:
+        return {"started": False, "run_state": state,
+                "note": "Un backtest est déjà en cours — attendre qu'il se termine."}
+
+    async def _job() -> None:
+        try:
+            await pbt.run_volatility_ab(store)
+        except Exception as exc:  # noqa: BLE001 — une tâche de fond ne doit jamais faire tomber l'API
+            logger.exception("A/B volatilité échoué (%s)", exc)
+
+    asyncio.create_task(_job())
+    return {"started": True, "run_state": pbt.run_state(),
+            "note": "A/B volatilité lancé (3 passes ≈ 30 min). Résultat via GET /playbook/volatility-ab."}
+
+
 async def _load_history(symbol: str, timeframe: str, limit: int = 500) -> list[Candle]:
     """Charge l'historique OHLCV horodaté ; repli synthétique si indisponible."""
     try:

@@ -31,6 +31,26 @@ services:
       timeout: 5s
       retries: 5
 
+  # Backup quotidien (plan Phase 1.2) : pg_dump compressé toutes les 24 h, rétention 14 jours.
+  # Les archives vivent dans le volume `pgbackups` (indépendant de `pgdata` : la corruption de la
+  # base ne peut pas emporter ses sauvegardes). Restauration : docs/BACKUPS.md.
+  db-backup:
+    image: timescale/timescaledb:latest-pg16
+    entrypoint: ["/bin/bash", "/backup.sh"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-quantum}
+      POSTGRES_DB: ${POSTGRES_DB:-quantum}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-quantum_dev_pwd}
+      BACKUP_RETENTION_DAYS: "14"
+    volumes:
+      - pgbackups:/backups
+      - ./db/backup.sh:/backup.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
     # Interne uniquement (6379 souvent déjà pris). Accessible via "redis:6379" dans le réseau.
@@ -93,3 +113,4 @@ services:
 
 volumes:
   pgdata:
+  pgbackups:

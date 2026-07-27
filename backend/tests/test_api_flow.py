@@ -43,7 +43,7 @@ def test_full_value_loop():
     assert r.status_code == 200 and r.json()["onboarded"] is True
 
     # Génération de signal
-    r = client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "swing"}, headers=h)
+    r = client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "1h"}, headers=h)
     assert r.status_code == 200
     card = r.json()
     assert card["asset"] == "BTC/USDT"

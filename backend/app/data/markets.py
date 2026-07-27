@@ -152,9 +152,16 @@ async def load_candles(symbol: str, interval: str = "1h", limit: int = 200) -> l
         if len(candles) >= min_needed:
             _LAST_SOURCE[key] = "real"
             return candles
-        logger.warning("Backfill %s (%s) insuffisant, repli synthétique", symbol, cls)
+        logger.warning("Backfill %s (%s) insuffisant", symbol, cls)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Connecteur %s indisponible pour %s (%s), repli synthétique", cls, symbol, exc)
+        logger.warning("Connecteur %s indisponible pour %s (%s)", cls, symbol, exc)
+    # Par défaut on ne FABRIQUE pas de bougies : une série vide est honnête, une série inventée ne
+    # l'est pas. Les appelants (playbook, entraînement, backtest) refusent déjà d'agir sans données.
+    from app.core.config import get_settings
+
+    if not get_settings().data_allow_synthetic:
+        _LAST_SOURCE[key] = "unavailable"
+        return []
     # Repli déterministe (graine basée sur le symbole pour la cohérence par actif)
     _LAST_SOURCE[key] = "synthetic"
     return generate_candles(seed=abs(hash(symbol)) % 10_000)

@@ -8,18 +8,24 @@
  *   2. Journalier -> RSI14, MA20/MA50, volume, tendance VWAP, divergences RSI/MACD, Fibonacci
  *   3. 4 h -> mêmes facteurs, confirmation
  *   4. 15 min -> déclencheur d'entrée (seule unité de temps d'entrée)
- * puis R/R dans la bande 1,2–1,3 et objectif ≥ 200 pips.
+ * Le STOP vient de la structure 15 min, l'OBJECTIF est borné par le prochain niveau 1 h, et le
+ * R/R tient dans la bande 1:1,2 – 1:1,3.
  *
  * Principe d'affichage : AUCUN score technique brut. Chaque facteur porte un score de fiabilité
  * lisible de -5 à +5 (positif = argument d'achat, négatif = argument de vente), l'explication est
  * rédigée en français, et le trade se termine par un score de fiabilité global.
  *
- * La page se rafraîchit TOUTE SEULE : la stratégie est recalculée à intervalle régulier.
+ * AUCUN CLIC N'EST NÉCESSAIRE :
+ * - la page lit un instantané pré-calculé par le serveur -> elle se rafraîchit toutes les 10 s
+ *   sans jamais attendre un recalcul complet ;
+ * - les setups « armés » sont ouverts AUTOMATIQUEMENT en compte démo dès que leur déclencheur
+ *   15 min se forme. Les boutons ne servent qu'à forcer la main.
  */
 
 import { useCallback, useEffect, useState } from 'react';
 import {
   api,
+  type AutoEntryStatus,
   type PaperExecutionReport,
   type PlaybookFactor,
   type PlaybookLayer,
@@ -29,8 +35,8 @@ import {
 import { refreshLabel, useAutoRefresh } from '@/lib/useAutoRefresh';
 import { Button } from '@/components/ui';
 
-/** Recalcul complet de la stratégie toutes les 2 minutes (le cache serveur absorbe le coût). */
-const REFRESH_MS = 120_000;
+/** L'instantané est déjà prêt côté serveur : on peut donc relire toutes les 10 secondes. */
+const REFRESH_MS = 10_000;
 
 const LAYER_ORDER = ['monthly', 'daily', 'h4', 'm15'] as const;
 const LAYER_TITLES: Record<string, string> = {
@@ -140,7 +146,56 @@ function ChecklistRow({ c }: { c: PlaybookTrade['checklist'][number] }) {
   );
 }
 
-function TradeCard({ trade, rank }: { trade: PlaybookTrade; rank: number }) {
+function CardTradeButton({ symbol, direction }: { symbol: string; direction: 'BUY' | 'SELL' | 'NO_TRADE' }) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<PaperExecutionReport | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function run() {
+    setBusy(true);
+    setErr(null);
+    setResult(null);
+    try {
+      // La stratégie est RECALCULÉE côté serveur au moment du clic : les niveaux affichés dans la
+      // carte peuvent avoir quelques secondes ; on n'ouvre jamais sur des chiffres périmés.
+      setResult(await api.executePlaybookSymbol(symbol));
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const opened = result?.opened[0];
+  return (
+    <div className="mt-3 border-t border-border pt-3">
+      <Button
+        size="sm"
+        variant={direction === 'BUY' ? 'buy' : direction === 'SELL' ? 'sell' : 'secondary'}
+        onClick={run}
+        loading={busy}
+        className="w-full"
+      >
+        {busy ? 'Ouverture…' : `📈 Trader en démo — ${symbol}`}
+      </Button>
+      {err && <p className="mt-1.5 text-[11px] text-sell">{err}</p>}
+      {opened && (
+        <p className="mt-1.5 text-[11px] text-buy">
+          ✅ Ouvert : {opened.side.toUpperCase()} {opened.qty} @ {opened.entry} · SL {opened.stop_loss} ·
+          TP {opened.take_profit} · R/R 1:{opened.risk_reward}.{' '}
+          <a href="/execution" className="underline">Voir dans Paper Trading →</a>
+        </p>
+      )}
+      {result && !opened && (
+        <p className="mt-1.5 text-[11px] text-yellow-300/90">
+          ⏭️ {result.summary}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function TradeCard({ trade, rank, autoEntry }: { trade: PlaybookTrade; rank: number; autoEntry: boolean }) {
   const [tab, setTab] = useState<'none' | 'why' | 'steps' | 'factors'>('none');
   const ready = trade.tier === 'ready';
   const buy = trade.direction === 'BUY';
@@ -151,21 +206,39 @@ function TradeCard({ trade, rank }: { trade: PlaybookTrade; rank: number }) {
           <span className="mr-2 text-muted">#{rank}</span>{trade.symbol}
         </span>
         <div className="flex items-center gap-1.5">
-          <ScoreBadge score={trade.reliability_score} label={trade.reliability} />
+          {/* Un setup ARMÉ n'a pas de note de TRADE (il n'y a pas de trade) : on affiche alors la
+              fiabilité de son CONTEXTE, qui est ce qui a réellement été validé. */}
+          {ready ? (
+            <ScoreBadge score={trade.reliability_score} label={trade.reliability} />
+          ) : (
+            <ScoreBadge score={trade.context_reliability} label={`contexte ${trade.context_reliability_label}`} />
+          )}
           <span className={`rounded px-2 py-0.5 text-xs font-bold ${buy ? 'bg-buy/20 text-buy' : 'bg-sell/20 text-sell'}`}>
             {trade.direction}
           </span>
         </div>
       </div>
 
-      <div className="mt-1">
+      <div className="mt-1 flex flex-wrap gap-1">
         {ready ? (
           <span className="rounded bg-buy/15 px-2 py-0.5 text-[10px] font-bold text-buy">
             ✅ EXÉCUTABLE — déclencheur 15 min actif
           </span>
         ) : (
           <span className="rounded bg-yellow-500/15 px-2 py-0.5 text-[10px] font-bold text-yellow-300">
-            🟡 ARMÉ — contexte validé, en attente du déclencheur 15 min
+            {autoEntry
+              ? '🟡 ARMÉ — entrée AUTOMATIQUE dès le déclencheur 15 min'
+              : '🟡 ARMÉ — contexte validé, en attente du déclencheur 15 min'}
+          </span>
+        )}
+        {trade.edge && trade.edge.trades > 0 && (
+          <span
+            title={trade.edge.status}
+            className={`rounded px-2 py-0.5 text-[10px] font-bold ${
+              trade.edge.score > 0 ? 'bg-buy/10 text-buy' : 'bg-sell/10 text-sell'
+            }`}
+          >
+            📊 {trade.edge.win_rate}% sur {trade.edge.trades} trades rejoués
           </span>
         )}
       </div>
@@ -181,14 +254,26 @@ function TradeCard({ trade, rank }: { trade: PlaybookTrade; rank: number }) {
             <span>TP3 : <span className="font-mono text-white/80">{trade.take_profit_3}</span></span>
           </div>
           <p className="mt-1.5 text-[11px] text-muted">
-            Stop placé sur la <span className="text-white/80">{trade.stop_basis}</span>
-            {trade.horizon_days != null && <> · horizon estimé <span className="text-white/80">~{trade.horizon_days} jour(s)</span></>}
+            Stop sur la <span className="text-white/80">{trade.stop_basis}</span>
+            {trade.horizon_label && <> · horizon estimé <span className="text-white/80">{trade.horizon_label}</span></>}
+          </p>
+          <p className="mt-0.5 text-[11px] text-muted">
+            Objectif : <span className="text-white/80">{trade.target_basis}</span>
+            {trade.target_level != null && (
+              <> · niveau 1 h à <span className="font-mono text-white/80">{trade.target_level}</span></>
+            )}
           </p>
         </>
       ) : (
         <p className="mt-3 text-xs text-muted">
           Les étapes 1 à 3 sont validées (mensuel + journalier, puis 4 h). L&apos;entrée ne se prend
           qu&apos;en 15 min : {trade.reasons[0] ?? 'déclencheur non formé'}.
+          {autoEntry && (
+            <> <span className="text-yellow-300">
+              Tu n&apos;as rien à faire : la position s&apos;ouvrira toute seule en démo à la seconde
+              où le déclencheur se formera.
+            </span></>
+          )}
         </p>
       )}
 
@@ -238,6 +323,8 @@ function TradeCard({ trade, rank }: { trade: PlaybookTrade; rank: number }) {
           })}
         </div>
       )}
+
+      <CardTradeButton symbol={trade.symbol} direction={trade.direction} />
     </div>
   );
 }
@@ -278,17 +365,55 @@ function ExecutionReport({ report }: { report: PaperExecutionReport }) {
   );
 }
 
+/** Bandeau d'auto-entrée : ce que le robot surveille, et ce qu'il a ouvert pendant ton absence. */
+function AutoEntryBanner({ status }: { status: AutoEntryStatus }) {
+  if (!status.enabled) {
+    return (
+      <div className="rounded-xl border border-border bg-surface px-4 py-2 text-xs text-muted">
+        🤖 Auto-entrée désactivée — les setups armés attendent une ouverture manuelle.
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-xl border border-accent/40 bg-accent/5 px-4 py-3 text-sm">
+      <p className="font-semibold text-accent">
+        🤖 Auto-entrée active — compte DÉMO · vérification toutes les {status.interval_seconds} s
+      </p>
+      <p className="mt-0.5 text-[11px] text-muted">
+        Tu n&apos;as rien à cliquer : dès qu&apos;un setup armé voit son déclencheur 15 min se former,
+        la position est ouverte automatiquement avec son stop 15 min et son objectif borné 1 h.
+        Aucun argent réel n&apos;est engagé.
+      </p>
+      {status.watching.length > 0 && (
+        <p className="mt-1 text-[11px] text-muted">
+          Sous surveillance : {status.watching.map((w) => `${w.symbol} ${w.direction}`).join(' · ')}
+        </p>
+      )}
+      {status.recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-[11px] text-buy">
+          {status.recent.slice(0, 4).map((e) => <li key={e.id}>{e.message}</li>)}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export function TopTrades() {
   const [data, setData] = useState<TopTradesData | null>(null);
+  const [autoEntry, setAutoEntry] = useState<AutoEntryStatus | null>(null);
   const [firstLoad, setFirstLoad] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<PaperExecutionReport | null>(null);
   const [executing, setExecuting] = useState(false);
+  const [recomputing, setRecomputing] = useState(false);
 
-  // `refresh: true` -> la stratégie est RECALCULÉE, pas seulement relue depuis le cache du jour.
+  // Lecture de l'INSTANTANÉ déjà calculé par le serveur (pas de `refresh`) : la réponse arrive en
+  // quelques millisecondes, ce qui permet de relire toutes les 10 s sans jamais bloquer la page.
   const load = useCallback(async () => {
     try {
-      setData(await api.topTrades(true, 5));
+      const [trades, status] = await Promise.all([api.topTrades(false, 5), api.autoEntry()]);
+      setData(trades);
+      setAutoEntry(status);
       setError(null);
     } catch (e: any) {
       setError(e.message);
@@ -304,6 +429,19 @@ export function TopTrades() {
     void load();
   }, [load]);
 
+  /** Force un RECALCUL complet côté serveur (le rafraîchissement normal ne fait que relire). */
+  async function recomputeNow() {
+    setRecomputing(true);
+    setError(null);
+    try {
+      setData(await api.topTrades(true, 5));
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setRecomputing(false);
+    }
+  }
+
   async function execute() {
     setExecuting(true);
     setError(null);
@@ -318,6 +456,7 @@ export function TopTrades() {
   }
 
   const readyCount = data?.picks.filter((p) => p.tier === 'ready').length ?? 0;
+  const autoOn = Boolean(autoEntry?.enabled ?? data?.auto_entry);
 
   return (
     <section className="space-y-3">
@@ -326,16 +465,23 @@ export function TopTrades() {
           <h2 className="text-lg font-semibold text-white">🎯 Les 5 trades du jour — stratégie du desk</h2>
           <p className="text-xs text-muted">
             Mensuel + Journalier (tendance de fond &amp; niveaux majeurs) → Journalier détaillé →
-            4 h → <strong className="text-white/80">entrée en 15 min uniquement</strong> · R/R entre
-            1,2 et 1,3 · objectif ≥ 200 pips.
+            4 h → <strong className="text-white/80">entrée en 15 min uniquement</strong> · stop sur
+            la structure 15 min · objectif borné par le niveau 1 h · R/R entre 1,2 et 1,3.
           </p>
           <p className="mt-0.5 text-[11px] text-muted">
-            <span className={auto.refreshing ? 'text-accent' : ''}>🔄 Recalcul automatique</span> · {refreshLabel(auto)}
+            <span className={auto.refreshing ? 'text-accent' : ''}>🔄 Mise à jour automatique</span> ·{' '}
+            {refreshLabel(auto)}
+            {data?.age_seconds != null && (
+              <span className={data.stale ? 'text-sell' : ''}>
+                {' '}· stratégie calculée il y a {Math.round(data.age_seconds)} s
+                {data.stale && ' (donnée périmée)'}
+              </span>
+            )}
           </p>
         </div>
         <div className="flex gap-2">
-          <Button variant="secondary" size="sm" onClick={auto.refreshNow} loading={auto.refreshing}>
-            {auto.refreshing ? '…' : 'Recalculer maintenant'}
+          <Button variant="secondary" size="sm" onClick={recomputeNow} loading={recomputing}>
+            {recomputing ? '…' : 'Recalculer maintenant'}
           </Button>
           <Button size="sm" onClick={execute} loading={executing}>
             {executing ? '…' : readyCount > 0 ? `Ouvrir en démo (${readyCount})` : 'Ouvrir en démo'}
@@ -343,6 +489,7 @@ export function TopTrades() {
         </div>
       </div>
 
+      {autoEntry && <AutoEntryBanner status={autoEntry} />}
       {data && <SessionBanner data={data} />}
       {error && <p className="text-sell">{error}</p>}
       {report && <ExecutionReport report={report} />}
@@ -352,20 +499,24 @@ export function TopTrades() {
         <>
           <p className="text-xs text-muted">
             {data.scanned} symbole(s) passés à la stratégie · {data.ready} exécutable(s) maintenant
+            {data.armed != null && <> · {data.armed} armé(s)</>}
           </p>
           {data.picks.length === 0 ? (
             <div className="rounded-xl border border-border bg-surface p-6 text-muted">{data.note}</div>
           ) : (
             <>
               <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-                {data.picks.map((p, i) => <TradeCard key={p.symbol} trade={p} rank={i + 1} />)}
+                {data.picks.map((p, i) => (
+                  <TradeCard key={p.symbol} trade={p} rank={p.rank ?? i + 1} autoEntry={autoOn} />
+                ))}
               </div>
               <p className="text-xs text-muted">{data.note}</p>
             </>
           )}
           <p className="text-[11px] text-muted">
             Aucun trade n&apos;est garanti gagnant : ces setups sont ceux qui respectent intégralement
-            la stratégie, classés par fiabilité. Aide à la décision, pas un conseil en investissement.
+            la stratégie, classés par fiabilité mesurée sur l&apos;historique rejoué. Aide à la
+            décision, pas un conseil en investissement.
           </p>
         </>
       )}

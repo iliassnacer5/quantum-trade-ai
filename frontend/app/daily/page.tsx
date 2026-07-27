@@ -5,12 +5,15 @@ import { api } from '@/lib/api';
 import { PageHeader, Button } from '@/components/ui';
 import { TopTrades } from '@/components/domain';
 
+// Unités de temps du desk, nommées par leur DURÉE (cf. lib/markets.ts). Les valeurs doivent
+// correspondre exactement à l'énumération de l'API, sinon la requête part en 422.
 const TIMEFRAMES = [
-  { tf: '5m', label: 'Scalp 5m' },
-  { tf: '15m', label: 'Intraday 15m' },
-  { tf: '1h', label: 'Swing 1h' },
-  { tf: '4h', label: 'Position 4h' },
-  { tf: '1d', label: 'Journalier 1d' },
+  { tf: '15min', label: '15 min' },
+  { tf: '1h', label: '1 h' },
+  { tf: '4h', label: '4 h' },
+  { tf: '1d', label: '1 jour' },
+  { tf: '1week', label: '1 semaine' },
+  { tf: '1month', label: '1 mois' },
 ];
 
 export default function DailyPage() {

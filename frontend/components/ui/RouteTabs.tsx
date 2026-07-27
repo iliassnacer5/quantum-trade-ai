@@ -34,5 +34,6 @@ export const PROVE_TABS = [
   { href: '/edge', label: '🗺️ Edge' },
   { href: '/strategies', label: 'Stratégies' },
   { href: '/backtest', label: 'Backtest' },
+  { href: '/backtest/rapport', label: 'Rapport' },
   { href: '/track-record', label: 'Track record' },
 ];

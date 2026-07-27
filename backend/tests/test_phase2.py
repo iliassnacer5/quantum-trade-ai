@@ -192,8 +192,18 @@ def test_agents_status_endpoint():
     assert len(data["agents"]) == 9
     names = [a["name"] for a in data["agents"]]
     assert names[0] == "playbook"  # agent chef de file
-    assert data["strategy"]["min_risk_reward"] == 1.2
-    assert data["strategy"]["max_risk_reward"] == 1.3
+    assert data["strategy"]["min_risk_reward"] == 2.0
+    assert data["strategy"]["max_risk_reward"] == 3.0
+    # Objectif ≥ 200 pips : le stop vit donc sur la structure 4 h, le 15 min ne donne que le timing.
     assert data["strategy"]["min_target_pips"] == 200.0
     assert data["strategy"]["entry_timeframe"] == "15m"
-    assert len(data["strategy"]["steps"]) == 4
+    assert data["strategy"]["confirm_timeframe"] == "1h"
+    assert data["strategy"]["stop_timeframe"] == "4h"
+    # Sécurisation du profit à +2R, et pas d'ouverture marchés fermés.
+    assert data["strategy"]["secure_at_r"] == 2.0
+    assert data["strategy"]["trade_only_when_open"] is True
+    # L'auto-entrée est annoncée, et elle est en compte démo — jamais en réel.
+    assert data["strategy"]["auto_entry_mode"] == "paper"
+    assert "training" in data
+    assert data["strategy"]["entry_timeframe"] == "15m"
+    assert len(data["strategy"]["steps"]) == 5
