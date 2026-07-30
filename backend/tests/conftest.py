@@ -19,6 +19,7 @@ def _test_env():
     settings.expert_agents_enabled = False  # path générique par défaut (testé séparément avec mocks)
     settings.event_blackout_enabled = False  # pas d'appel calendrier réseau en test
     settings.edge_sweep_enabled = False      # pas de sweep de fond en test (testé séparément)
+    settings.daily_picks_precompute_enabled = False  # pas de précalcul de fond en test
     settings.auto_trade_green_only = False   # les tests d'auto-trade n'exigent pas la carte de l'edge
     # Gates du PLAN (verdicts de paires, sizing par conviction, gels de perte, corrélation) :
     # désactivés par défaut — chacun est testé explicitement dans tests/test_plan_phases.py,
@@ -40,4 +41,26 @@ def _test_env():
     # blackout événementiel, sweep de l'edge).
     settings.playbook_enabled = False
     reset_store()
+    # Cache COURT (15 s) du prix de référence (`execution_service._reference_price`) : sans ce
+    # nettoyage, un test qui appelle le vrai chemin (non moqué) pour "EUR/USD" pourrait hériter,
+    # selon la vitesse d'exécution, du prix laissé par un test précédent utilisant le même symbole.
+    from app.services import execution_service
+
+    execution_service._price_cache.clear()
+    # Même raison, même remède, pour le cache court (20 s) de `data.ohlcv.get_ohlcv_with_source` :
+    # deux tests qui interrogent le même (symbole, unité, limite) avec des mocks DIFFÉRENTS ne
+    # doivent jamais se voir répondre par le résultat laissé par l'autre.
+    from app.data import markets as markets_mod
+    from app.data import ohlcv as ohlcv_mod
+
+    ohlcv_mod._CACHE.clear()
+    # Idem pour le cache court de `markets.load_candles` (30/07/2026) : deux tests qui chargent le
+    # même (symbole, unité, limite) avec des fournisseurs moqués DIFFÉRENTS doivent chacun voir leur
+    # propre mock, jamais la réponse mémorisée par l'autre.
+    markets_mod.clear_cache()
+    # Instantané du scanner complémentaire : sans ce reset, un test hériterait de la sélection
+    # calculée par un autre (le cache est en mémoire de module, pas dans le store).
+    from app.services import daily_picks_cache
+
+    daily_picks_cache.reset()
     yield

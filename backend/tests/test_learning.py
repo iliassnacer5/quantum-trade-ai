@@ -58,8 +58,14 @@ async def test_auto_resolve_closes_open_signals(monkeypatch):
     client.post("/api/signals/generate", json={"asset": "BTC/USDT", "timeframe": "1h", "notify": False}, headers=h)
 
     # Rejeu mocké -> le TP est touché (won), indépendamment de la direction réelle du signal.
+    # Le faux doit rendre le VERDICT MOTIVÉ (dictionnaire) que `replay.replay_outcome` produit
+    # depuis le correctif d'honnêteté : un tuple faisait passer le test à côté du vrai contrat.
     async def _won(symbol, direction, entry, sl, tp, since_iso, interval="1h"):  # noqa: ANN001
-        return "won", (tp if tp else entry * 1.05), 1_700_000_000
+        return {
+            "outcome": "won", "exit_price": (tp if tp else entry * 1.05),
+            "closed_ts": 1_700_000_000, "reason": "objectif touché (rejeu simulé)",
+            "data_real": True, "covered_until": None, "bars": 42,
+        }
 
     monkeypatch.setattr(replay, "replay_outcome", _won)
     store = get_store()

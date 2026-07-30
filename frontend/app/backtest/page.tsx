@@ -13,7 +13,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, type BacktestConfig, type BacktestReport } from '@/lib/api';
-import { MarketSelector } from '@/components/domain';
+import { MarketSelector, PlaybookSymbolBacktest } from '@/components/domain';
 import {
   Button, Card, EmptyState, PageHeader, PROVE_TABS, RouteTabs,
   Table, TBody, TD, TH, THead, TR,
@@ -103,20 +103,33 @@ export default function BacktestPage() {
       />
       <RouteTabs items={PROVE_TABS} />
 
+      {/* LA STRATÉGIE DU DESK, sur un instrument choisi. C'est ce qu'on veut le plus souvent :
+          « et sur celui-ci, ça donne quoi ? » — sans attendre les dix minutes du passage complet. */}
+      <PlaybookSymbolBacktest />
+
       <Card className="border-accent/40 bg-accent/5 p-4">
         <p className="text-sm text-white">
-          Tu cherches le backtest de <strong>la stratégie du desk</strong> sur toutes les paires ?
+          Tu cherches le backtest de <strong>la stratégie du desk sur TOUS les marchés</strong> ?
         </p>
         <p className="mt-0.5 text-[11px] text-muted">
           Il est sur la page <a href="/backtest/rapport" className="text-accent underline">Rapport de backtest</a> :
-          classement des paires par fiabilité, profil des trades perdants, méthode et limites.
-          Ici, on teste une configuration ponctuelle.
+          les 10 meilleurs instruments de chaque marché, le classement complet par fiabilité, le
+          profil des trades perdants, la méthode et ses limites.
         </p>
       </Card>
 
-      {/* ---- Sélecteurs (mêmes que le Scanner) ---- */}
+      {/* ---- Moteur générique : une CONFIGURATION, pas la stratégie du desk ---- */}
       <Card className="space-y-4 p-6">
-        <h2 className="text-lg font-semibold text-white">Configuration</h2>
+        <div>
+          <h2 className="text-lg font-semibold text-white">
+            Moteur générique — tester une configuration
+          </h2>
+          <p className="mt-0.5 text-xs text-muted">
+            Ce bloc-ci ne rejoue PAS la stratégie du desk : il teste une configuration ponctuelle
+            (capital, risque par trade, agents LLM) sur une paire. Les deux résultats ne sont pas
+            comparables entre eux.
+          </p>
+        </div>
         <div className="flex flex-wrap items-end gap-4">
           <div>
             <label className="mb-1 block text-xs text-muted">Marché</label>

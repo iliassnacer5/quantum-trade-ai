@@ -7,7 +7,7 @@ pour ancrer l'actualité géopolitique en temps réel.
 
 from __future__ import annotations
 
-from app.agents.base import AgentOutput
+from app.agents.base import AgentOutput, apply_playbook
 
 
 def assess_regime(macro: dict) -> tuple[str, float]:
@@ -43,7 +43,7 @@ def assess_regime(macro: dict) -> tuple[str, float]:
     return regime, score
 
 
-async def run(macro: dict | None = None) -> AgentOutput:
+async def run(macro: dict | None = None, context: dict | None = None) -> AgentOutput:
     name = "macro"
     if not macro:
         macro = {} # Avoid None for dictionary access
@@ -77,10 +77,18 @@ async def run(macro: dict | None = None) -> AgentOutput:
             import logging
             logging.getLogger(__name__).warning("Erreur LLM Macro : %s", e)
 
+    # Cadre de la stratégie, avec la même atténuation douce que le sentiment : la macro ne lit pas
+    # le graphique. Son désaccord avec la tendance est une information à conserver, pas un bruit.
+    metrics: dict = {"regime": regime}
+    notes: list[str] = []
+    score, confidence = apply_playbook(score, confidence, notes, metrics, context, soften=0.7)
+    if notes:
+        rationale += " " + " ; ".join(notes) + "."
+
     return AgentOutput(
         name=name,
         score=round(score, 3),
-        confidence=confidence,
+        confidence=round(confidence, 3),
         rationale=rationale,
-        details={"regime": regime},
+        details=metrics,
     )

@@ -256,15 +256,19 @@ async def _ctx_todays_trades(user: User, store: AppStore, symbol: str) -> tuple[
     by_class: dict[str, list[dict]] = {}
     for p in picks:
         by_class.setdefault(p["asset_class"], []).append(p)
-    labels = {"crypto": "Crypto", "forex": "Forex", "stock": "Actions"}
+    labels = {"crypto": "Crypto", "forex": "Forex", "stock": "Actions",
+              "commodity": "Or & Métaux", "index": "Indices"}
     lines: list[str] = []
     for cls, items in by_class.items():
         lines.append(f"{labels.get(cls, cls)} :")
         for p in items:
             bt = p.get("backtest") or {}
+            # On annonce ce que la STRATÉGIE mesure : sa lecture de la tendance et son R/R.
+            trend = f"tendance {p['trend_score']}/100" if p.get("trend_score") is not None else p["trend"]
+            rr = f" | R/R 1:{p['risk_reward']:.2f}" if p.get("risk_reward") else ""
             lines.append(
-                f"  - {p['symbol']} {p['direction']} @ {p['price']} | ADX {p['adx']} | "
-                f"réussite {bt.get('win_rate')}% | PF {bt.get('profit_factor')} | {p['trend']}"
+                f"  - {p['symbol']} {p['direction']} @ {p['price']} | {trend}{rr} | "
+                f"réussite {bt.get('win_rate')}% | PF {bt.get('profit_factor')}"
             )
     context_text = "\n".join(lines)
     deterministic = (

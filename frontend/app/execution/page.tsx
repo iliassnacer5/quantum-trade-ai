@@ -1,16 +1,21 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, BrokerConn, Order, PlanInfo, PositionsSnapshot } from '@/lib/api';
+import { api, BrokerConn, Order, PaperPosition, PlanInfo, PositionsSnapshot } from '@/lib/api';
 import { MarketSelector, OutcomeBanner, DataSourceBadge } from '@/components/domain';
 import { PageHeader } from '@/components/ui';
 import { refreshLabel, useAutoRefresh } from '@/lib/useAutoRefresh';
 
 type Ticket = { connId: string; side: 'buy' | 'sell' };
 
-/** Le P&L latent est recalculé côté serveur toutes les 10 s — aucun clic nécessaire.
- *  C'est aussi ce qui fait apparaître les positions ouvertes AUTOMATIQUEMENT par le robot. */
-const REFRESH_MS = 10_000;
+/** Le P&L latent est recalculé côté serveur — aucun clic nécessaire. C'est aussi ce qui fait
+ *  apparaître les positions ouvertes AUTOMATIQUEMENT par le robot.
+ *
+ *  15 s et non 10 s (30/07/2026) : le prix de référence côté serveur est lui-même mémorisé ~20 s
+ *  (`market_cache_ttl`), donc interroger plus souvent que ça ne rapportait aucune fraîcheur
+ *  supplémentaire — seulement des requêtes. Le hook suspend déjà la boucle quand l'onglet est
+ *  masqué (cf. `useAutoRefresh`). */
+const REFRESH_MS = 15_000;
 
 export default function ExecutionPage() {
   const [plan, setPlan] = useState<PlanInfo | null>(null);
@@ -35,7 +40,22 @@ export default function ExecutionPage() {
   const [price, setPrice] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [checking, setChecking] = useState<string | null>(null);
+  // Confirmation de clôture EN PAGE (pas de window.confirm) : la boîte de dialogue native du
+  // navigateur peut être bloquée ou auto-rejetée silencieusement dans certains contextes embarqués
+  // (webview, aperçu intégré…) — le clic ne produisait alors AUCUNE requête, sans aucun message
+  // d'erreur, ce qui ressemblait à un bouton cassé. Un état de confirmation en JSX fonctionne
+  // partout où React fonctionne.
+  const [confirmCloseId, setConfirmCloseId] = useState<string | null>(null);
   const [dataSrc, setDataSrc] = useState<{ source: string; real: boolean; label: string } | null>(null);
+
+  // Modification manuelle du stop / de l'objectif d'une position ouverte : une seule ligne
+  // éditable à la fois, avec son propre message d'erreur (le prix a pu franchir le niveau demandé
+  // entre la saisie et l'envoi, par ex.).
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editSL, setEditSL] = useState('');
+  const [editTP, setEditTP] = useState('');
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
 
   // Un seul appel : positions + P&L latent déjà calculé côté serveur.
   const refresh = useCallback(async () => {
@@ -141,7 +161,7 @@ export default function ExecutionPage() {
   }
 
   async function manualClose(id: string) {
-    if (!confirm('Clôturer cette position au prix du marché actuel ?')) return;
+    setConfirmCloseId(null);
     setChecking(id);
     setError(null);
     try {
@@ -151,6 +171,42 @@ export default function ExecutionPage() {
       setError(e.message);
     } finally {
       setChecking(null);
+    }
+  }
+
+  function startEdit(o: PaperPosition) {
+    setEditingId(o.id);
+    setEditSL(o.stop_loss != null ? String(o.stop_loss) : '');
+    setEditTP(o.take_profit != null ? String(o.take_profit) : '');
+    setEditError(null);
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditError(null);
+  }
+
+  async function saveEdit(id: string) {
+    const sl = editSL.trim() ? parseFloat(editSL) : undefined;
+    const tp = editTP.trim() ? parseFloat(editTP) : undefined;
+    if (sl === undefined && tp === undefined) {
+      setEditError('Indique un stop ou un objectif.');
+      return;
+    }
+    if ((editSL.trim() && Number.isNaN(sl)) || (editTP.trim() && Number.isNaN(tp))) {
+      setEditError('Valeur numérique invalide.');
+      return;
+    }
+    setEditSaving(true);
+    setEditError(null);
+    try {
+      await api.updateOrderLevels(id, { stop_loss: sl, take_profit: tp });
+      setEditingId(null);
+      await refresh();
+    } catch (e: any) {
+      setEditError(e.message);
+    } finally {
+      setEditSaving(false);
     }
   }
 
@@ -181,6 +237,158 @@ export default function ExecutionPage() {
       setSubmitting(false);
     }
   }
+
+  // Une seule position, rendue identiquement qu'elle soit ouverte ou clôturée — extrait pour
+  // éviter de dupliquer ce bloc entre les deux groupes (en cours / clôturés) affichés plus bas.
+  function positionCard(o: PaperPosition) {
+    const closed = o.closed;
+    const pnl = closed ? o.realized_pnl : o.unrealized_pnl;
+    const progress = Math.max(0, Math.min(100, o.progress_pct ?? 0));
+    return (
+      <div key={o.id} className="rounded-lg border border-border bg-surface p-3 text-sm">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="font-mono text-white">{o.symbol}</span>
+          <span className={o.side === 'buy' ? 'text-buy' : 'text-sell'}>
+            {o.side === 'buy' ? 'ACHAT' : 'VENTE'}
+          </span>
+          <span className="text-muted">{o.qty} @ {o.entry ?? o.filled_price ?? '—'}</span>
+          <span className="rounded bg-muted/20 px-2 py-0.5 text-xs text-muted">{o.mode}</span>
+          {closed ? <OutcomeBanner outcome={o.outcome!} className="px-2 py-0.5" />
+            : <span className="rounded bg-accent/15 px-2 py-0.5 text-xs text-accent">en cours</span>}
+          {o.copied_from && <span className="rounded bg-accent/20 px-2 py-0.5 text-xs text-accent">copié</span>}
+          {pnl != null && (
+            <span className={`font-mono font-semibold ${pnl >= 0 ? 'text-buy' : 'text-sell'}`}>
+              {pnl >= 0 ? '+' : ''}{pnl}
+              {o.pnl_pct != null && !closed && <span className="ml-1 text-[11px]">({o.pnl_pct > 0 ? '+' : ''}{o.pnl_pct}%)</span>}
+            </span>
+          )}
+          {/* Pips gagnés ou perdus : la lecture du trade indépendante de la taille de position. */}
+          {o.pips != null && (
+            <span className={`rounded px-2 py-0.5 font-mono text-xs ${o.pips >= 0 ? 'bg-buy/15 text-buy' : 'bg-sell/15 text-sell'}`}
+              title={`${o.pips >= 0 ? 'Gagné' : 'Perdu'} ${Math.abs(o.pips)} ${o.pips_label ?? 'pips'} ${closed ? '(réalisé)' : '(latent)'}`}>
+              {o.pips >= 0 ? '+' : ''}{o.pips} pips
+            </span>
+          )}
+          {!closed && editingId !== o.id && (
+            <span className="ml-auto flex items-center gap-2">
+              {confirmCloseId === o.id ? (
+                <>
+                  <span className="text-xs text-muted">Clôturer au prix du marché ?</span>
+                  <button onClick={() => manualClose(o.id)} disabled={checking === o.id}
+                    className="rounded border border-sell bg-sell/10 px-2 py-0.5 text-xs font-medium text-sell hover:bg-sell/20 disabled:opacity-50">
+                    {checking === o.id ? '…' : 'Oui, clôturer'}
+                  </button>
+                  <button onClick={() => setConfirmCloseId(null)} disabled={checking === o.id}
+                    className="rounded border border-border px-2 py-0.5 text-xs text-muted hover:bg-[#1A1A1A]">
+                    Annuler
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button onClick={() => startEdit(o)}
+                    className="rounded border border-border px-2 py-0.5 text-xs text-muted hover:bg-[#1A1A1A]">
+                    Modifier SL/TP
+                  </button>
+                  <button onClick={() => setConfirmCloseId(o.id)}
+                    className="rounded border border-sell/50 px-2 py-0.5 text-xs text-sell hover:bg-sell/10">
+                    Clôturer maintenant
+                  </button>
+                </>
+              )}
+            </span>
+          )}
+        </div>
+
+        {/* Ce qui a été choisi au lancement du trade — ou le formulaire de modification. */}
+        {editingId === o.id ? (
+          <div className="mt-2 space-y-2 rounded border border-border bg-background/60 p-2">
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="block">
+                <span className="mb-1 block text-[11px] text-muted">Nouveau stop</span>
+                <input value={editSL} onChange={(e) => setEditSL(e.target.value)} inputMode="decimal"
+                  className="w-32 rounded border border-border bg-surface px-2 py-1 text-sm text-white" />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-[11px] text-muted">Nouvel objectif</span>
+                <input value={editTP} onChange={(e) => setEditTP(e.target.value)} inputMode="decimal"
+                  className="w-32 rounded border border-border bg-surface px-2 py-1 text-sm text-white" />
+              </label>
+              <button onClick={() => saveEdit(o.id)} disabled={editSaving}
+                className="rounded bg-accent px-3 py-1 text-xs font-medium text-background hover:brightness-110 disabled:opacity-50">
+                {editSaving ? 'Enregistrement…' : 'Enregistrer'}
+              </button>
+              <button onClick={cancelEdit} disabled={editSaving}
+                className="rounded border border-border px-3 py-1 text-xs text-muted hover:bg-[#1A1A1A]">
+                Annuler
+              </button>
+            </div>
+            {editError && <p className="text-xs text-sell">{editError}</p>}
+            <p className="text-[11px] text-muted">
+              Le risque d&apos;origine (ce que vaut 1R pour la sécurisation automatique à +2R)
+              ne change pas — seuls les niveaux affichés et le R/R informatif sont mis à jour.
+            </p>
+          </div>
+        ) : (
+        <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted">
+          {/* Heure d'ENTRÉE : sans elle, impossible de rattacher le trade à une séance. */}
+          {o.opened_at && (
+            <span>Entrée le <span className="text-white">{new Date(o.opened_at).toLocaleString('fr-FR')}</span>
+              {o.held_seconds != null && <span className="text-muted"> · tenue {formatDuration(o.held_seconds)}</span>}
+            </span>
+          )}
+          {o.stop_loss != null && (
+            <span>Stop : <span className="text-sell">{o.stop_loss}</span>
+              {o.stop_pips != null && <span className={o.stop_pips >= 0 ? 'text-buy' : 'text-sell'}> ({o.stop_pips >= 0 ? '+' : ''}{o.stop_pips} pips)</span>}
+            </span>
+          )}
+          {o.take_profit != null && (
+            <span>Objectif : <span className="text-buy">{o.take_profit}</span>
+              {o.target_pips != null && <span className={o.target_pips >= 0 ? 'text-buy' : 'text-sell'}> ({o.target_pips >= 0 ? '+' : ''}{o.target_pips} pips)</span>}
+            </span>
+          )}
+          {o.risk_reward != null && <span>R/R : <span className="text-white">1 : {o.risk_reward}</span></span>}
+          {o.risk_amount != null && <span>Risqué : <span className="text-sell">{o.risk_amount}</span></span>}
+          {o.potential_profit != null && <span>Gain visé : <span className="text-buy">{o.potential_profit}</span></span>}
+          {!closed && o.current_price != null && <span>Prix actuel : <span className="text-white">{o.current_price}</span></span>}
+          {!closed && o.r_multiple != null && <span>En multiples de risque : <span className="text-white">{o.r_multiple} R</span></span>}
+        </div>
+        )}
+
+        {/* Progression vers l'objectif, sans aucun clic. */}
+        {!closed && o.progress_pct != null && (
+          <div className="mt-2">
+            <div className="mb-0.5 flex justify-between text-[10px] text-muted">
+              <span>Entrée</span>
+              <span>{o.progress_pct}% du chemin vers l&apos;objectif</span>
+              <span>Objectif</span>
+            </div>
+            <div className="h-1.5 w-full rounded bg-border">
+              <div className={`h-1.5 rounded ${(o.progress_pct ?? 0) >= 0 ? 'bg-buy' : 'bg-sell'}`}
+                style={{ width: `${progress}%` }} />
+            </div>
+          </div>
+        )}
+
+        {closed && o.exit_price != null && (
+          <p className="mt-1.5 text-xs text-muted">
+            Sortie @ <span className="text-white">{o.exit_price}</span>
+            {o.closed_at && <> · le {new Date(o.closed_at).toLocaleString('fr-FR')}</>}
+            {o.pips != null && (
+              <> · <span className={o.pips >= 0 ? 'text-buy' : 'text-sell'}>
+                {o.pips >= 0 ? '+' : ''}{o.pips} {o.pips_label ?? 'pips'}
+              </span></>
+            )}
+            {/* Pourquoi la position s'est fermée : « stop touché » sur un trade GAGNANT
+                n'explique rien, le motif dit désormais que le stop avait été remonté. */}
+            {o.close_reason && <> · {o.close_reason}</>}
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  const openPositions = snap?.positions.filter((o) => !o.closed) ?? [];
+  const closedPositions = snap?.positions.filter((o) => o.closed) ?? [];
 
   return (
     <div className="p-8 space-y-6">
@@ -391,74 +599,34 @@ export default function ExecutionPage() {
           <p className="text-muted">Aucune position. Lance un trade ci-dessus ou depuis les trades du jour.</p>
         )}
 
-        {snap?.positions.map((o) => {
-          const closed = o.closed;
-          const pnl = closed ? o.realized_pnl : o.unrealized_pnl;
-          const progress = Math.max(0, Math.min(100, o.progress_pct ?? 0));
-          return (
-            <div key={o.id} className="rounded-lg border border-border bg-surface p-3 text-sm">
-              <div className="flex flex-wrap items-center gap-3">
-                <span className="font-mono text-white">{o.symbol}</span>
-                <span className={o.side === 'buy' ? 'text-buy' : 'text-sell'}>
-                  {o.side === 'buy' ? 'ACHAT' : 'VENTE'}
-                </span>
-                <span className="text-muted">{o.qty} @ {o.entry ?? o.filled_price ?? '—'}</span>
-                <span className="rounded bg-muted/20 px-2 py-0.5 text-xs text-muted">{o.mode}</span>
-                {closed ? <OutcomeBanner outcome={o.outcome!} className="px-2 py-0.5" />
-                  : <span className="rounded bg-accent/15 px-2 py-0.5 text-xs text-accent">en cours</span>}
-                {o.copied_from && <span className="rounded bg-accent/20 px-2 py-0.5 text-xs text-accent">copié</span>}
-                {pnl != null && (
-                  <span className={`font-mono font-semibold ${pnl >= 0 ? 'text-buy' : 'text-sell'}`}>
-                    {pnl >= 0 ? '+' : ''}{pnl}
-                    {o.pnl_pct != null && !closed && <span className="ml-1 text-[11px]">({o.pnl_pct > 0 ? '+' : ''}{o.pnl_pct}%)</span>}
-                  </span>
-                )}
-                {!closed && (
-                  <button onClick={() => manualClose(o.id)} disabled={checking === o.id}
-                    className="ml-auto rounded border border-sell/50 px-2 py-0.5 text-xs text-sell hover:bg-sell/10 disabled:opacity-50">
-                    {checking === o.id ? '…' : 'Clôturer maintenant'}
-                  </button>
-                )}
-              </div>
+        {/* EN COURS et CLÔTURÉS, séparés : deux listes chronologiques mélangées obligeaient à
+            chercher les positions encore actives au milieu de l'historique. */}
+        {openPositions.length > 0 && (
+          <div className="space-y-2">
+            <h3 className="text-sm font-semibold text-accent">🟢 En cours ({openPositions.length})</h3>
+            {openPositions.map(positionCard)}
+          </div>
+        )}
 
-              {/* Ce qui a été choisi au lancement du trade. */}
-              <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted">
-                {o.stop_loss != null && <span>Stop : <span className="text-sell">{o.stop_loss}</span></span>}
-                {o.take_profit != null && <span>Objectif : <span className="text-buy">{o.take_profit}</span></span>}
-                {o.risk_reward != null && <span>R/R : <span className="text-white">1 : {o.risk_reward}</span></span>}
-                {o.risk_amount != null && <span>Risqué : <span className="text-sell">{o.risk_amount}</span></span>}
-                {o.potential_profit != null && <span>Gain visé : <span className="text-buy">{o.potential_profit}</span></span>}
-                {!closed && o.current_price != null && <span>Prix actuel : <span className="text-white">{o.current_price}</span></span>}
-                {!closed && o.r_multiple != null && <span>En multiples de risque : <span className="text-white">{o.r_multiple} R</span></span>}
-              </div>
-
-              {/* Progression vers l'objectif, sans aucun clic. */}
-              {!closed && o.progress_pct != null && (
-                <div className="mt-2">
-                  <div className="mb-0.5 flex justify-between text-[10px] text-muted">
-                    <span>Entrée</span>
-                    <span>{o.progress_pct}% du chemin vers l&apos;objectif</span>
-                    <span>Objectif</span>
-                  </div>
-                  <div className="h-1.5 w-full rounded bg-border">
-                    <div className={`h-1.5 rounded ${(o.progress_pct ?? 0) >= 0 ? 'bg-buy' : 'bg-sell'}`}
-                      style={{ width: `${progress}%` }} />
-                  </div>
-                </div>
-              )}
-
-              {closed && o.exit_price != null && (
-                <p className="mt-1.5 text-xs text-muted">
-                  Sortie @ <span className="text-white">{o.exit_price}</span>
-                  {o.closed_at && <> · le {new Date(o.closed_at).toLocaleString('fr-FR')}</>}
-                </p>
-              )}
-            </div>
-          );
-        })}
+        {closedPositions.length > 0 && (
+          <div className="space-y-2">
+            <h3 className="mt-2 text-sm font-semibold text-muted">📋 Clôturés ({closedPositions.length})</h3>
+            {closedPositions.map(positionCard)}
+          </div>
+        )}
       </section>
     </div>
   );
+}
+
+/** Durée de détention, lisible : « 3 j 4 h », « 2 h 15 min », « 40 min ». */
+function formatDuration(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return m % 60 ? `${h} h ${m % 60} min` : `${h} h`;
+  const d = Math.floor(h / 24);
+  return h % 24 ? `${d} j ${h % 24} h` : `${d} j`;
 }
 
 function Recap({ label, value, tone = '', mono = false }:

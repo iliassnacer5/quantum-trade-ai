@@ -98,6 +98,13 @@ export default function JournalPage() {
             <h2 className="text-sm font-semibold text-white">Apprentissage — fiabilité par agent</h2>
             <span className="text-xs text-muted">{insights.trades_learned ?? 0} trade(s) appris</span>
           </div>
+          {insights.reliability_source === 'training' && (
+            <p className="mb-2 text-[11px] text-muted">
+              ⓘ Aucun signal généré via le dashboard pour l&apos;instant : la fiabilité ci-dessous
+              vient du walk-forward nocturne de la stratégie (positions démo), pas d&apos;un vote
+              d&apos;agents en direct.
+            </p>
+          )}
           {insights.reliability && insights.reliability.length > 0 ? (
             <div className="space-y-2">
               {insights.reliability.map((r) => (
@@ -129,8 +136,9 @@ export default function JournalPage() {
             </div>
           ) : (
             <p className="text-xs text-muted">
-              Pas encore assez de trades clôturés. Génère des signaux et laisse-les se résoudre (auto ou bouton ci-dessus) :
-              l&apos;apprentissage démarre dès quelques trades et s&apos;affine ensuite.
+              Pas encore assez de trades clôturés. Génère des signaux depuis le dashboard (ou
+              laisse l&apos;auto-entrée ouvrir des positions démo, puis attends le prochain
+              entraînement nocturne) : l&apos;apprentissage démarre dès quelques trades et s&apos;affine ensuite.
             </p>
           )}
         </section>
@@ -138,37 +146,68 @@ export default function JournalPage() {
 
       <section className="space-y-3">
         <h2 className="text-lg font-semibold text-white">Trades ({entries.length})</h2>
-        {entries.length === 0 && <p className="text-muted">Aucune entrée. Génère un signal depuis le dashboard.</p>}
-        {entries.map((e) => (
+        {entries.length === 0 && <p className="text-muted">Aucune entrée. Génère un signal depuis le dashboard, ou laisse l&apos;auto-entrée ouvrir une position démo.</p>}
+        {entries.map((e) => {
+          const isPlaybook = e.source === 'playbook';
+          return (
           <div key={e.id} className="rounded-xl border border-border bg-surface p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-3">
                 <span className="font-medium text-white">{e.symbol}</span>
                 <span className="text-sm text-muted">{e.direction}</span>
                 <span className={`rounded px-2 py-0.5 text-xs ${badge(e.outcome)}`}>{e.outcome}</span>
-                {e.pnl != null && <span className="text-sm text-gray-300">P&L {e.pnl}</span>}
-              </div>
-              <div className="flex gap-2">
-                {e.outcome === 'open' && (
-                  <>
-                    <button onClick={() => close(e.id, 'win')} className="rounded border border-buy/40 px-2 py-1 text-xs text-buy hover:bg-buy/10">
-                      Gain
-                    </button>
-                    <button onClick={() => close(e.id, 'loss')} className="rounded border border-sell/40 px-2 py-1 text-xs text-sell hover:bg-sell/10">
-                      Perte
-                    </button>
-                  </>
+                {isPlaybook && (
+                  <span className="rounded bg-accent/15 px-2 py-0.5 text-xs text-accent" title="Position ouverte par la stratégie (auto-entrée ou « Ouvrir en démo »)">
+                    playbook
+                  </span>
                 )}
-                <button onClick={() => explain(e.id)} className="rounded border border-border px-2 py-1 text-xs text-gray-200 hover:bg-[#1A1A1A]">
-                  Expliquer (IA)
-                </button>
+                {e.pnl != null && <span className="text-sm text-gray-300">P&L {e.pnl}</span>}
+                {e.pips != null && (
+                  <span className={`rounded px-2 py-0.5 font-mono text-xs ${e.pips >= 0 ? 'bg-buy/15 text-buy' : 'bg-sell/15 text-sell'}`}
+                    title={`${e.pips >= 0 ? 'Gagné' : 'Perdu'} ${Math.abs(e.pips)} ${e.pips_label ?? 'pips'}`}>
+                    {e.pips >= 0 ? '+' : ''}{e.pips} pips
+                  </span>
+                )}
               </div>
+              {/* Un trade playbook se ferme depuis Paper Trading (« Clôturer maintenant » /
+                  « Modifier SL/TP ») — ce n'est pas un enregistrement du journal des signaux,
+                  clore ou expliquer ici échouerait silencieusement. */}
+              {isPlaybook ? (
+                <a href="/execution" className="text-xs text-accent underline underline-offset-2">
+                  Gérer dans Paper Trading →
+                </a>
+              ) : (
+                <div className="flex gap-2">
+                  {e.outcome === 'open' && (
+                    <>
+                      <button onClick={() => close(e.id, 'win')} className="rounded border border-buy/40 px-2 py-1 text-xs text-buy hover:bg-buy/10">
+                        Gain
+                      </button>
+                      <button onClick={() => close(e.id, 'loss')} className="rounded border border-sell/40 px-2 py-1 text-xs text-sell hover:bg-sell/10">
+                        Perte
+                      </button>
+                    </>
+                  )}
+                  <button onClick={() => explain(e.id)} className="rounded border border-border px-2 py-1 text-xs text-gray-200 hover:bg-[#1A1A1A]">
+                    Expliquer (IA)
+                  </button>
+                </div>
+              )}
             </div>
+            {/* Heure d'ENTRÉE (et de sortie si le trade est fermé) : un journal sans horodatage
+                ne permet ni de rattacher un trade à une séance, ni d'en juger la durée. */}
+            {e.created_at && (
+              <p className="mt-1 text-xs text-muted">
+                Entrée le <span className="text-gray-300">{new Date(e.created_at).toLocaleString('fr-FR')}</span>
+                {e.closed_at && <> · sortie le <span className="text-gray-300">{new Date(e.closed_at).toLocaleString('fr-FR')}</span></>}
+              </p>
+            )}
             {explanations[e.id] && (
               <p className="mt-3 whitespace-pre-wrap rounded-lg bg-[#1A1A1A] p-3 text-sm text-gray-300">{explanations[e.id]}</p>
             )}
           </div>
-        ))}
+          );
+        })}
       </section>
     </div>
   );

@@ -43,6 +43,11 @@ class OrderRequest(BaseModel):
     take_profit: float | None = None
 
 
+class LevelsRequest(BaseModel):
+    stop_loss: float | None = None
+    take_profit: float | None = None
+
+
 @router.post("/brokers", status_code=status.HTTP_201_CREATED)
 async def connect(
     body: ConnectRequest,
@@ -195,6 +200,33 @@ async def close_order(
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     audit.record("execution.order_closed_manual", actor=user.email, tenant_id=user.tenant_id,
                  detail=f"{result['outcome']} {result['symbol']} pnl={result.get('realized_pnl')}")
+    return result
+
+
+@router.post("/orders/{order_id}/levels")
+async def update_levels(
+    order_id: str,
+    body: LevelsRequest,
+    user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """Modifie MANUELLEMENT le stop et/ou l'objectif d'une position papier encore ouverte.
+
+    Réservé au papier — ajuster un ordre réel passerait par le broker, pas par cette route. Le
+    risque d'origine (ce que vaut 1R pour la sécurisation automatique) n'est jamais redéfini par
+    cette modification ; seuls les niveaux affichés et le R/R informatif le sont.
+    """
+    try:
+        result = await execution_service.update_order_levels(
+            store, user.tenant_id, order_id,
+            stop_loss=body.stop_loss, take_profit=body.take_profit,
+        )
+    except execution_service.ExecutionError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    audit.record(
+        "execution.order_levels_edited", actor=user.email, tenant_id=user.tenant_id,
+        detail=f"{result['symbol']} SL={result.get('stop_loss')} TP={result.get('take_profit')}",
+    )
     return result
 
 

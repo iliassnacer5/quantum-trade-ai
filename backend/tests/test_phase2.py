@@ -194,16 +194,26 @@ def test_agents_status_endpoint():
     assert names[0] == "playbook"  # agent chef de file
     assert data["strategy"]["min_risk_reward"] == 2.0
     assert data["strategy"]["max_risk_reward"] == 3.0
-    # Objectif ≥ 200 pips : le stop vit donc sur la structure 4 h, le 15 min ne donne que le timing.
-    assert data["strategy"]["min_target_pips"] == 200.0
+    # Plancher d'objectif : 50 pips (décision du 28/07/2026, remplace les 200 pips). L'ATR
+    # journalier ne participe plus au calcul du profit.
+    assert data["strategy"]["min_target_pips"] == 50.0
     assert data["strategy"]["entry_timeframe"] == "15m"
     assert data["strategy"]["confirm_timeframe"] == "1h"
-    assert data["strategy"]["stop_timeframe"] == "4h"
-    # Sécurisation du profit à +2R, et pas d'ouverture marchés fermés.
+    # Le stop ne vit plus sur une unité de temps fixe : il est posé sur le niveau qui invalide le
+    # scénario. Ce qui est annoncé, c'est le verrou ADX et la règle d'entrée par confluence.
+    assert data["strategy"]["trend_timeframes"] == ["1d", "4h", "1h", "15m"]
+    assert data["strategy"]["trend_min_score"] == 0.10
+    # L'ADX ne fait plus partie de la stratégie : il ne doit plus apparaître comme un critère.
+    assert "trend_adx_min" not in data["strategy"]
+    assert data["strategy"]["entry_mode"] == "hybrid"
+    assert data["strategy"]["tp1_lock_fraction"] == 0.8
+    # Sécurisation du profit à +2R. Le desk trade désormais tous les marchés 24 h/24 : la fenêtre
+    # de session module la conviction, elle n'interdit plus l'ouverture.
     assert data["strategy"]["secure_at_r"] == 2.0
-    assert data["strategy"]["trade_only_when_open"] is True
+    assert data["strategy"]["trade_only_when_open"] is False
     # L'auto-entrée est annoncée, et elle est en compte démo — jamais en réel.
     assert data["strategy"]["auto_entry_mode"] == "paper"
     assert "training" in data
     assert data["strategy"]["entry_timeframe"] == "15m"
-    assert len(data["strategy"]["steps"]) == 5
+    # Trois étapes indépendantes (tendance, entrée, sortie) plus la règle de sécurisation.
+    assert len(data["strategy"]["steps"]) == 4

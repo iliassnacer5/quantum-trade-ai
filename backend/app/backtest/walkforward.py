@@ -32,21 +32,16 @@ def _cap_pf(pf: float) -> float:
 
 async def walk_forward(
     symbol: str, timeframe: str = "1h", folds: int = 4, initial_capital: float = 10_000.0,
-    strategy_id: str | None = None, exit_config: dict | None = None,
+    exit_config: dict | None = None,
     preloaded: tuple[list[Candle], bool] | None = None,
 ) -> dict:
     """Backteste `symbol` sur `folds` segments temporels successifs et juge la cohérence.
 
-    Si `strategy_id` est fourni, valide cette stratégie classique ; sinon le moteur multi-agents.
-    `preloaded=(candles, data_real)` : réutilise des bougies déjà chargées — indispensable pour le
-    sweep de la carte de l'edge (1 fetch par symbole×TF au lieu d'un par stratégie)."""
+    Le desk n'a qu'UNE stratégie — celle du playbook — et c'est elle qui est validée ici, via le
+    moteur multi-agents qu'elle pilote. `preloaded=(candles, data_real)` réutilise des bougies déjà
+    chargées, ce qui évite un rechargement par symbole × unité de temps.
+    """
     strategy = None
-    if strategy_id:
-        from app.strategies import get_strategy
-        s = get_strategy(strategy_id)
-        if s is None:
-            raise ValueError(f"stratégie inconnue : {strategy_id}")
-        strategy = s.fn
     if preloaded is not None:
         candles, data_real = preloaded
     else:
@@ -102,7 +97,7 @@ async def walk_forward(
             "beats_hold": report.alpha_pct > 0,
         })
 
-    return _summarize(symbol, timeframe, fold_results, data_real, strategy_id)
+    return _summarize(symbol, timeframe, fold_results, data_real)
 
 
 async def validate_expert_agent(market_type: str, symbols: list[str], timeframe: str = "1h", folds: int = 4) -> dict:
@@ -113,7 +108,7 @@ async def validate_expert_agent(market_type: str, symbols: list[str], timeframe:
     results = []
     for sym in symbols:
         try:
-            results.append(await walk_forward(sym, timeframe, folds=folds))  # sans strategy_id -> moteur agents
+            results.append(await walk_forward(sym, timeframe, folds=folds))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Validation expert %s échouée (%s)", sym, exc)
     n = len(results) or 1
@@ -128,7 +123,7 @@ async def validate_expert_agent(market_type: str, symbols: list[str], timeframe:
     }
 
 
-def _summarize(symbol: str, timeframe: str, folds: list[dict], data_real: bool, strategy_id: str | None = None) -> dict:
+def _summarize(symbol: str, timeframe: str, folds: list[dict], data_real: bool) -> dict:
     """Agrège les segments en un verdict honnête et prudent."""
     evaluated = [f for f in folds if f["trades"] > 0]
     n = len(evaluated)
@@ -159,7 +154,7 @@ def _summarize(symbol: str, timeframe: str, folds: list[dict], data_real: bool, 
         label = "🔴 Non prouvé — incohérent, pas d'edge démontré après frais"
 
     return {
-        "symbol": symbol, "timeframe": timeframe, "strategy_id": strategy_id,
+        "symbol": symbol, "timeframe": timeframe, "strategy_id": "playbook",
         "folds": folds, "folds_evaluated": n,
         "total_trades": total_trades,
         "profitable_folds": profitable,

@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
 from app.api import (
+    analysis,
     audit,
     auth,
     billing,
@@ -31,7 +32,6 @@ from app.api import (
     marketplace,
     i18n,
     branding,
-    strategies,
     wallet,
 )
 from app.core.config import enforce_prod_secrets, get_settings
@@ -115,6 +115,15 @@ async def lifespan(_app: FastAPI):
 
         snapshot_task = asyncio.create_task(snapshot_loop())
 
+    # Scanner complémentaire (bas de la page « Trades du jour ») : précalculé pour les 6 unités de
+    # temps. Sans cette boucle, la première visite de CHAQUE unité de temps lançait jusqu'à
+    # 32 backtests complets dans la requête HTTP.
+    daily_picks_task = None
+    if get_settings().daily_picks_precompute_enabled:
+        from app.services.scheduler import daily_picks_loop
+
+        daily_picks_task = asyncio.create_task(daily_picks_loop())
+
     # Auto-entrée : ouvre en COMPTE DÉMO dès qu'un setup armé voit son déclencheur 15 min se former.
     auto_entry_task = None
     if get_settings().playbook_auto_entry_enabled:
@@ -131,12 +140,24 @@ async def lifespan(_app: FastAPI):
         training_service.load_from_store(get_store())   # réutilise l'entraînement de la veille
         training_task = asyncio.create_task(training_loop())
 
-    # Backtest hebdomadaire de la stratégie sur toutes les paires du desk (classement des paires).
+    # Analyse quotidienne des marchés (forex + or), HORS stratégie : l'avis du modèle, rattrapé au
+    # démarrage s'il manque celui du jour.
+    opinion_task = None
+    if get_settings().market_opinion_enabled:
+        from app.services.scheduler import market_opinion_loop
+
+        opinion_task = asyncio.create_task(market_opinion_loop())
+
+    # Backtest hebdomadaire de la stratégie sur toutes les paires du desk (classement des paires),
+    # plus la passe LONGUE (5 ans, échelle swing) rejouée seule en milieu de semaine.
     backtest_task = None
+    deep_backtest_task = None
     if get_settings().playbook_backtest_enabled:
-        from app.services.scheduler import backtest_loop
+        from app.services.scheduler import backtest_loop, deep_backtest_loop
 
         backtest_task = asyncio.create_task(backtest_loop())
+        if get_settings().playbook_backtest_deep_enabled:
+            deep_backtest_task = asyncio.create_task(deep_backtest_loop())
 
     logging.getLogger(__name__).info(
         "Démarrage OK (in_memory=%s, redis=%s, digest=%s)",
@@ -159,12 +180,18 @@ async def lifespan(_app: FastAPI):
         edge_task.cancel()
     if snapshot_task:
         snapshot_task.cancel()
+    if daily_picks_task:
+        daily_picks_task.cancel()
     if auto_entry_task:
         auto_entry_task.cancel()
     if training_task:
         training_task.cancel()
+    if opinion_task:
+        opinion_task.cancel()
     if backtest_task:
         backtest_task.cancel()
+    if deep_backtest_task:
+        deep_backtest_task.cancel()
     if get_settings().live_ingestion_enabled:
         from app.realtime import market_stream
 
@@ -202,7 +229,7 @@ app.include_router(billing.router)
 app.include_router(audit.router)
 app.include_router(ws.router)
 app.include_router(backtest.router)
-app.include_router(strategies.router)
+app.include_router(analysis.router)
 app.include_router(wallet.router)
 app.include_router(agents.router)
 app.include_router(plan.router)

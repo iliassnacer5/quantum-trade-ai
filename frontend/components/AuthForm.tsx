@@ -1,9 +1,27 @@
 'use client';
 
-import { useRouter } from 'next/navigation';
-import { useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { Suspense, useState } from 'react';
 import { api, setToken } from '@/lib/api';
 import { Button } from '@/components/ui';
+
+/**
+ * Isolé dans son propre composant + Suspense : `useSearchParams` fait basculer en rendu
+ * client tout composant qui l'appelle, ce qui casserait le prérendu statique de `/register`
+ * si l'appel vivait directement dans `AuthForm` (partagé par les deux pages).
+ */
+function ExpiredNotice() {
+  const searchParams = useSearchParams();
+  // Redirigé ici parce que le jeton a expiré (session de 60 min) pendant qu'une page se
+  // rafraîchissait toute seule : sans ce message, l'écran de connexion semble sorti de nulle part.
+  if (searchParams.get('expired') !== '1') return null;
+  return (
+    <p className="rounded-lg border border-warn/30 bg-warn-soft/20 px-3 py-2 text-sm text-white/85">
+      Session expirée (elle dure 60 minutes) — reconnecte-toi pour retrouver ton poste, tes trades
+      ne sont pas perdus.
+    </p>
+  );
+}
 
 export function AuthForm({ mode }: { mode: 'login' | 'register' }) {
   const router = useRouter();
@@ -61,6 +79,11 @@ export function AuthForm({ mode }: { mode: 'login' | 'register' }) {
           className="w-full rounded-lg border border-border bg-background/60 px-3 py-2.5 text-sm outline-none transition focus:border-accent"
         />
       </div>
+      {!isRegister && !error && (
+        <Suspense fallback={null}>
+          <ExpiredNotice />
+        </Suspense>
+      )}
       {error && <p className="rounded-lg border border-sell/30 bg-sell/10 px-3 py-2 text-sm text-sell">{error}</p>}
       <Button type="submit" size="lg" loading={loading} className="w-full">
         {isRegister ? 'Créer mon compte' : 'Se connecter'}

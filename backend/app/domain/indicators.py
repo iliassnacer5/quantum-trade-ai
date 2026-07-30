@@ -183,6 +183,17 @@ def stochastic(candles: list[Candle], period: int = 14, smooth: int = 3) -> tupl
 
 def adx(candles: list[Candle], period: int = 14) -> float | None:
     """Average Directional Index — force de la tendance (0-100). >25 = tendance, <20 = range."""
+    res = adx_di(candles, period)
+    return res[0] if res else None
+
+
+def adx_di(candles: list[Candle], period: int = 14) -> tuple[float, float, float] | None:
+    """ADX **et** les deux directionnels : ``(adx, +DI, -DI)``.
+
+    L'ADX seul dit qu'il y a une tendance, pas dans quel SENS. Les directionnels tranchent :
+    +DI > -DI signale une pression acheteuse dominante. La détection de tendance en a besoin pour
+    vérifier que la force mesurée pousse bien dans le sens du biais, et pas contre lui.
+    """
     if len(candles) < 2 * period:
         return None
     trs: list[float] = []
@@ -210,16 +221,19 @@ def adx(candles: list[Candle], period: int = 14) -> float | None:
     pdm_s = _wilder(plus_dm)
     mdm_s = _wilder(minus_dm)
     dxs: list[float] = []
+    last_pdi = last_mdi = 0.0
     for atr_v, pdm_v, mdm_v in zip(atr_s, pdm_s, mdm_s):
         if atr_v == 0:
             continue
         pdi = 100 * pdm_v / atr_v
         mdi = 100 * mdm_v / atr_v
+        last_pdi, last_mdi = pdi, mdi
         denom = pdi + mdi
         dxs.append(100 * abs(pdi - mdi) / denom if denom else 0.0)
-    if len(dxs) < period:
-        return sum(dxs) / len(dxs) if dxs else None
-    return sum(dxs[-period:]) / period
+    if not dxs:
+        return None
+    value = sum(dxs) / len(dxs) if len(dxs) < period else sum(dxs[-period:]) / period
+    return value, last_pdi, last_mdi
 
 
 def support_resistance(candles: list[Candle], lookback: int = 50) -> tuple[float, float]:
@@ -268,6 +282,106 @@ def fibonacci_levels(candles: list[Candle], lookback: int = 100) -> dict | None:
             "levels": {k: round(v, 6) for k, v in levels.items()}}
 
 
+def fibonacci_extension(candles: list[Candle], lookback: int = 100) -> dict | None:
+    """Extensions de Fibonacci (127,2 % et 161,8 %) — des OBJECTIFS, pas des retracements.
+
+    Là où `fibonacci_levels` mesure la profondeur d'une correction (où le prix pourrait repartir),
+    l'extension projette le mouvement AU-DELÀ de l'extrême du swing : c'est là que le marché a
+    l'habitude d'aller chercher ses prises de bénéfices quand la tendance reprend.
+
+    Même swing de référence que `fibonacci_levels`, pour que retracement et objectif racontent la
+    même histoire. Retourne ``{"swing", "high", "low", "levels": {"1.272", "1.618"}}``.
+    """
+    base = fibonacci_levels(candles, lookback)
+    if not base:
+        return None
+    hi, lo = base["high"], base["low"]
+    span = hi - lo
+    if base["swing"] == "haussier":
+        levels = {"1.272": hi + 0.272 * span, "1.618": hi + 0.618 * span}
+    else:
+        levels = {"1.272": lo - 0.272 * span, "1.618": lo - 0.618 * span}
+    return {"swing": base["swing"], "high": hi, "low": lo,
+            "levels": {k: round(v, 6) for k, v in levels.items()}}
+
+
+def supertrend(candles: list[Candle], period: int = 10, multiplier: float = 3.0) -> dict | None:
+    """SuperTrend — un suiveur de tendance qui ne change d'avis que lorsque le prix le franchit.
+
+    Deux bandes sont posées à `multiplier` × ATR de part et d'autre du prix médian. Elles sont
+    VERROUILLÉES : tant que la tendance dure, la bande ne peut que se resserrer vers le prix, jamais
+    s'en éloigner. C'est ce verrou qui évite les allers-retours d'un simple canal ATR — la bascule
+    ne se produit qu'à une vraie cassure.
+
+    Retourne ``{"direction": +1|-1, "level", "flipped_ago", "series"}`` où `flipped_ago` est le
+    nombre de bougies depuis la dernière bascule (0 = elle vient de se produire, donc fragile).
+    ``None`` si l'historique ne suffit pas — jamais de direction inventée.
+    """
+    if len(candles) < period + 1:
+        return None
+    atrs = _atr_series(candles, period)
+    if not atrs:
+        return None
+    directions: list[int] = []
+    final_upper = final_lower = 0.0
+    direction = 1
+    level = candles[0].close
+    for i in range(period, len(candles)):
+        c = candles[i]
+        atr_v = atrs[i]
+        if atr_v is None:
+            continue
+        mid = (c.high + c.low) / 2
+        basic_upper = mid + multiplier * atr_v
+        basic_lower = mid - multiplier * atr_v
+        prev_close = candles[i - 1].close
+        # Verrou des bandes : elles ne s'écartent du prix que si la précédente a été franchie.
+        final_upper = (basic_upper if not directions or basic_upper < final_upper
+                       or prev_close > final_upper else final_upper)
+        final_lower = (basic_lower if not directions or basic_lower > final_lower
+                       or prev_close < final_lower else final_lower)
+        if not directions:
+            direction = 1 if c.close >= final_upper else -1
+        elif direction > 0 and c.close < final_lower:
+            direction = -1
+        elif direction < 0 and c.close > final_upper:
+            direction = 1
+        level = final_lower if direction > 0 else final_upper
+        directions.append(direction)
+    if not directions:
+        return None
+    flipped_ago = 0
+    for d in reversed(directions[:-1]):
+        if d != directions[-1]:
+            break
+        flipped_ago += 1
+    return {"direction": directions[-1], "level": round(level, 8),
+            "flipped_ago": flipped_ago, "series": directions}
+
+
+def _atr_series(candles: list[Candle], period: int = 14) -> list[float | None]:
+    """ATR de Wilder sous forme de SÉRIE, alignée sur `candles` (None avant amorçage).
+
+    `atr()` ne rend que la dernière valeur ; le SuperTrend, lui, doit rejouer toute l'histoire.
+    """
+    if len(candles) < period + 1:
+        return []
+    out: list[float | None] = [None] * len(candles)
+    trs = []
+    for i in range(1, len(candles)):
+        trs.append(max(
+            candles[i].high - candles[i].low,
+            abs(candles[i].high - candles[i - 1].close),
+            abs(candles[i].low - candles[i - 1].close),
+        ))
+    running = sum(trs[:period]) / period
+    out[period] = running
+    for i in range(period, len(trs)):
+        running = (running * (period - 1) + trs[i]) / period
+        out[i + 1] = running
+    return out
+
+
 def obv(candles: list[Candle]) -> list[float]:
     """On-Balance Volume (OBV)."""
     if not candles:
@@ -305,16 +419,27 @@ def rolling_vwap(candles: list[Candle], period: int = 20) -> list[float | None]:
 
     Le VWAP « ancré » classique (cf. `vwap`) donne un niveau ; la stratégie demande la *tendance*
     VWAP, donc il faut la série.
+
+    Calculé en SOMME GLISSANTE (une seule passe) et non en re-sommant la fenêtre à chaque bougie.
+    L'ancienne version était quadratique : profilée le 30/07/2026 sur un backtest de 500 bougies,
+    elle représentait à elle seule 1,4 s de processeur, 237 000 appels à `sum()` et 1,9 million
+    d'évaluations de générateur — pour un résultat identique. Cet indicateur est sur le chemin de
+    `ta.analyze`, donc de TOUTE analyse (scanner, sélection du jour, backtests, playbook) : le gain
+    profite à toutes les pages, pas seulement à celle qui a révélé le problème.
     """
     out: list[float | None] = []
-    for i in range(len(candles)):
-        window = candles[max(0, i - period + 1) : i + 1]
-        cum_vol = sum(c.volume for c in window)
-        if cum_vol <= 0:
-            out.append(None)
-            continue
-        cum_pv = sum(((c.high + c.low + c.close) / 3) * c.volume for c in window)
-        out.append(cum_pv / cum_vol)
+    cum_pv = cum_vol = 0.0
+    for i, c in enumerate(candles):
+        cum_pv += ((c.high + c.low + c.close) / 3) * c.volume
+        cum_vol += c.volume
+        # Sortie de fenêtre : on retire la bougie qui vient de quitter les `period` dernières.
+        if i >= period:
+            old = candles[i - period]
+            cum_pv -= ((old.high + old.low + old.close) / 3) * old.volume
+            cum_vol -= old.volume
+        # `cum_vol` peut devenir infinitésimal (et non exactement 0) par accumulation d'erreurs de
+        # virgule flottante sur des volumes nuls : on teste donc un seuil, pas l'égalité stricte.
+        out.append(cum_pv / cum_vol if cum_vol > 1e-12 else None)
     return out
 
 

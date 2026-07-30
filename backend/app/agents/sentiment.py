@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.agents.base import AgentOutput
+from app.agents.base import AgentOutput, apply_playbook
 
 _BULLISH = {
     "surge", "rally", "soar", "gain", "bullish", "beat", "record", "upgrade",
@@ -36,7 +36,8 @@ def _lexicon_score(headline: str) -> float:
     return (pos - neg) / (pos + neg)
 
 
-async def run(news: list[NewsItem], fear_greed: int | None = None) -> AgentOutput:
+async def run(news: list[NewsItem], fear_greed: int | None = None,
+              context: dict | None = None) -> AgentOutput:
     name = "sentiment"
     if not news and fear_greed is None:
         return AgentOutput(name, 0.0, 0.1, "Pas de news disponibles.")
@@ -106,12 +107,20 @@ async def run(news: list[NewsItem], fear_greed: int | None = None) -> AgentOutpu
         parts.append(f"{src} {fear_greed}/100 ({fg_label})")
     if not parts:
         parts.append("aucune source de sentiment")
-    rationale = "Analyse de sentiment : " + " ; ".join(parts) + "."
+
+    # Cadre de la stratégie. Atténuation DOUCE : le sentiment ne lit pas le graphique, il lit ce que
+    # le marché raconte. Quand il contredit la tendance, ce n'est pas une erreur de lecture mais une
+    # information — souvent la première alerte d'un retournement. L'écraser comme un agent technique
+    # reviendrait à supprimer le seul contre-pouvoir du système.
+    metrics: dict = {"news_count": len(news), "fear_greed": fear_greed}
+    notes: list[str] = []
+    score, confidence = apply_playbook(score, confidence, notes, metrics, context, soften=0.7)
+    rationale = "Analyse de sentiment : " + " ; ".join(parts + notes) + "."
 
     return AgentOutput(
         name=name,
         score=round(score, 3),
         confidence=round(confidence, 3),
         rationale=rationale,
-        details={"news_count": len(news), "fear_greed": fear_greed},
+        details=metrics,
     )

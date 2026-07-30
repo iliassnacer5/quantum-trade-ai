@@ -491,6 +491,46 @@ class SqlRecordRepository:
             rows = s.scalars(stmt.order_by(RecordRow.created_at.desc())).all()
             return [self._to_dict(r) for r in rows]
 
+    def list_where_field_not_in(
+        self, kind: str, field: str, excluded: set[str], tenant_id: str | None = None,
+    ) -> list[dict]:
+        """Enregistrements dont `field` n'est PAS dans `excluded`, filtrés CÔTÉ BASE.
+
+        Motif (mesuré le 30/07/2026) : `positions_loop` enchaîne quatre passages par minute et
+        chacun appelait `list(ORDER)` sans filtre — donc chargeait puis désérialisait en JSON,
+        en Python, TOUT l'historique d'ordres de TOUS les comptes pour n'en garder que les quelques
+        positions encore ouvertes. Le coût croissait avec le nombre total de trades jamais passés,
+        pas avec le nombre de positions actives : un ralentissement qui s'aggrave avec le temps.
+
+        Le payload est un document JSON (colonne texte), donc le filtre s'exprime en SQL sur ce
+        texte. On ne se contente PAS du filtre SQL : il sert à réduire le volume transféré, et le
+        résultat est revérifié en Python (`_to_dict`) qui reste l'autorité sur le contenu. Un filtre
+        textuel peut être trop LARGE (un `LIKE` peut matcher la même chaîne ailleurs dans le
+        document) — jamais trop étroit, ce qui serait le seul cas dangereux ici.
+        """
+        from sqlalchemy import not_, or_
+
+        from app.models.db import RecordRow
+
+        with self._sm() as s:
+            stmt = select(RecordRow).where(RecordRow.kind == kind)
+            if tenant_id is not None:
+                stmt = stmt.where(RecordRow.tenant_id == tenant_id)
+            if excluded:
+                # Un enregistrement est écarté si son payload contient `"field": "valeur"` pour
+                # l'une des valeurs exclues. Les deux orthographes JSON (avec et sans espace après
+                # le deux-points) sont couvertes : le sérialiseur peut changer, la requête ne doit
+                # pas se mettre à mentir pour autant.
+                patterns = [
+                    f'%"{field}":{sep}"{value}"%'
+                    for value in sorted(excluded)
+                    for sep in ("", " ")
+                ]
+                stmt = stmt.where(not_(or_(*(RecordRow.payload.like(p) for p in patterns))))
+            rows = s.scalars(stmt.order_by(RecordRow.created_at.desc())).all()
+            # Revérification en Python : c'est elle qui fait foi, le SQL n'a fait que dégrossir.
+            return [d for r in rows if (d := self._to_dict(r)).get(field) not in excluded]
+
     def delete(self, kind: str, record_id: str) -> bool:
         from app.models.db import RecordRow
 

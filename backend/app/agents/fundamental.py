@@ -6,7 +6,7 @@ Score déterministe à partir de ratios financiers (PER, croissance, dette, marg
 
 from __future__ import annotations
 
-from app.agents.base import AgentOutput
+from app.agents.base import AgentOutput, apply_playbook
 
 
 def score_ratios(ratios: dict) -> tuple[float, list[str]]:
@@ -42,7 +42,8 @@ def score_ratios(ratios: dict) -> tuple[float, list[str]]:
     return score, notes
 
 
-async def run(symbol: str, ratios: dict | None = None) -> AgentOutput:
+async def run(symbol: str, ratios: dict | None = None,
+              context: dict | None = None) -> AgentOutput:
     name = "fundamental"
     base = symbol.split("/")[0]
     is_crypto = "/" in symbol and symbol.split("/")[1] in {"USDT", "USD", "USDC", "BTC", "ETH"}
@@ -54,10 +55,15 @@ async def run(symbol: str, ratios: dict | None = None) -> AgentOutput:
         )
     score, notes = score_ratios(ratios)
     confidence = min(1.0, 0.4 + 0.1 * len(notes))
+    # Cadre de la stratégie, atténuation douce : la valorisation d'une entreprise et la tendance
+    # d'un graphique ne se contredisent pas vraiment — elles répondent à des horizons différents.
+    metrics: dict = {"ratios": ratios}
+    pb_notes: list[str] = []
+    score, confidence = apply_playbook(score, confidence, pb_notes, metrics, context, soften=0.7)
     return AgentOutput(
         name=name,
         score=round(score, 3),
         confidence=round(confidence, 3),
-        rationale=f"Analyse fondamentale {base} : " + " ; ".join(notes) + ".",
-        details={"ratios": ratios},
+        rationale=f"Analyse fondamentale {base} : " + " ; ".join(notes + pb_notes) + ".",
+        details=metrics,
     )

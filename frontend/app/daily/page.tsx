@@ -120,7 +120,7 @@ export default function DailyPage() {
                     </div>
                     <div className="mt-2 grid grid-cols-2 gap-1 text-xs text-muted">
                       <span>Prix : <span className="text-white">{p.price}</span></span>
-                      <span>ADX : <span className="text-white">{p.adx}</span></span>
+                      <span>Tendance : <span className="text-white">{p.trend_score != null ? `${p.trend_score}/100` : '—'}</span></span>
                       {p.backtest ? (
                         <>
                           <span>Réussite : <span className="text-buy">{p.backtest.win_rate}%</span></span>

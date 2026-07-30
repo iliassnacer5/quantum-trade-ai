@@ -1,25 +1,31 @@
 """AUTO-ENTRÉE — le robot prend le trade tout seul, en COMPTE DÉMO, sans aucun clic.
 
-Principe : un setup « 🟡 ARMÉ » a déjà validé les étapes 1 à 3 de la stratégie (tendance de fond
-mensuelle + journalière, niveaux majeurs, confirmation journalière, confirmation 4 h). Il ne lui
-manque que le déclencheur 15 min — et ce déclencheur peut apparaître à n'importe quelle bougie.
-Attendre qu'un humain rafraîchisse une page et clique, c'est rater l'entrée.
+Principe : un setup « 🟡 ARMÉ » a déjà validé le contexte de la stratégie (tendance validée par le
+4 h et le 1 h, niveaux majeurs identifiés). Il ne lui manque que le déclencheur 15 min — et ce
+déclencheur peut apparaître à n'importe quelle bougie. Attendre qu'un humain rafraîchisse une page
+et clique, c'est rater l'entrée.
 
 Cette veille tourne donc en continu (`playbook_auto_entry_interval`, 60 s par défaut) :
 
 1. elle reprend les setups ARMÉS et PRÊTS du dernier instantané ;
 2. elle **recalcule la stratégie** pour chacun (jamais sur des niveaux affichés, toujours sur les
    données du moment) ;
-3. dès qu'un déclencheur 15 min est actif, elle ouvre la position en compte DÉMO avec son stop
-   15 min et son objectif borné 1 h, dimensionnée au profil de risque de l'utilisateur ;
+3. dès qu'un déclencheur 15 min est actif, elle ouvre la position en compte DÉMO avec le stop et
+   l'objectif calculés par la stratégie, dimensionnée au profil de risque de l'utilisateur ;
 4. elle notifie (temps réel + push) et journalise l'ouverture.
 
 GARDE-FOUS — l'auto-entrée ne touche QUE du papier :
 - seules les connexions en mode ``paper`` sont utilisées ; une connexion ``live`` est ignorée, quel
   que soit son statut KYC. Aucun argent réel ne peut être engagé par cette boucle ;
 - les protections de portefeuille s'appliquent (nombre de positions max, plafond de risque total) ;
-- un même symbole/sens déjà ouvert n'est jamais doublé ;
+- un même symbole/sens déjà ouvert n'est jamais doublé, et un symbole/sens ouvert dans les
+  `playbook_auto_entry_cooldown_min` dernières minutes non plus — un déclencheur qui reste actif
+  plusieurs passages ne doit pas empiler quatre fois le même pari ;
 - rien ne part sur données synthétiques (le playbook refuse déjà d'affirmer un trade dans ce cas).
+
+**Aucun refus n'est silencieux.** Chaque passage rend `skipped` avec le motif de chaque setup
+écarté, et `note` les reprend : « le trade était dans les trades du jour mais rien ne s'est passé »
+doit toujours avoir une réponse lisible. `reset()` remet la veille à zéro (cf. plus bas).
 """
 
 from __future__ import annotations
@@ -34,6 +40,9 @@ from app.services import execution_service, playbook_service
 logger = logging.getLogger(__name__)
 
 EVENTS = "auto_entry_event"
+# Dernier passage de veille (tous tenants) : ce qui a été refusé et pourquoi. Un seul enregistrement
+# ("latest"), écrasé à chaque passage — ce n'est pas un historique, juste l'état du moment.
+LAST_RUN = "auto_entry_last_run"
 
 
 def enabled() -> bool:
@@ -120,10 +129,14 @@ async def run_auto_entry(store, *, candidates: list[dict] | None = None) -> dict
                      "formé sur ce passage"),
         }
 
-    # GATING PAR VERDICT (plan, tâche 2.2) : l'auto-entrée ne trade QUE les paires notées 🟢 par
-    # le backtest hebdomadaire (espérance ≥ +0,4 R, n ≥ 20, deux passages consécutifs), et jamais
-    # sur un déclencheur désactivé par la matrice paire × déclencheur. Les 🟡 restent analysées et
-    # affichées, les 🔴 sont exclues. Chaque refus est journalisé (« trades évités »).
+    # GATING PAR VERDICT (plan, tâche 2.2) : quand `playbook_pair_gating` est actif, l'auto-entrée
+    # ne trade QUE les paires notées 🟢 par le backtest hebdomadaire.
+    #
+    # Il est DÉSACTIVÉ par défaut depuis le 28/07/2026, et c'est ce gate qui expliquait « le trade
+    # est dans les trades du jour mais il n'a pas été lancé automatiquement » : un setup prêt était
+    # écarté en silence parce que sa paire attendait encore deux backtests hebdomadaires
+    # consécutifs au-dessus du seuil. Le verdict reste calculé, affiché, et module la TAILLE de
+    # position — il ne décide plus s'il y a trade.
     from app.services import verdict_service
 
     ready, gate_refused = verdict_service.filter_auto_ready(store, ready)
@@ -137,11 +150,13 @@ async def run_auto_entry(store, *, candidates: list[dict] | None = None) -> dict
             ),
         }
 
+    cooldown = get_settings().playbook_auto_entry_cooldown_min
     opened_all: list[dict] = []
+    skipped_all: list[dict] = []
     for tenant_id in _paper_tenants(store):
         try:
             report = await execution_service.execute_playbook_trades(
-                store, tenant_id, count=len(ready), picks=ready,
+                store, tenant_id, count=len(ready), picks=ready, cooldown_min=cooldown,
             )
         except Exception as exc:  # noqa: BLE001 — un tenant en échec n'arrête pas les autres
             logger.warning("Auto-entrée : tenant %s échoué (%s)", tenant_id, exc)
@@ -150,28 +165,59 @@ async def run_auto_entry(store, *, candidates: list[dict] | None = None) -> dict
             order["tenant_id"] = tenant_id
             opened_all.append(order)
             await _announce(store, tenant_id, order)
+        # Les refus d'exécution (anti-doublon, corrélation, garde-fous de portefeuille) étaient
+        # perdus ici : le rapport disait « aucune ouverture » sans jamais dire POURQUOI, ce qui est
+        # précisément la question posée quand un trade attendu n'est pas parti.
+        for skip in report.get("skipped") or []:
+            skipped_all.append({**skip, "tenant_id": tenant_id})
 
-    if opened_all:
-        logger.info(
-            "Auto-entrée : %d position(s) ouverte(s) automatiquement en démo (%s)",
-            len(opened_all), ", ".join(sorted({o["symbol"] for o in opened_all})),
-        )
-    return {
+    note = (
+        f"{len(opened_all)} position(s) ouverte(s) automatiquement en démo sur "
+        f"{len(ready)} déclencheur(s) 15 min formé(s)."
+        if opened_all else
+        f"{len(ready)} déclencheur(s) formé(s) mais aucune ouverture — "
+        + (" ; ".join(dict.fromkeys(sk["reason"] for sk in skipped_all))
+           if skipped_all else "aucun tenant éligible à l'auto-entrée")
+    )
+    # Journalisé dans TOUS les cas, pas seulement quand quelque chose s'ouvre : un passage qui ne
+    # trouve rien à ouvrir laissait auparavant AUCUNE trace, ce qui rendait « pourquoi rien ne
+    # s'est ouvert » impossible à répondre après coup.
+    logger.info("Auto-entrée : %s", note)
+    result = {
         "enabled": True,
         "checked": len(pool),
         "triggered": [p["symbol"] for p in ready],
         "opened": opened_all,
+        "skipped": skipped_all,
         "armed": len(still_armed),
         "gate_refused": gate_refused,
+        "cooldown_min": cooldown,
         "at": datetime.now(UTC).isoformat(),
-        "note": (
-            f"{len(opened_all)} position(s) ouverte(s) automatiquement en démo sur "
-            f"{len(ready)} déclencheur(s) 15 min formé(s)."
-            if opened_all else
-            f"{len(ready)} déclencheur(s) formé(s) mais aucune ouverture (position déjà en cours "
-            "ou garde-fou de portefeuille)."
-        ),
+        "note": note,
     }
+    # Persisté pour que la page « Trades du jour » puisse expliquer, PAR UTILISATEUR, pourquoi un
+    # setup marqué « exécutable » à l'écran ne s'est pas ouvert (garde-fou de portefeuille, de
+    # corrélation, anti-doublon…) — sans ça, le refus reste invisible jusqu'à ce qu'on aille
+    # chercher dans les logs serveur.
+    try:
+        store.records.put(LAST_RUN, "latest", result)
+    except Exception as exc:  # noqa: BLE001 — la persistance ne doit jamais casser la veille
+        logger.warning("Auto-entrée : dernier passage non persisté (%s)", exc)
+    return result
+
+
+def blocked_for(store, tenant_id: str) -> list[dict]:  # noqa: ANN001
+    """Setups REFUSÉS pour CE tenant au dernier passage de veille (motif inclus).
+
+    C'est la réponse à « ce trade était marqué exécutable, pourquoi il ne s'est pas ouvert ? » —
+    sans ça, un garde-fou de portefeuille ou de corrélation qui refuse un trade reste invisible.
+    """
+    last = store.records.get(LAST_RUN, "latest") or {}
+    return [
+        {"symbol": sk.get("symbol"), "reason": sk.get("reason")}
+        for sk in (last.get("skipped") or [])
+        if sk.get("tenant_id") == tenant_id
+    ]
 
 
 async def _announce(store, tenant_id: str, order: dict) -> None:  # noqa: ANN001
@@ -212,3 +258,57 @@ async def _announce(store, tenant_id: str, order: dict) -> None:  # noqa: ANN001
 def recent_events(store, tenant_id: str, limit: int = 20) -> list[dict]:  # noqa: ANN001
     """Historique des entrées automatiques (ce que le robot a fait pendant ton absence)."""
     return store.records.list(EVENTS, tenant_id)[:limit]
+
+
+def reset(store, tenant_id: str, *, close_positions: bool = True) -> dict:  # noqa: ANN001
+    """REMET L'AUTO-ENTRÉE À ZÉRO pour ce tenant : positions démo en cours + historique des entrées.
+
+    Ce que ça fait, exactement — et rien de plus :
+
+    1. les positions PAPIER encore ouvertes sont marquées ``reset`` (issue neutre, P&L à zéro) et
+       exclues des statistiques : elles n'ont pas été jouées jusqu'au bout, les compter en gagnantes
+       ou en perdantes fabriquerait un résultat que le marché n'a pas donné ;
+    2. les traces d'entrée automatique (`auto_entry_event`) sont effacées, ce qui remet aussi le
+       délai anti-doublon à zéro : le prochain déclencheur repart immédiatement ;
+    3. l'instantané des setups armés est vidé, pour que le passage suivant reparte d'un calcul frais.
+
+    Aucune position RÉELLE n'est touchée : la boucle d'auto-entrée ne connaît que le papier, et ce
+    reset ne regarde que les ordres en mode ``paper``. Les ordres déjà clôturés sont conservés —
+    effacer un historique de résultats serait la seule façon sûre de ne plus rien pouvoir mesurer.
+    """
+    from app.services import execution_service, live_snapshot
+
+    closed: list[dict] = []
+    if close_positions:
+        for order in store.records.list(execution_service.ORDER, tenant_id):
+            if order.get("mode") != "paper" or order.get("outcome") in execution_service.FINAL_OUTCOMES:
+                continue
+            store.records.put(
+                execution_service.ORDER, order["id"],
+                {**order, "outcome": "reset", "pnl": 0.0, "realized_pnl": 0.0, "r_multiple": 0.0,
+                 "closed_at": datetime.now(UTC).isoformat(),
+                 "close_reason": "remise à zéro de l'auto-entrée (position non jouée jusqu'au bout)"},
+                tenant_id=tenant_id,
+            )
+            closed.append({"order_id": order["id"], "symbol": order.get("symbol"),
+                           "side": order.get("side")})
+
+    cleared = 0
+    for event in store.records.list(EVENTS, tenant_id):
+        if store.records.delete(EVENTS, event["id"]):
+            cleared += 1
+
+    live_snapshot.reset()
+    logger.info("Auto-entrée remise à zéro (%s) : %d position(s) neutralisée(s), %d trace(s) effacée(s)",
+                tenant_id, len(closed), cleared)
+    return {
+        "closed": closed,
+        "events_cleared": cleared,
+        "note": (
+            f"{len(closed)} position(s) démo neutralisée(s) (issue « reset », P&L à zéro, hors "
+            f"statistiques) et {cleared} trace(s) d'entrée automatique effacée(s). Le délai "
+            "anti-doublon repart de zéro : le prochain déclencheur 15 min sera pris immédiatement. "
+            "Aucune position réelle n'a été touchée, et l'historique des trades déjà clôturés est "
+            "conservé."
+        ),
+    }

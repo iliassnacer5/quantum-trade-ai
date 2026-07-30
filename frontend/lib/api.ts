@@ -32,13 +32,27 @@ export type SignalsTrackRecord = {
   avoided: { blocked: number; would_have_lost: number; would_have_won: number; undecided: number };
 };
 
+/** Métriques de LA STRATÉGIE sur un symbole (backtest), à ne pas confondre avec le walk-forward :
+ *  celui-ci répond « bat-on le buy & hold ? », celles-ci « que gagne la méthode par trade ? ». */
+export type PlaybookSymbolStats = {
+  trades: number; win_rate: number; expectancy_r: number; profit_factor: number | null;
+  max_drawdown_r: number; trades_per_day?: number | null; days_between_trades?: number | null;
+  r_per_month?: number | null; rank?: number | null; verdict?: string;
+};
 export type EdgeRow = {
   strategy: string; strategy_name: string; symbol: string; market: string; timeframe: string;
   alpha: number; pf: number; win: number; trades: number; verdict?: string;
   data_real: boolean; status: 'green' | 'yellow' | 'red'; green_streak?: number;
+  playbook?: PlaybookSymbolStats | null;
 };
 export type EdgeMap = {
   generated_at?: string; rows: EdgeRow[]; greens: number; yellows: number; reds: number; note: string;
+  strategy?: string; symbols?: number; timeframes?: string[];
+  playbook_summary?: {
+    measured: boolean; note: string;
+    symbols?: number; trades?: number; expectancy_r?: number;
+    trades_per_day?: number; trades_per_week?: number;
+  };
 };
 
 /** Verdict 🟢/🟡/🔴 d'une paire, issu du backtest hebdomadaire de la stratégie du desk. */
@@ -188,6 +202,15 @@ export type JournalEntry = {
   pnl?: number | null;
   agent_scores?: Record<string, number>;
   created_at?: string | null;
+  /** 'playbook' = position démo (auto-entrée, « Ouvrir en démo »...) ; absent = signal classique
+   *  (bouton « Générer un signal »). Un trade playbook se gère depuis la page Paper Trading — ce
+   *  n'est pas une entrée de journal « pure », donc ni close ni explain n'y sont proposés ici. */
+  source?: 'playbook' | 'signal';
+  /** Pips réalisés (entrée -> sortie), signés dans le sens du trade. Renseigné pour un trade
+   *  playbook clôturé ; absent pour un signal classique, qui n'a pas de prix de sortie. */
+  pips?: number | null;
+  pips_label?: string;
+  closed_at?: string | null;
 };
 
 export type JournalInsights = {
@@ -203,6 +226,9 @@ export type JournalInsights = {
   weight_multipliers: Record<string, number>;
   reliability?: { agent: string; samples: number; hit_rate: number; multiplier: number; low_sample?: boolean }[];
   trades_learned?: number;
+  /** 'signals' = mesuré sur le flux « Générer un signal » ; 'training' = repli sur le walk-forward
+   *  nocturne de la stratégie quand ce flux est vide mais que des trades playbook existent. */
+  reliability_source?: 'signals' | 'training';
 };
 
 export type TeamMember = { id: string; email: string; full_name?: string | null; role: string; onboarded: boolean };
@@ -237,30 +263,6 @@ export type TrackRecord = {
   disclaimer: string;
 };
 
-export type StrategyInfo = { id: string; name: string; category: string; description: string; markets?: string[] };
-export type StrategyBacktest = {
-  strategy: string; symbol: string; timeframe: string;
-  metrics: { trades: number; win_rate: number; profit_factor: number; total_pnl_pct: number; max_drawdown_pct: number; sharpe: number; expectancy: number };
-  benchmark_pnl_pct?: number; alpha_pct?: number; cost_pct_per_side?: number;
-  equity_curve: { t: string; equity: number }[];
-};
-export type StrategyComparison = {
-  symbol: string; timeframe: string;
-  ranking: { id: string; name: string; category: string; trades: number; win_rate: number; profit_factor: number; pnl_pct: number; alpha_pct: number; max_drawdown_pct: number; sharpe: number }[];
-  best: StrategyComparison['ranking'][number] | null;
-  recommended: StrategyComparison['ranking'][number] | null;
-  note: string;
-};
-export type MultiValidation = {
-  strategy: string; timeframe: string; symbols: number; robust: number; fragile: number;
-  beats_hold: number; verdict: string; results: WalkForward[];
-};
-export type StrategySignal = {
-  strategy: string; name?: string; symbol: string; timeframe?: string; direction: 'BUY' | 'SELL' | 'HOLD';
-  entry: number; stop_loss?: number; take_profit_1?: number; take_profit_2?: number;
-  risk_reward?: number; position_size?: number; data_source?: string; rationale: string;
-};
-
 export type AgentInfo = {
   name: string;
   role: string;
@@ -285,11 +287,15 @@ export type AgentStatus = {
     name: string; enabled: boolean; veto: boolean; steps: string[];
     min_risk_reward: number; max_risk_reward?: number; min_target_pips: number;
     entry_timeframe: string; daily_trades: number;
-    /** Unité de temps qui fixe le stop (15m) et celle qui borne l'objectif (1h). */
-    stop_timeframe?: string; target_timeframe?: string;
-    min_target_atr15?: number; max_stop_atr15?: number;
+    confirm_timeframe?: string;
+    /** Unités de temps sur lesquelles la tendance est mesurée, et le seuil de netteté exigé. */
+    trend_timeframes?: string[]; trend_min_score?: number;
+    /** Comment l'entrée est autorisée : "hybrid" | "legacy" | "confluence", et son seuil. */
+    entry_mode?: string; confluence_min_score?: number;
     /** Niveau (en multiples du risque) où le stop est remonté pour verrouiller le gain. */
     secure_at_r?: number; secure_profit?: boolean;
+    /** Fraction du chemin TP1 verrouillée quand TP1 est touché et le momentum confirmé. */
+    tp1_lock_fraction?: number;
     /** Vrai si aucune position n'est ouverte quand Londres ET New York sont fermées. */
     trade_only_when_open?: boolean;
     auto_entry?: boolean; auto_entry_mode?: string;
@@ -301,6 +307,57 @@ export type AgentStatus = {
     overall?: TrainingMetrics; agent_multipliers?: Record<string, number>;
   };
   session?: SessionContext;
+};
+
+/** Un facteur d'une étape (indicateur de tendance ou outil de confirmation) avec son poids. */
+export type StrategyInput = {
+  key: string; label: string; role: string;
+  weight?: number | null; weight_pct?: number; strong?: boolean;
+};
+
+/** Une étape de la stratégie, décrite comme le moteur l'exécute. */
+export type StrategyStep = {
+  n: number; title: string; summary: string;
+  timeframes?: string[];
+  /** Unités de temps dont l'ACCORD est exigé pour valider la tendance (étape 1). */
+  required_timeframes?: string[];
+  inputs?: StrategyInput[];
+  timeframe_weights?: Record<string, number>;
+  blocking?: string[];
+  /** Cases CALCULÉES et affichées mais qui ne refusent plus le trade (décision du 28/07/2026) —
+   *  à ne pas confondre avec `blocking` : un ❌ ici informe, il ne bloque rien. */
+  informative?: string[];
+  rules?: string[];
+  stop_candidates?: string[];
+  stop_rule?: string;
+  scale_explained?: string;
+  not_used?: string;
+  measured?: string;
+  mode?: string;
+  mode_explained?: string;
+};
+
+/**
+ * LA STRATÉGIE DU DESK décrite de A à Z, lue dans la configuration RÉELLE du moteur.
+ * La page n'invente ni ne recopie aucun seuil : une documentation recopiée à la main finit
+ * toujours par décrire une version de la stratégie qui n'existe plus.
+ */
+export type StrategySpec = {
+  name: string;
+  one_liner: string;
+  enabled: boolean;
+  veto: boolean;
+  principles: { title: string; body: string }[];
+  steps: StrategyStep[];
+  risk: { sizing: string; correlation: string; freeze: string; gating: string; volatility: string };
+  scope: {
+    markets: string[]; universe_size: number; universe_capped: boolean; universe_note?: string; hours: string;
+    entry_timeframe: string; confirm_timeframe: string; trend_timeframes: string[];
+    proposals_per_day: number | string; min_reliability: number;
+    auto_entry: boolean; auto_entry_mode: string; why_all_markets: string;
+  };
+  data_honesty: string[];
+  settings: Record<string, number | string | boolean>;
 };
 
 /** Contexte de session : ouvertures Londres / New York et leur chevauchement. */
@@ -417,6 +474,15 @@ export type PaperPosition = Order & {
   pnl_pct?: number;
   progress_pct?: number;   // avancement vers l'objectif (100 % = TP touché)
   r_multiple?: number;     // gain/perte exprimé en multiples du risque initial
+  opened_at?: string | null;    // heure d'ENTRÉE dans la position
+  held_seconds?: number | null; // durée de détention (entrée -> sortie, ou -> maintenant)
+  // Pips SIGNÉS dans le sens du trade : positif = en notre faveur. `pips` est le résultat réalisé
+  // pour une position clôturée, le latent pour une position ouverte.
+  pips?: number | null;
+  pips_label?: string;          // « pips » ou « pips éq. » selon la classe d'actif
+  target_pips?: number | null;
+  stop_pips?: number | null;
+  close_reason?: string | null; // ce qui a fermé la position (quel stop, quel objectif)
 };
 
 export type PositionsSnapshot = {
@@ -464,7 +530,14 @@ export type TopTrades = {
   scanned: number;
   ready: number;
   armed?: number;
-  requested: number;
+  /** Plafond demandé, ou la chaîne « tous » quand la sélection n'en a aucun (le cas par défaut). */
+  requested: number | string;
+  /** Setups conformes à la stratégie, avant le plancher de fiabilité. */
+  conform?: number;
+  /** Combien de conformes ont été écartés par ce plancher — un filtre qu'on compte est un filtre
+   *  qu'on peut contester. */
+  below_reliability?: number;
+  min_reliability?: number;
   picks: PlaybookTrade[];
   /** Verdict de la stratégie pour CHAQUE symbole balayé (pas seulement les 5 retenus). */
   verdicts?: Record<string, PlaybookVerdict>;
@@ -494,6 +567,15 @@ export type AutoEntryStatus = {
   enabled: boolean;
   mode: 'paper';
   interval_seconds: number;
+  /** Délai minimum entre deux entrées sur le même symbole/sens (anti-doublon). */
+  cooldown_min?: number;
+  /** Un verdict de paire peut-il encore refuser une entrée dont le déclencheur s'est formé ? */
+  pair_gating?: boolean;
+  /** Symboles dont le déclencheur 15 min est actif MAINTENANT. */
+  ready_now?: string[];
+  /** Exécutables à l'écran mais refusés au dernier passage (garde-fou de portefeuille, corrélation,
+   *  anti-doublon…) — sans ce champ, un refus légitime ressemble à une panne. */
+  blocked?: { symbol: string; reason: string }[];
   watching: { symbol: string; direction: string; tier: string; reason: string }[];
   recent: {
     id: string; symbol: string; side: string; entry: number | null;
@@ -538,6 +620,18 @@ export type PlaybookPairRank = PlaybookBacktestMetrics & {
   symbol: string; rank: number | null; verdict: string;
 };
 
+/** Les N meilleurs instruments D'UN marché. Classer dans chaque marché plutôt que globalement :
+ *  sinon le marché le plus volatil occupe tout le haut du tableau et les autres disparaissent. */
+export type PlaybookMarketTop = {
+  market: string;
+  label: string;
+  rated: number;
+  unrated: number;
+  profitable: number;
+  note: string;
+  top: (PlaybookPairRank & { market_rank: number })[];
+};
+
 /** Une passe de backtest (portée 1 h, ou fidélité 15 min). */
 export type PlaybookBacktestPass = {
   entry_timeframe: string;
@@ -547,6 +641,8 @@ export type PlaybookBacktestPass = {
   duration_s: number;
   overall: PlaybookBacktestMetrics;
   ranking: PlaybookPairRank[];
+  /** Les 10 meilleurs instruments de chaque marché, classés à l'intérieur du marché. */
+  market_tops?: Record<string, PlaybookMarketTop>;
   by_trigger: Record<string, PlaybookBacktestMetrics>;
   by_session: Record<string, PlaybookBacktestMetrics>;
   by_direction: Record<string, PlaybookBacktestMetrics>;
@@ -580,11 +676,160 @@ export type PlaybookBacktest = {
   universe?: string[];
   scope?: PlaybookBacktestPass;
   fidelity?: PlaybookBacktestPass;
-  data_limits?: { note: string; m15_days: number; h1_years: number; daily_years: number };
+  /** Passe LONGUE (5 ans, échelle swing). Peut ne rien produire — voir `conclusion.long.measurable`,
+   *  qui dit alors POURQUOI plutôt que d'afficher une section vide. */
+  long?: PlaybookBacktestPass | null;
+  data_limits?: {
+    note: string; m15_days: number; h1_years: number; daily_years: number;
+    h4_years?: number; weekly_years?: number;
+  };
   conclusion?: {
     headline: string; verdict: string; lines: string[];
-    markets: Record<string, { pairs: number; trades: number; win_rate: number; expectancy_r: number; best: string | null }>;
+    markets: Record<string, PlaybookMarketBreakdown>;
+    /** Les 10 meilleurs instruments par marché, tels que mesurés par la passe portée. */
+    market_tops?: Record<string, PlaybookMarketTop>;
+    long?: {
+      measurable: boolean; note?: string; years?: number; pairs_tested?: number;
+      overall?: TrainingMetrics; markets?: Record<string, PlaybookMarketBreakdown>;
+    };
+    /** Fréquence d'opportunité mesurée : la réponse chiffrée à « combien de trades par jour ». */
+    frequency?: OpportunityRate;
+    volume_levers?: VolumeLevers;
   };
+};
+
+export type PlaybookMarketBreakdown = {
+  pairs: number; trades: number; win_rate: number; expectancy_r: number;
+  best: string | null; best_expectancy_r?: number; trades_per_day?: number;
+};
+
+/** Combien de trades l'univers balayé produit, en moyenne des TAUX par symbole (jamais total ÷
+ *  période la plus longue : les historiques n'ont pas la même profondeur). */
+export type OpportunityRate = {
+  symbols: number; note: string;
+  avg_trades_per_day_per_symbol?: number;
+  median_trades_per_day_per_symbol?: number;
+  days_between_trades_per_symbol?: number | null;
+  universe_trades_per_day?: number;
+  universe_trades_per_week?: number;
+  universe_trades_per_month?: number;
+  projection?: Record<string, number>;
+};
+
+/** Comment obtenir plus de trades : le levier gratuit (élargir l'univers) et les leviers payants
+ *  (desserrer un seuil), chacun avec ce qu'il coûte. */
+export type VolumeLevers = {
+  note: string;
+  free: {
+    lever: string; why: string;
+    measured_rate_per_symbol_per_day: number;
+    projection_trades_per_day: Record<string, number>;
+    projection_trades_per_week: Record<string, number>;
+    best_producers: {
+      symbol: string; trades_per_day: number; days_between_trades: number | null;
+      expectancy_r: number; r_per_month: number | null;
+    }[];
+  };
+  free_secondary: { lever: string; why: string };
+  costly: { setting: string; current: number | boolean; direction: string; effect: string; risk: string }[];
+};
+
+/** Backtest de la STRATÉGIE DU DESK sur UN seul instrument — même code, même walk-forward strict
+ *  que le backtest complet, restreint à un symbole. */
+export type PlaybookSymbolBacktest = {
+  available: boolean;
+  run_state?: { running: boolean; started_at: string | null; elapsed_s?: number };
+  note?: string;
+  symbol: string;
+  market?: string;
+  market_label?: string;
+  entry_timeframe: string;
+  step?: number;
+  error?: string | null;
+  verdict?: string;
+  duration_s?: number;
+  bars?: number;
+  bars_evaluated?: number;
+  coverage?: string;
+  years_covered?: number;
+  days_evaluated?: number;
+  trades_per_day?: number;
+  days_between_trades?: number | null;
+  overall?: PlaybookBacktestMetrics;
+  by_trigger?: Record<string, PlaybookBacktestMetrics>;
+  by_session?: Record<string, PlaybookBacktestMetrics>;
+  by_direction?: Record<string, PlaybookBacktestMetrics>;
+  by_outcome?: Record<string, PlaybookBacktestMetrics>;
+  losers_profile?: PlaybookBacktestPass['losers_profile'];
+  /** Nombre de trades en dessous duquel une ventilation ne conclut rien. */
+  min_trades?: number;
+  secure_ab?: { note?: string; delta_r?: number; trades?: number };
+  tp_management_ab?: { note?: string; delta_r?: number; trades?: number };
+  trades?: PlaybookBacktestTrade[];
+};
+
+/** Un trade rejoué par le backtest — c'est ce qui rend le résultat vérifiable. */
+export type PlaybookBacktestTrade = {
+  symbol: string; at: string; direction: 'BUY' | 'SELL'; trigger: string;
+  entry: number; stop_loss: number; target: number;
+  risk_pips: number; reward_pips: number; planned_rr: number;
+  outcome: string; r: number; bars_held: number; secured: boolean;
+  exit_reason?: string; session?: string; confidence?: number;
+};
+
+/** Les marchés backtestables et leurs instruments (menus de la page backtest). */
+export type PlaybookBacktestMarkets = {
+  markets: { market: string; label: string; symbols: string[]; count: number }[];
+  entry_timeframes: { tf: string; label: string; note: string }[];
+};
+
+/** L'avis du modèle sur UN instrument, produit HORS stratégie du desk. */
+export type MarketOpinion = {
+  symbol: string;
+  error?: string;
+  asset_class?: string;
+  direction?: 'BUY' | 'SELL' | 'HOLD';
+  stance?: string;              // haussier | baissier | neutre
+  confidence?: number;          // 0-100
+  conviction?: string;          // lecture en français de la confiance
+  consensus_pct?: number;
+  headline?: string;
+  rationale?: string;
+  /** Le détail de CHAQUE agent : c'est ce qui rend l'avis vérifiable plutôt que déclaratif. */
+  agents?: { name: string; score: number; confidence: number; rationale: string; details?: any }[];
+  master?: {
+    score?: number; threshold?: number; consensus?: number; conflict?: boolean;
+    weights_used?: Record<string, number>;
+  };
+  metrics?: Record<string, any>;
+  price?: number;
+  timeframe?: string;
+  /** Niveaux INDICATIFS (ATR) : hors stratégie, ce ne sont pas des ordres à passer. */
+  levels?: {
+    entry?: number; stop_loss?: number; take_profit_1?: number;
+    risk_reward?: number; source?: string;
+  };
+};
+
+/** L'analyse quotidienne complète — forex + or, hors stratégie. */
+export type DailyAnalysis = {
+  available: boolean;
+  /** Vrai si l'analyse servie ne porte pas la date du jour (annoncé plutôt que caché). */
+  stale?: boolean;
+  note?: string;
+  universe?: string[];
+  date?: string;
+  generated_at?: string;
+  duration_s?: number;
+  opinions?: MarketOpinion[];
+  summary?: {
+    analysed: number; failed?: number;
+    bullish?: number; bearish?: number; neutral?: number;
+    strongest?: { symbol: string; direction: string; confidence: number; headline: string };
+    note: string;
+  };
+  method?: string;
+  disclaimer?: string;
 };
 
 export type TrainingMetrics = {
@@ -662,6 +907,16 @@ async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
     // Signal global : le Toaster décide s'il l'affiche (il ignore 401/402/404, gérés inline).
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('qta:api-error', { detail: { message, status: res.status } }));
+      // SESSION EXPIRÉE : un token était envoyé et le serveur le rejette (expire après 60 min).
+      // Sans ce redirect, les pages qui se rafraîchissent seules (positions, scanner, trades du
+      // jour…) avalent l'erreur en silence dans leur boucle d'auto-refresh et affichent des
+      // zéros qui ressemblent à un compte vide — alors que les données existent bel et bien côté
+      // serveur. On ne redirige QUE si un token était présent : un 401 sur une tentative de
+      // connexion (mauvais mot de passe) ne doit jamais renvoyer vers /login en boucle.
+      if (res.status === 401 && t && !window.location.pathname.startsWith('/login')) {
+        clearToken();
+        window.location.href = '/login?expired=1';
+      }
     }
     throw new ApiError(message, res.status);
   }
@@ -716,12 +971,18 @@ export const api = {
   /** Les trades du jour issus de la STRATÉGIE (mensuel+journalier → 4 h → entrée 15 min).
    *  Sans `refresh`, la réponse est l'instantané déjà calculé par la boucle de fond : elle arrive
    *  en quelques millisecondes, ce qui autorise un rafraîchissement toutes les 10 secondes. */
-  topTrades: (refresh = false, count = 5) =>
+  topTrades: (refresh = false, count = 0) =>
     req<TopTrades>(`/api/signals/top-trades?count=${count}${refresh ? '&refresh=true' : ''}`),
   /** État de l'auto-entrée en compte démo (ce que le robot surveille et ce qu'il a ouvert seul). */
   autoEntry: () => req<AutoEntryStatus>('/api/signals/auto-entry'),
   /** Force un passage de veille de l'auto-entrée. */
   runAutoEntry: () => req<{ opened: any[]; note: string }>('/api/signals/auto-entry/run', { method: 'POST' }),
+  /** REMET L'AUTO-ENTRÉE À ZÉRO : positions démo en cours neutralisées (issue « reset », hors
+   *  statistiques) + traces effacées, puis un passage de veille immédiat. Ne touche rien de réel. */
+  resetAutoEntry: () =>
+    req<{ closed: { symbol: string }[]; events_cleared: number; note: string; run?: any }>(
+      '/api/signals/auto-entry/reset', { method: 'POST' },
+    ),
   /** Dernier backtest de LA STRATÉGIE sur le forex et l'or : classement des paires + conclusion. */
   playbookBacktest: () => req<PlaybookBacktest>('/api/backtest/playbook'),
   /** LANCE le backtest en arrière-plan et rend la main aussitôt (il dure une dizaine de minutes).
@@ -730,6 +991,24 @@ export const api = {
     req<{ started: boolean; run_state: BacktestRunState; note: string }>(
       '/api/backtest/playbook/run', { method: 'POST' },
     ),
+  /** Marchés backtestables + instruments de chacun (les mêmes que le backtest complet). */
+  playbookBacktestMarkets: () => req<PlaybookBacktestMarkets>('/api/backtest/playbook/markets'),
+  /** Dernier backtest de la stratégie du desk sur UN symbole. */
+  playbookSymbolBacktest: (symbol: string, entryTf = '1h') =>
+    req<PlaybookSymbolBacktest>(
+      `/api/backtest/playbook/symbol?symbol=${encodeURIComponent(symbol)}&entry_tf=${entryTf}`,
+    ),
+  /** LANCE ce backtest en arrière-plan (quelques secondes à une minute selon la profondeur). */
+  runPlaybookSymbolBacktest: (symbol: string, entryTf = '1h', step = 4) =>
+    req<{ started: boolean; symbol: string; note: string }>(
+      `/api/backtest/playbook/symbol/run?symbol=${encodeURIComponent(symbol)}` +
+      `&entry_tf=${entryTf}&step=${step}`,
+      { method: 'POST' },
+    ),
+  /** ANALYSE QUOTIDIENNE des marchés (forex + or), produite HORS stratégie du desk. */
+  dailyAnalysis: () => req<DailyAnalysis>('/api/analysis/daily'),
+  /** Force une analyse immédiate (synchrone : l'univers est court). */
+  runDailyAnalysis: () => req<DailyAnalysis>('/api/analysis/daily/run', { method: 'POST' }),
   /** Entraînement quotidien des agents sur la stratégie (walk-forward mesuré + fiches). */
   training: () => req<TrainingReport>('/api/agents/training'),
   /** Relance un entraînement complet (opération longue). */
@@ -763,8 +1042,13 @@ export const api = {
         }),
       },
     ),
-  scan: (asset_class?: string, timeframe = '1h', limit = 20, high_conviction_only = false, session?: string) =>
-    req<{ count: number; high_conviction: number; results: any[] }>(
+  /** Scan par LA STRATÉGIE DU DESK : chaque ligne porte son verdict, ses métriques et son `why`
+   *  (comment la tendance a été établie, quelles confirmations, ce qui a bloqué). */
+  scan: (asset_class?: string, timeframe = '1h', limit = 100, high_conviction_only = false, session?: string) =>
+    req<{
+      count: number; high_conviction: number; results: any[];
+      ready?: number; armed?: number; refused?: number; not_scanned?: number; strategy?: string;
+    }>(
       `/api/signals/scan?${new URLSearchParams({
         ...(asset_class ? { asset_class } : {}),
         ...(session ? { session } : {}),
@@ -801,25 +1085,14 @@ export const api = {
     req<WalkForward>(`/api/backtest/walk-forward?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&folds=${folds}`, { method: 'POST' }),
   trackRecord: (refresh = false) =>
     req<TrackRecord>(`/api/backtest/track-record${refresh ? '?refresh=true' : ''}`),
-  // Stratégies
-  strategies: () => req<{ strategies: StrategyInfo[] }>('/api/strategies'),
-  strategyBacktest: (symbol: string, strategy: string, timeframe = '1h') =>
-    req<StrategyBacktest>(`/api/strategies/backtest?symbol=${encodeURIComponent(symbol)}&strategy=${strategy}&timeframe=${timeframe}`, { method: 'POST' }),
-  strategyWalkForward: (symbol: string, strategy: string, timeframe = '1h', folds = 4) =>
-    req<WalkForward>(`/api/strategies/walk-forward?symbol=${encodeURIComponent(symbol)}&strategy=${strategy}&timeframe=${timeframe}&folds=${folds}`, { method: 'POST' }),
-  strategyValidateMulti: (strategy: string, timeframe = '1h', market = 'crypto') =>
-    req<MultiValidation>(`/api/strategies/validate-multi?strategy=${strategy}&timeframe=${timeframe}&market=${market}`, { method: 'POST' }),
-  autoTrade: () => req<{ auto_trade: boolean }>('/api/strategies/auto-trade'),
+  // La stratégie du desk. Il n'y a plus de bibliothèque ni de sélection : le projet entier
+  // applique cette méthode et elle seule, sur tous les marchés.
+  autoTrade: () => req<{ auto_trade: boolean }>('/api/agents/auto-trade'),
   setAutoTrade: (enabled: boolean) =>
-    req<{ auto_trade: boolean }>(`/api/strategies/auto-trade?enabled=${enabled}`, { method: 'POST' }),
-  compareStrategies: (symbol: string, timeframe = '1h') =>
-    req<StrategyComparison>(`/api/strategies/compare?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}`, { method: 'POST' }),
-  selectStrategy: (strategy: string) =>
-    req<{ selected: string }>(`/api/strategies/select?strategy=${strategy}`, { method: 'POST' }),
-  selectedStrategy: () => req<{ selected: string | null }>('/api/strategies/selected'),
-  strategySignal: (symbol: string, strategy?: string, timeframe = '1h') =>
-    req<StrategySignal>(`/api/strategies/signal?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}${strategy ? `&strategy=${strategy}` : ''}`, { method: 'POST' }),
+    req<{ auto_trade: boolean }>(`/api/agents/auto-trade?enabled=${enabled}`, { method: 'POST' }),
   agentsStatus: () => req<AgentStatus>('/api/agents/status'),
+  /** LA stratégie décrite de A à Z, avec les seuils réellement appliqués par le moteur. */
+  strategySpec: () => req<StrategySpec>('/api/agents/strategy'),
   // Phase 3
   myPlan: () => req<PlanInfo>('/api/plan'),
   upgrade: (plan: string) => req<{ mode: string; checkout_url?: string }>(`/api/billing/checkout/${plan}`, { method: 'POST' }),
@@ -854,6 +1127,13 @@ export const api = {
     req<Wallet>(`/api/wallet/reset?starting_balance=${starting_balance}&clear_orders=${clear_orders}`, { method: 'POST' }),
   checkOrder: (id: string) => req<Order>(`/api/execution/orders/${id}/check`, { method: 'POST' }),
   closeOrder: (id: string) => req<Order>(`/api/execution/orders/${id}/close`, { method: 'POST' }),
+  /** Modifie MANUELLEMENT le stop et/ou l'objectif d'une position papier encore ouverte. Au moins
+   *  un des deux champs doit être fourni. Refusé si le prix actuel a déjà franchi le niveau
+   *  demandé (la position se clôturerait sinon dès le prochain passage de surveillance). */
+  updateOrderLevels: (id: string, levels: { stop_loss?: number; take_profit?: number }) =>
+    req<PaperPosition>(`/api/execution/orders/${id}/levels`, {
+      method: 'POST', body: JSON.stringify(levels),
+    }),
   // Phase 4 — Copy-trading
   leaderboard: () => req<Trader[]>('/api/copytrading/leaderboard'),
   publishProfile: (display_name: string) => req<unknown>('/api/copytrading/publish', { method: 'POST', body: JSON.stringify({ display_name }) }),

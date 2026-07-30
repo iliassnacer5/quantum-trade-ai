@@ -71,3 +71,22 @@ def from_pips(symbol: str, pips: float, price: float | None = None) -> float:
 def label(symbol: str) -> str:
     """Mention à afficher : distingue le pip réel de l'équivalence en points de base."""
     return "pips" if pip_kind(symbol) == _STANDARD else "pips éq. (1 pip = 0,01 % du prix)"
+
+
+def signed_pips(symbol: str, side: str | None, entry: float | None,
+                price: float | None) -> float | None:
+    """Mouvement `entry` -> `price` en pips, SIGNÉ dans le sens du trade.
+
+    Positif = le prix est allé dans notre sens (pips gagnés) ; négatif = contre nous (pips perdus).
+    Le signe est ce qui rend la valeur lisible sans contexte : une distance non signée affiche la
+    même chose pour un stop qui coûte 40 pips et un stop remonté qui en verrouille 40.
+
+    Retourne None dès qu'une donnée manque — on n'invente pas un mouvement à partir d'un prix absent.
+    """
+    if entry is None or price is None or side not in ("buy", "sell"):
+        return None
+    size = pip_size(symbol, entry)
+    if size <= 0:
+        return None
+    move = (price - entry) if side == "buy" else (entry - price)
+    return round(move / size, 1)

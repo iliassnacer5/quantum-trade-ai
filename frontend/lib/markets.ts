@@ -6,10 +6,11 @@ export type MarketClass = { id: string; label: string };
 
 export const MARKET_CLASSES: MarketClass[] = [
   { id: '', label: 'Tous' },
-  { id: 'crypto', label: 'Crypto' },
   { id: 'forex', label: 'Forex' },
-  { id: 'stock', label: 'Actions' },
+  { id: 'index', label: '📊 Indices' },
   { id: 'commodity', label: '🥇 Or & Métaux' },
+  { id: 'stock', label: 'Actions' },
+  { id: 'crypto', label: 'Crypto' },
 ];
 
 /** Marchés concrets (sans « Tous ») — pour les pages qui exigent un marché précis. */
@@ -21,6 +22,7 @@ export const MARKET_BADGE: Record<string, string> = {
   forex: '💱 Forex',
   stock: '📈 Actions',
   commodity: '🥇 Or',
+  index: '📊 Indice',
 };
 
 export type Timeframe = { tf: string; interval: string; label: string };

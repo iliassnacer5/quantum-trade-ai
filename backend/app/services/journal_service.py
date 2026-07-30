@@ -38,6 +38,69 @@ def record_signal(store, tenant_id: str, card, signal_id: str | None = None) -> 
         logger.warning("Enregistrement journal échoué (%s)", exc)
 
 
+def playbook_entries(store, tenant_id: str, limit: int = 200) -> list[dict]:
+    """Positions ouvertes en démo (playbook) reformatées comme des entrées de journal.
+
+    Le Journal n'enregistrait QUE les signaux du flux classique (bouton « Générer un signal » du
+    dashboard) — un flux distinct de celui que la plupart des utilisateurs emploient réellement
+    (auto-entrée, « Ouvrir en démo », trades du jour). Résultat mesuré : un compte avec plusieurs
+    positions ouvertes et clôturées voyait le Journal afficher zéro partout, ce qui ressemble à une
+    panne alors que les deux flux n'ont simplement jamais partagé leurs données.
+
+    Cette fonction ne CRÉE aucun enregistrement : elle traduit à la volée les ordres papier
+    (`execution_service`) dans la forme attendue par `stats()` et par l'affichage. Les issues
+    NEUTRES (`reset`, `invalid` — jamais jouées jusqu'au bout) sont exclues : ce ne sont pas des
+    trades gagnés ou perdus, les compter fausserait le taux de réussite.
+    """
+    from app.domain import pips as pips_mod
+    from app.services import execution_service
+
+    out: list[dict] = []
+    for o in execution_service.list_orders(store, tenant_id, limit=limit):
+        if o.get("mode") != "paper":
+            continue
+        outcome_raw = o.get("outcome")
+        if outcome_raw in execution_service.NEUTRAL_OUTCOMES:
+            continue
+        outcome = {"won": "win", "lost": "loss"}.get(outcome_raw, "open")
+        # Pips réalisés (entrée -> sortie) sur un trade clôturé : la même lecture que sur la carte
+        # de Paper Trading, pour que les deux pages ne racontent pas deux histoires différentes.
+        pips = pips_mod.signed_pips(
+            o.get("symbol", ""), o.get("side"),
+            o.get("entry") if o.get("entry") is not None else o.get("filled_price"),
+            o.get("exit_price"),
+        ) if outcome != "open" else None
+        out.append({
+            "id": o["id"],
+            "source": "playbook",
+            "symbol": o.get("symbol"),
+            "direction": "BUY" if o.get("side") == "buy" else "SELL",
+            "outcome": outcome,
+            "pips": pips,
+            "pips_label": pips_mod.label(o.get("symbol", "")),
+            "pnl": round(float(o["realized_pnl"]), 2) if outcome != "open" and o.get("realized_pnl") is not None else None,
+            "agent_scores": {},
+            "trigger": o.get("trigger"),
+            "entry": o.get("entry") or o.get("filled_price"),
+            "stop_loss": o.get("stop_loss"),
+            "take_profit": o.get("take_profit"),
+            "created_at": o.get("created_at"),
+            "closed_at": o.get("closed_at"),
+        })
+    return out
+
+
+def all_entries(store, tenant_id: str, limit: int = 200) -> list[dict]:
+    """Le Journal COMPLET : signaux classiques + trades playbook, les deux flux réunis.
+
+    C'est cette liste que la page doit afficher — l'utilisateur voit « ses trades », pas « les
+    trades du flux qu'il n'a pas utilisé ». Triée du plus récent au plus ancien.
+    """
+    merged = recent_entries(store, tenant_id, limit) + playbook_entries(store, tenant_id, limit)
+    merged.sort(key=lambda e: e.get("created_at") or "", reverse=True)
+    return merged[:limit]
+
+
 def recent_entries(store, tenant_id: str, limit: int = 200) -> list[dict]:
     """Entrées de journal récentes pour `compute_weight_multipliers`."""
     journal_repo = getattr(store, "journal", None)

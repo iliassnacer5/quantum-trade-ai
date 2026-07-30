@@ -1,0 +1,48 @@
+# Porte d'entrée unique de la production. Caddy obtient et renouvelle le certificat Let's Encrypt
+# tout seul : il n'y a aucun certbot à programmer, et rien qui expire silencieusement dans 90 jours.
+#
+# Le domaine vient de la variable DOMAIN (docker-compose.prod.yml). Le DNS doit pointer sur l'IP du
+# VPS AVANT le premier démarrage : Let's Encrypt vérifie le domaine en appelant le serveur, donc un
+# DNS non propagé se solde par un échec d'obtention du certificat (Caddy réessaie, mais en HTTP).
+
+{
+	# Adresse de contact pour les avis d'expiration Let's Encrypt. Vide = compte anonyme (accepté).
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# --- API, WebSocket et sonde de santé -> backend -------------------------------------------
+	# `handle` (et non `handle_path`) : le préfixe /api est CONSERVÉ, parce que les routes FastAPI
+	# le déclarent elles-mêmes (APIRouter(prefix="/api/...")). Le retirer ici donnerait des 404 sur
+	# toute l'API.
+	handle /api/* {
+		reverse_proxy backend:8000
+	}
+	# WebSocket temps réel (/ws/signals). Caddy relaie l'Upgrade sans configuration particulière.
+	handle /ws/* {
+		reverse_proxy backend:8000
+	}
+	handle /health* {
+		reverse_proxy backend:8000
+	}
+
+	# `/metrics` n'est VOLONTAIREMENT pas exposé : ces compteurs décrivent l'activité interne de la
+	# plateforme (ordres, erreurs, tenants) et n'ont aucune raison d'être publics. Pour les lire,
+	# passer par la machine : `docker compose exec backend curl -s localhost:8000/metrics`.
+
+	# --- Tout le reste -> interface Next.js -----------------------------------------------------
+	handle {
+		reverse_proxy frontend:3000
+	}
+
+	# En-têtes de sécurité de base. HSTS n'est PAS activé ici : il est irréversible côté navigateur
+	# pendant toute sa durée de vie, à n'activer qu'une fois le HTTPS confirmé stable.
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}

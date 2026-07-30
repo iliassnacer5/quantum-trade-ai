@@ -74,7 +74,10 @@ async def refresh(store=None, *, count: int | None = None, skip_if_newer_than: f
         if (skip_if_newer_than is not None and _snapshot is not None
                 and _age_of(_snapshot) <= skip_if_newer_than):
             return _decorate(_snapshot)
-        payload = await signal_service.daily_top_trades(count or s.daily_top_trades_count)
+        # `count=None` -> le réglage (0 = tous les setups conformes). On ne remplace pas un 0
+        # explicite par le défaut : « aucun plafond » est une valeur, pas une absence de valeur.
+        payload = await signal_service.daily_top_trades(
+            s.daily_top_trades_count if count is None else count)
         payload["computed_at"] = datetime.now(UTC).isoformat()
         payload["date"] = datetime.now(UTC).date().isoformat()
         _snapshot = payload
@@ -91,9 +94,26 @@ async def get(store=None, *, count: int | None = None, force: bool = False) -> d
 
     `force=True` (bouton « recalculer maintenant ») relance le calcul complet.
     """
+    global _snapshot
+
     s = get_settings()
     if force:
         return await refresh(store, count=count)
+    if _snapshot is None and store is not None:
+        # REDÉMARRAGE : la boucle de fond persiste son instantané à chaque passage. Le relire est
+        # instantané, alors que le recalculer coûte ~80 s (84 symboles × 5 unités de temps) —
+        # mesuré le 30/07/2026. Une page ouverte dans la minute qui suit un redémarrage payait ce
+        # calcul complet, alors qu'un instantané du jour existait déjà en base.
+        # Il est servi avec son ÂGE : une donnée de dix minutes est annoncée comme telle, jamais
+        # maquillée en donnée fraîche (`_decorate`), et la boucle de fond la remplacera d'elle-même.
+        try:
+            stored = store.records.get("top_trades", datetime.now(UTC).date().isoformat())
+        except Exception as exc:  # noqa: BLE001 — la relecture n'est qu'un raccourci
+            logger.warning("Instantané persisté illisible (%s)", exc)
+            stored = None
+        if stored and stored.get("picks") is not None:
+            _snapshot = stored
+            return _decorate(stored)
     if _snapshot is None:
         # Plusieurs pages peuvent arriver ensemble avant le premier calcul : la première déclenche,
         # les autres récupèrent son résultat au lieu de relancer le même balayage.

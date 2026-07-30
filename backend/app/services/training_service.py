@@ -310,13 +310,8 @@ async def train_symbol(symbol: str, *, asset_class: str = "") -> dict:
             sliced["monthly"], sliced["daily"], sliced["h4"], m15[max(0, i - _TAIL["m15"] + 1): i + 1],
             h1=sliced["h1"] or None,
             session=sessions_mod.session_context(stamp),
-            min_rr=s.playbook_min_rr, max_rr=s.playbook_max_rr,
-            min_target_pips=s.playbook_min_target_pips,
-            min_target_atr15=s.playbook_min_target_atr15,
-            max_stop_pips=s.playbook_max_stop_pips,
-            max_stop_atr15=s.playbook_max_stop_atr15,
-            target_level_buffer=s.playbook_target_level_buffer,
-            max_atr_multiple=s.playbook_max_atr_multiple,
+            # Mêmes réglages que la production et que le backtest, lus au même endroit.
+            **playbook.settings_kwargs(s),
         )
         if not setup.ready or setup.entry is None:
             continue
@@ -457,6 +452,16 @@ async def run_backtest_training(store) -> dict:  # noqa: ANN001
         "by_symbol": scope["by_symbol"],
         "by_trigger": scope["by_trigger"],
         "losers_profile": scope["losers_profile"],
+        # Fréquence d'opportunité mesurée : c'est elle qui dit combien de trades par jour l'univers
+        # balayé produit, et quels symboles en produisent le plus.
+        "frequency": scope.get("frequency"),
+        # Passe LONGUE (5 ans, échelle swing) : le classement de fiabilité sur la durée.
+        "long": ({
+            "years_covered": payload["long"]["years_covered"],
+            "overall": payload["long"]["overall"],
+            "ranking": payload["long"]["ranking"],
+            "frequency": payload["long"].get("frequency"),
+        } if payload.get("long") else None),
         "conclusion": payload["conclusion"],
     }
     try:
@@ -520,7 +525,8 @@ async def run_training(store, *, symbols: list[dict] | None = None, write_expert
         "factor_competence": competence,
         "agent_multipliers": _agent_multipliers(competence, min_obs),
         "min_trades": s.playbook_training_min_trades,
-        "strategy": "Playbook MTF — stop 15 min, objectif borné 1 h, R/R 1:1,2–1:1,3",
+        "strategy": ("Playbook — tendance multi-indicateurs figée, entrée par confluence, "
+                     "stop et objectifs sur niveaux, R/R 1:2–1:3"),
     }
     if write_expertise:
         payload["expertise"] = await build_expertise(payload)
@@ -623,8 +629,10 @@ async def build_expertise(payload: dict) -> dict[str, str]:
         prompt = (
             "Tu es le responsable de la formation d'un desk de trading. Voici les résultats MESURÉS "
             f"de la nuit pour l'agent « {agent} » ({role}), obtenus en rejouant notre stratégie "
-            "(mensuel/journalier → 4 h → entrée 15 min, stop sur la structure 15 min, objectif "
-            "borné par le prochain niveau 1 h, R/R 1:1,2 à 1:1,3) sur l'historique réel :\n\n"
+            "(tendance multi-indicateurs sur D1/4h/1h/15min puis figée, entrée 15 min autorisée par "
+            "au moins trois confirmations pondérées, stop posé sur le niveau qui invalide le "
+            "scénario, objectifs devant le premier obstacle réel, R/R 1:2 à 1:3) sur l'historique "
+            "réel :\n\n"
             f"{facts}\n\n"
             "Rédige sa fiche d'expertise du jour en 3 puces MAXIMUM, en français, à l'impératif. "
             "Chaque puce doit être une règle opératoire directement applicable demain sur CETTE "

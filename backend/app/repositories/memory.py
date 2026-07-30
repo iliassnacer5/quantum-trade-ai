@@ -157,5 +157,16 @@ class RecordRepository:
             items = [v for v in items if v.get("tenant_id") == tenant_id]
         return sorted(items, key=lambda r: r.get("created_at", ""), reverse=True)
 
+    def list_where_field_not_in(
+        self, kind: str, field: str, excluded: set[str], tenant_id: str | None = None,
+    ) -> list[dict]:
+        """Enregistrements dont `field` n'est PAS dans `excluded` (ex. positions encore ouvertes).
+
+        En mémoire, le filtre coûte le même prix qu'ailleurs — l'intérêt de cette méthode est côté
+        SQL, où elle évite de matérialiser tout l'historique pour n'en garder qu'une poignée. Les
+        deux implémentations doivent rendre le même résultat, c'est le contrat du Protocol.
+        """
+        return [r for r in self.list(kind, tenant_id) if r.get(field) not in excluded]
+
     def delete(self, kind: str, record_id: str) -> bool:
         return self._records.pop((kind, record_id), None) is not None

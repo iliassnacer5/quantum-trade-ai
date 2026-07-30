@@ -504,3 +504,200 @@ def test_api_training_endpoint(market):
     assert "trained" in body      # non entraîné au démarrage : la réponse le dit franchement
     status = client.get("/api/agents/status", headers=h).json()
     assert "training" in status and "trained" in status["training"]
+
+
+# ---------------------------------------------------------------------------------------
+# 5. Anti-doublon et remise à zéro (demandés le 28/07/2026)
+# ---------------------------------------------------------------------------------------
+async def test_the_same_trigger_is_not_taken_twice_in_a_row(market):
+    """Quatre entrées ETH/USDT en quatre minutes : c'est ce que le délai anti-doublon empêche.
+
+    Le déclencheur 15 min reste actif plusieurs passages de veille d'affilée. `_already_open` ne
+    couvre que les positions ENCORE ouvertes : dès que la précédente se referme, la suivante
+    repartait aussitôt, au même prix. Quatre fois le même pari, donc quatre fois le risque prévu
+    pour un seul.
+    """
+    store = get_store()
+    user = _user(store, "cooldown@test.com")
+    s = get_settings()
+    s.playbook_auto_entry_cooldown_min = 45
+    candidates = [{"symbol": "EUR/USD", "asset_class": "forex", "tier": "armed"}]
+
+    first = await auto_entry_service.run_auto_entry(store, candidates=candidates)
+    assert len(first["opened"]) == 1
+
+    # La position se referme (gagnante) : sans le délai, le passage suivant rouvrirait aussitôt.
+    order = execution_service.list_orders(store, user.tenant_id)[0]
+    store.records.put(execution_service.ORDER, order["id"],
+                      {**order, "outcome": "won"}, tenant_id=user.tenant_id)
+
+    second = await auto_entry_service.run_auto_entry(store, candidates=candidates)
+    assert second["opened"] == []
+    assert any("anti-doublon" in sk["reason"] for sk in second["skipped"]), second["skipped"]
+    # Le rapport DIT pourquoi rien n'est parti — un refus silencieux passe pour une panne.
+    assert "anti-doublon" in second["note"]
+
+
+async def test_the_cooldown_can_be_switched_off(market):
+    """`playbook_auto_entry_cooldown_min = 0` désactive le garde : c'est l'ancien comportement."""
+    store = get_store()
+    user = _user(store, "nocooldown@test.com")
+    s = get_settings()
+    s.playbook_auto_entry_cooldown_min = 0
+    candidates = [{"symbol": "EUR/USD", "asset_class": "forex", "tier": "armed"}]
+
+    await auto_entry_service.run_auto_entry(store, candidates=candidates)
+    order = execution_service.list_orders(store, user.tenant_id)[0]
+    store.records.put(execution_service.ORDER, order["id"],
+                      {**order, "outcome": "won"}, tenant_id=user.tenant_id)
+
+    second = await auto_entry_service.run_auto_entry(store, candidates=candidates)
+    assert len(second["opened"]) == 1
+    s.playbook_auto_entry_cooldown_min = 45
+
+
+async def test_reset_neutralises_open_demo_positions_without_inventing_a_result(market):
+    """La remise à zéro ne clôture pas « gagnant » ni « perdant » : elle NEUTRALISE.
+
+    Une position rouverte n'a pas été jouée jusqu'au bout. Lui donner une issue fabriquerait un
+    résultat que le marché n'a pas produit — exactement le défaut qui avait produit 13 000 € de
+    profit fictif. Elle sort donc des statistiques, et le P&L n'en garde rien.
+    """
+    store = get_store()
+    user = _user(store, "reset@test.com")
+    s = get_settings()
+    s.playbook_auto_entry_cooldown_min = 45
+    candidates = [{"symbol": "EUR/USD", "asset_class": "forex", "tier": "armed"}]
+    await auto_entry_service.run_auto_entry(store, candidates=candidates)
+    assert len(execution_service.list_orders(store, user.tenant_id)) == 1
+
+    out = auto_entry_service.reset(store, user.tenant_id)
+
+    assert len(out["closed"]) == 1 and out["events_cleared"] == 1
+    order = execution_service.list_orders(store, user.tenant_id)[0]
+    assert order["outcome"] == "reset" and order["pnl"] == 0.0
+    # Ni gagnante ni perdante : elle ne compte nulle part.
+    snapshot = await execution_service.positions_snapshot(store, user.tenant_id)
+    assert snapshot["wins"] == 0 and snapshot["losses"] == 0
+    assert snapshot["open_count"] == 0
+    # L'historique des entrées automatiques est vide, donc le délai anti-doublon repart de zéro.
+    assert auto_entry_service.recent_events(store, user.tenant_id) == []
+
+
+async def test_reset_lets_the_next_trigger_fire_immediately(market):
+    """Après une remise à zéro, le prochain déclencheur repart : c'est tout l'intérêt du bouton."""
+    store = get_store()
+    user = _user(store, "reset2@test.com")
+    s = get_settings()
+    s.playbook_auto_entry_cooldown_min = 45
+    candidates = [{"symbol": "EUR/USD", "asset_class": "forex", "tier": "armed"}]
+    await auto_entry_service.run_auto_entry(store, candidates=candidates)
+
+    auto_entry_service.reset(store, user.tenant_id)
+    again = await auto_entry_service.run_auto_entry(store, candidates=candidates)
+
+    assert len(again["opened"]) == 1, again["note"]
+
+
+def test_api_auto_entry_reset_endpoint(market):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+    r = client.post("/api/auth/register", json={"email": "resetapi@test.com", "password": "password123"})
+    h = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+    body = client.post("/api/signals/auto-entry/reset?relaunch=false", headers=h).json()
+    assert "closed" in body and "events_cleared" in body
+    assert "conservé" in body["note"]        # les trades clôturés ne sont JAMAIS effacés
+
+    status = client.get("/api/signals/auto-entry", headers=h).json()
+    assert status["pair_gating"] is False    # plus de refus silencieux par verdict de paire
+    assert status["cooldown_min"] >= 0
+
+
+# ---------------------------------------------------------------------------------------
+# 6. Refus non silencieux (garde-fou de portefeuille, corrélation…) — demandé le 28/07/2026
+# ---------------------------------------------------------------------------------------
+async def test_a_ready_setup_blocked_by_the_portfolio_guard_is_explained_not_silent(market):
+    """Un setup EXÉCUTABLE à l'écran mais refusé par un garde-fou doit le dire, pas se taire.
+
+    Avant ce correctif, un passage qui n'ouvrait rien ne laissait AUCUNE trace côté logs ni côté
+    API : impossible de distinguer « le robot est en panne » de « le garde-fou de portefeuille a
+    fait exactement ce qu'on lui a demandé ».
+    """
+    from app.core.config import get_settings
+    from app.services import execution_service
+
+    store = get_store()
+    user = _user(store, "blocked1@test.com")
+    s = get_settings()
+    s.paper_portfolio_guard = True
+    # 0 = AUCUN plafond (décision du 28/07/2026) : pour forcer le refus, on remplit le plafond
+    # avec une position déjà ouverte plutôt que de le fixer à zéro.
+    s.paper_max_positions = 1
+    conn_id = execution_service.ensure_paper_connection(store, user.tenant_id)
+    await execution_service.place_order(
+        store, user.tenant_id, conn_id=conn_id, symbol="GBP/USD", side="buy", qty=1.0,
+    )
+    try:
+        report = await auto_entry_service.run_auto_entry(
+            store, candidates=[{"symbol": "EUR/USD", "asset_class": "forex", "tier": "armed"}],
+        )
+        assert report["opened"] == []
+        assert any("Limite de" in sk["reason"] for sk in report["skipped"]), report["skipped"]
+
+        blocked = auto_entry_service.blocked_for(store, user.tenant_id)
+        assert len(blocked) == 1
+        assert blocked[0]["symbol"] == "EUR/USD"
+        assert "Limite de" in blocked[0]["reason"]
+    finally:
+        s.paper_portfolio_guard = False
+        s.paper_max_positions = 0
+
+
+async def test_blocked_for_is_scoped_to_the_right_tenant(market):
+    """Le refus d'UN tenant ne doit jamais apparaître comme le refus d'un AUTRE."""
+    from app.core.config import get_settings
+    from app.services import execution_service
+
+    store = get_store()
+    user_a = _user(store, "blockeda@test.com")
+    user_b = _user(store, "blockedb@test.com")
+    s = get_settings()
+    s.paper_portfolio_guard = True
+    s.paper_max_positions = 1
+    for user in (user_a, user_b):
+        conn_id = execution_service.ensure_paper_connection(store, user.tenant_id)
+        await execution_service.place_order(
+            store, user.tenant_id, conn_id=conn_id, symbol="GBP/USD", side="buy", qty=1.0,
+        )
+    try:
+        await auto_entry_service.run_auto_entry(
+            store, candidates=[{"symbol": "EUR/USD", "asset_class": "forex", "tier": "armed"}],
+        )
+        assert len(auto_entry_service.blocked_for(store, user_a.tenant_id)) == 1
+        assert len(auto_entry_service.blocked_for(store, user_b.tenant_id)) == 1
+        assert auto_entry_service.blocked_for(store, "unknown-tenant") == []
+    finally:
+        s.paper_portfolio_guard = False
+        s.paper_max_positions = 0
+
+
+def test_api_auto_entry_status_exposes_blocked_setups(market):
+    """Le champ `blocked` doit exister dans la réponse (vide ou non) : c'est le contrat d'API que
+    la bannière du front consomme. Le comportement de blocage lui-même est vérifié plus haut, au
+    niveau service (`test_a_ready_setup_blocked_by_the_portfolio_guard_is_explained_not_silent`)."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+    r = client.post("/api/auth/register",
+                    json={"email": "blockedapi@test.com", "password": "password123"})
+    h = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+    status = client.get("/api/signals/auto-entry", headers=h).json()
+    assert "blocked" in status
+    assert status["blocked"] == []

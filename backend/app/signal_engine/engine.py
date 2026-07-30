@@ -53,12 +53,19 @@ async def generate_signal(
     risk_context: dict | None = None,
     journal_multipliers: dict[str, float] | None = None,
     playbook_setup: PlaybookSetup | None = None,
+    include_playbook: bool = True,
 ) -> SignalCard:
     """Produit une Signal Card à partir des données de marché, sentiment, fondamentaux et macro.
 
     `playbook_setup` : résultat de la stratégie du desk (mensuel+journalier -> 4h -> entrée 15 min).
     S'il est fourni, il pilote la décision (droit de veto) et fournit les niveaux d'entrée/SL/TP.
     Sinon il est calculé automatiquement à partir du symbole quand la stratégie est activée.
+
+    `include_playbook=False` sort la stratégie du desk de l'analyse : l'agent playbook n'est ni
+    exécuté ni compté dans le vote, et son droit de veto ne s'applique pas. C'est ce que demande
+    l'ANALYSE QUOTIDIENNE (`services.market_opinion_service`) : un avis des agents qui ne soit pas
+    la stratégie répétée autrement. Un second regard n'a d'intérêt que s'il peut dire autre chose —
+    laisser le playbook opposer son veto ramènerait mécaniquement l'avis à celui de la stratégie.
     """
     news = news or []
     # Sans Fear & Greed externe, on dérive un indice de marché (momentum/volatilité) pour que
@@ -74,7 +81,7 @@ async def generate_signal(
 
     settings = get_settings()
     pb_output: AgentOutput | None = None
-    if settings.playbook_enabled:
+    if settings.playbook_enabled and include_playbook:
         try:
             if playbook_setup is None:
                 from app.services import playbook_service
@@ -88,6 +95,11 @@ async def generate_signal(
 
             logging.getLogger(__name__).warning("Playbook indisponible pour %s (%s)", asset, exc)
             playbook_setup = None
+    elif not include_playbook:
+        # Sortie COMPLÈTE de la stratégie : même un setup fourni par l'appelant est écarté, sinon
+        # il ré-entrerait par le contexte des agents (`_ctx["playbook"]`) et par les niveaux
+        # d'entrée — l'avis ne serait plus indépendant, il serait la stratégie déguisée.
+        playbook_setup = None
 
     # 1. Agents — l'agent technique est routé vers l'expert du marché (contexte = classe d'actif).
     from app.data.markets import asset_class as _asset_class
@@ -97,19 +109,22 @@ async def generate_signal(
     outputs: list[AgentOutput] = []
     if pb_output is not None:
         outputs.append(pb_output)
+    # TOUS les agents reçoivent le contexte de la stratégie : la tendance validée, les zones et les
+    # niveaux d'exécution sont la même lecture du marché pour tout le monde. Chacun décide ensuite
+    # du poids qu'il accorde à un désaccord (cf. `apply_playbook(soften=...)`).
     outputs += [
         await technical.run(candles, symbol=asset, context=_ctx),
         await volume.run(candles, _ctx),
-        await sentiment.run(news, fear_greed),
-        await pattern.run(candles),
+        await sentiment.run(news, fear_greed, context=_ctx),
+        await pattern.run(candles, symbol=asset, context=_ctx),
     ]
     # L'agent fondamental n'a de sens que pour les ACTIONS (ou si des ratios sont fournis).
     # (Avant : condition inversée qui l'activait sur la crypto et l'omettait sur les actions.)
     from app.data.markets import asset_class as _asset_class
     if ratios is not None or _asset_class(asset) == "stock":
-        outputs.append(await fundamental.run(asset, ratios))
+        outputs.append(await fundamental.run(asset, ratios, context=_ctx))
     if macro_data is not None:
-        outputs.append(await macro_agent.run(macro_data))
+        outputs.append(await macro_agent.run(macro_data, context=_ctx))
 
     risk_out = None
     if risk_context is not None:
@@ -124,7 +139,7 @@ async def generate_signal(
     # 2. Arbitrage Master (pondération dynamique + apprentissage + autorité du playbook)
     decision = master.decide(
         outputs, weights=weights, journal_multipliers=journal_multipliers, risk_output=risk_out,
-        playbook_gate=settings.playbook_veto,
+        playbook_gate=settings.playbook_veto and include_playbook,
     )
 
     entry = candles[-1].close

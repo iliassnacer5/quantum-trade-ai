@@ -33,9 +33,11 @@ async def playbook_backtest_report(
 ) -> dict:
     """Dernier backtest de la STRATÉGIE du desk : classement des paires + conclusion rédigée.
 
-    Deux passes complémentaires : une passe PORTÉE (déclencheur évalué en 1 h, toute la profondeur
-    disponible) et une passe FIDÉLITÉ (le vrai déclencheur 15 min, sur les ~80 jours réellement
-    disponibles). Les limites de données sont exposées telles quelles dans `data_limits`.
+    Trois passes complémentaires : une passe LONGUE (5 ans, échelle swing — contexte mensuel et
+    hebdomadaire, entrée journalière), une passe PORTÉE (le réglage de production, déclencheur
+    évalué en 1 h sur ~2 ans) et une passe FIDÉLITÉ (le vrai déclencheur 15 min, sur les ~60 jours
+    réellement disponibles). Les limites de données sont exposées telles quelles dans `data_limits`,
+    et la FRÉQUENCE d'opportunité par symbole dans `frequency`.
     """
     from app.backtest import playbook_backtest as pbt
 
@@ -45,7 +47,7 @@ async def playbook_backtest_report(
         return {"available": False, "run_state": state,
                 "note": ("Backtest en cours…" if state["running"]
                          else "Aucun backtest de la stratégie n'a encore été exécuté."),
-                "universe": pbt.DEFAULT_UNIVERSE}
+                "universe": pbt.full_universe()}
     return {"available": True, "run_state": state, **rec}
 
 
@@ -79,6 +81,96 @@ async def playbook_backtest_run(
     return {"started": True, "run_state": pbt.run_state(),
             "note": ("Backtest lancé en arrière-plan (une dizaine de minutes). "
                      "Cette page se met à jour toute seule.")}
+
+
+@router.get("/playbook/markets")
+async def playbook_markets(
+    _user: User = Depends(current_user),
+) -> dict:
+    """Les marchés backtestables et leurs instruments — ce que l'interface propose dans ses menus.
+
+    C'est la MÊME liste que celle du backtest complet : on ne veut pas pouvoir lancer depuis la page
+    un backtest sur un symbole que le passage hebdomadaire ne couvre pas, les deux chiffres
+    deviendraient incomparables.
+    """
+    from app.backtest import playbook_backtest as pbt
+
+    return {
+        "markets": [
+            {"market": cls, "label": pbt.MARKET_LABELS.get(cls, cls),
+             "symbols": syms, "count": len(syms)}
+            for cls, syms in pbt.MARKET_UNIVERSES.items()
+        ],
+        "entry_timeframes": [
+            {"tf": "1h", "label": "1 h — profondeur maximale (~2 ans)",
+             "note": "la passe qui donne le recul statistique"},
+            {"tf": "15m", "label": "15 min — le vrai déclencheur (~60 jours)",
+             "note": "l'unité d'entrée réelle, mais sur un historique court"},
+        ],
+    }
+
+
+@router.get("/playbook/symbol")
+async def playbook_symbol_report(
+    symbol: str,
+    entry_tf: str = "1h",
+    _user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """Dernier backtest de la stratégie du desk sur UN symbole (avec son état d'exécution)."""
+    from app.backtest import playbook_backtest as pbt
+
+    state = pbt.symbol_run_state(symbol, entry_tf)
+    rec = pbt.symbol_report(store, symbol, entry_tf)
+    if not rec:
+        return {"available": False, "symbol": symbol, "entry_timeframe": entry_tf,
+                "run_state": state,
+                "note": ("Backtest en cours…" if state["running"]
+                         else f"{symbol} n'a pas encore été backtesté en {entry_tf}.")}
+    return {"available": True, "run_state": state, **rec}
+
+
+@router.post("/playbook/symbol/run")
+async def playbook_symbol_run(
+    symbol: str,
+    entry_tf: str = "1h",
+    step: int = 4,
+    _user: User = Depends(require_feature("backtesting")),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """LANCE le backtest de la stratégie sur UN symbole, en arrière-plan.
+
+    Même code, mêmes réglages et même walk-forward strict que le backtest complet — restreints à un
+    seul instrument. Le résultat se récupère via `GET /api/backtest/playbook/symbol`.
+
+    `entry_tf` : « 1h » (profondeur maximale, ~2 ans) ou « 15m » (le vrai déclencheur, ~60 jours).
+    `step` : pas d'évaluation en bougies. Plus il est petit, plus la mesure est fine et lente.
+    """
+    import asyncio
+
+    from app.backtest import playbook_backtest as pbt
+    from app.data import symbols as symbols_catalog
+
+    symbol = symbols_catalog.normalize(symbol)
+    if entry_tf not in ("1h", "15m", "4h", "1d"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            f"unité d'entrée « {entry_tf} » non supportée (1h, 15m, 4h ou 1d)")
+    state = pbt.symbol_run_state(symbol, entry_tf)
+    if state["running"]:
+        return {"started": False, "symbol": symbol, "run_state": state,
+                "note": f"Un backtest de {symbol} en {entry_tf} est déjà en cours."}
+
+    async def _job() -> None:
+        try:
+            await pbt.run_symbol_job(store, symbol, entry_tf=entry_tf, step=max(1, step))
+        except Exception as exc:  # noqa: BLE001 — une tâche de fond ne fait jamais tomber l'API
+            logger.exception("Backtest %s (%s) échoué (%s)", symbol, entry_tf, exc)
+
+    asyncio.create_task(_job())
+    return {"started": True, "symbol": symbol, "entry_timeframe": entry_tf,
+            "run_state": pbt.symbol_run_state(symbol, entry_tf),
+            "note": ("Backtest lancé en arrière-plan. Le résultat arrive dans "
+                     "GET /api/backtest/playbook/symbol — la page se met à jour toute seule.")}
 
 
 @router.get("/playbook/verdicts")
@@ -139,6 +231,64 @@ async def playbook_volatility_ab_run(
     asyncio.create_task(_job())
     return {"started": True, "run_state": pbt.run_state(),
             "note": "A/B volatilité lancé (3 passes ≈ 30 min). Résultat via GET /playbook/volatility-ab."}
+
+
+@router.get("/playbook/volume-ab")
+async def playbook_volume_ab_report(
+    _user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """A/B des LEVIERS DE VOLUME : ce que chaque assouplissement rapporte en trades et coûte en R.
+
+    Répond à « comment avoir plus de trades » par la mesure. Chaque variante desserre UN verrou
+    (seuil de confluence, déclencheur divergence, taille d'objectif, bande de R/R, netteté de
+    tendance) et une dernière les desserre tous, pour donner la borne haute et son prix. Le
+    classement se lit sur le GAIN TOTAL en R : plus de trades ne vaut que si le total monte.
+    """
+    from app.backtest import playbook_backtest as pbt
+
+    rec = store.records.get(pbt.VOLUME_AB_COLLECTION, pbt.LATEST)
+    if not rec:
+        return {"available": False, "run_state": pbt.run_state(),
+                "variants": {k: v for k, v in pbt.VOLUME_VARIANTS.items()},
+                "note": ("A/B volume jamais exécuté — lance-le via POST /playbook/volume-ab/run. "
+                         "Le levier qui ne coûte rien (élargir l'univers balayé) est chiffré, lui, "
+                         "dans la section `frequency` du backtest.")}
+    return {"available": True, "run_state": pbt.run_state(), **rec}
+
+
+@router.post("/playbook/volume-ab/run")
+async def playbook_volume_ab_run(
+    _user: User = Depends(require_feature("backtesting")),
+    store: AppStore = Depends(store_dep),
+    universe: str | None = None,
+    step: int = 4,
+) -> dict:
+    """LANCE l'A/B des leviers de volume en arrière-plan (8 passes — compter plusieurs heures).
+
+    `universe` : liste de symboles séparés par des virgules pour restreindre la mesure (recommandé,
+    sinon huit passes sur tout le catalogue). `step` : pas d'évaluation en bougies 1 h.
+    """
+    import asyncio
+
+    from app.backtest import playbook_backtest as pbt
+
+    state = pbt.run_state()
+    if state["running"]:
+        return {"started": False, "run_state": state,
+                "note": "Un backtest est déjà en cours — attendre qu'il se termine."}
+    syms = [s.strip().upper() for s in universe.split(",") if s.strip()] if universe else None
+
+    async def _job() -> None:
+        try:
+            await pbt.run_volume_ab(store, universe=syms, step=max(1, step))
+        except Exception as exc:  # noqa: BLE001 — une tâche de fond ne doit jamais faire tomber l'API
+            logger.exception("A/B volume échoué (%s)", exc)
+
+    asyncio.create_task(_job())
+    return {"started": True, "run_state": pbt.run_state(),
+            "variants": list(pbt.VOLUME_VARIANTS),
+            "note": "A/B volume lancé. Résultat via GET /api/backtest/playbook/volume-ab."}
 
 
 async def _load_history(symbol: str, timeframe: str, limit: int = 500) -> list[Candle]:

@@ -39,12 +39,24 @@ def _range_for(interval: str, limit: int) -> str:
 # Métaux précieux -> futures COMEX Yahoo (réels, AVEC volume, sans clé).
 _COMMODITY_MAP = {"XAU/USD": "GC=F", "XAG/USD": "SI=F", "XPT/USD": "PL=F", "XPD/USD": "PA=F"}
 
+# Indices boursiers : on expose les noms lisibles des brokers CFD, Yahoo veut ses propres tickers.
+_INDEX_MAP = {
+    "SPX500": "^GSPC", "NAS100": "^NDX", "US30": "^DJI",
+    "GER40": "^GDAXI", "UK100": "^FTSE", "FRA40": "^FCHI", "EU50": "^STOXX50E",
+    "JPN225": "^N225", "HK50": "^HSI", "AUS200": "^AXJO",
+}
+
 
 def to_yahoo_symbol(symbol: str) -> str:
-    """Convertit un symbole interne en symbole Yahoo (forex -> 'EURUSD=X', or -> 'GC=F', action -> ticker)."""
+    """Convertit un symbole interne en symbole Yahoo.
+
+    Forex -> 'EURUSD=X', or -> 'GC=F', indice -> '^GSPC', action -> son ticker tel quel.
+    """
     s = symbol.upper()
     if s in _COMMODITY_MAP:
         return _COMMODITY_MAP[s]
+    if s in _INDEX_MAP:
+        return _INDEX_MAP[s]
     if "/" in s:  # forex (les paires crypto passent par Binance, pas ici)
         base, quote = s.split("/", 1)
         return f"{base}{quote}=X"
@@ -55,9 +67,13 @@ async def fetch_ohlcv(symbol: str, interval: str = "1h", limit: int = 200) -> li
     """Retourne [{time, open, high, low, close, volume}] (time = UNIX secondes). Lève si indispo."""
     import httpx
 
+    from app.data.markets import _timeout
+
     ysym = to_yahoo_symbol(symbol)
     params = {"interval": _INTERVAL.get(interval, "1h"), "range": _range_for(interval, limit)}
-    async with httpx.AsyncClient(timeout=12, headers=_HEADERS) as client:
+    # Délai de CONNEXION court (cf. `markets._timeout`) : mesuré, tous les échecs Yahoo observés
+    # étaient des `ConnectTimeout` à 12 s — du temps mort pur, jamais une réponse lente.
+    async with httpx.AsyncClient(timeout=_timeout(limit), headers=_HEADERS) as client:
         resp = await client.get(_CHART_URL.format(symbol=ysym), params=params)
         resp.raise_for_status()
         data = resp.json()

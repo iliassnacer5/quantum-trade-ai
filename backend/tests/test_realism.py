@@ -12,7 +12,7 @@ from app.backtest.schemas import BacktestConfig
 from app.core.config import get_settings
 from app.domain.indicators import Candle
 from app.main import app
-from app.strategies import get_strategy
+from app.models.signal import Direction
 
 
 def _uptrend(n: int = 250) -> list[Candle]:
@@ -24,6 +24,18 @@ def _uptrend(n: int = 250) -> list[Candle]:
     return out
 
 
+def _always_long(candles: list[Candle]) -> Direction:
+    """Stratégie d'essai minimale — elle n'existe que pour exercer le MOTEUR de backtest.
+
+    Le desk n'a qu'une stratégie (le playbook) ; ces tests-ci portent sur la mécanique du moteur
+    (frais, glissement, sorties étagées), pas sur la qualité d'un signal. Une règle triviale et
+    prévisible est donc exactement ce qu'il faut : elle isole ce qui est réellement testé.
+    """
+    if len(candles) < 60:
+        return Direction.HOLD
+    return Direction.BUY if candles[-1].close > candles[-20].close else Direction.HOLD
+
+
 def _cfg(candles):
     return BacktestConfig(symbol="BTC/USDT", timeframe="1h",
                           start_time=candles[0].timestamp, end_time=candles[-1].timestamp, initial_capital=10000)
@@ -31,7 +43,7 @@ def _cfg(candles):
 
 async def test_fees_reduce_pnl_and_report_has_benchmark():
     candles = _uptrend()
-    strat = get_strategy("ichimoku").fn
+    strat = _always_long
     s = get_settings()
     s.backtest_fee_pct, s.backtest_slippage_pct = 0.0, 0.0
     free = await run_backtest(_cfg(candles), candles, strategy=strat)
@@ -54,7 +66,7 @@ async def test_exit_config_staged_tp_partial_close():
     quel que soit le R/R visé — y compris dans la bande resserrée 1,2–1,3 de la stratégie.
     """
     candles = _uptrend(300)
-    strat = get_strategy("mtf_ema").fn
+    strat = _always_long
     plain = await run_backtest(_cfg(candles), candles, strategy=strat,
                                exit_config={"trailing": False, "breakeven_r": 0.0, "staged_tp": False})
     staged = await run_backtest(_cfg(candles), candles, strategy=strat,
@@ -65,21 +77,37 @@ async def test_exit_config_staged_tp_partial_close():
     assert partials, "au moins une sortie partielle attendue en tendance haussière"
 
 
-def test_regime_router_strategy():
-    """Le routeur de régime renvoie une direction valide et suit la tendance quand ADX est fort."""
-    from app.models.signal import Direction as D
-    r = get_strategy("regime_router")
-    assert r is not None
-    d = r.fn(_uptrend(150))
-    assert d in (D.BUY, D.SELL, D.HOLD)
+def test_the_project_knows_only_the_desk_strategy():
+    """La bibliothèque de stratégies a été retirée : le projet n'en connaît plus qu'une.
+
+    On vérifie la SOURCE plutôt que l'importabilité : une image Docker construite avant la
+    suppression garde une copie figée du paquet, ce qui rendrait un test d'import trompeur.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "app"
+    assert not (root / "strategies").exists(), "le paquet de stratégies devrait avoir disparu"
+    assert not (root / "api" / "strategies.py").exists()
+
+    offenders = [
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.py")
+        if "app.strategies" in path.read_text(encoding="utf-8")
+    ]
+    assert not offenders, f"ces modules dépendent encore de la bibliothèque supprimée : {offenders}"
+
+    client = TestClient(app)
+    h = _pro(client)
+    assert client.get("/api/strategies", headers=h).status_code == 404
 
 
 def test_auto_trade_toggle_endpoint():
+    """Le forward test automatique reste pilotable — il suit désormais la stratégie du desk."""
     client = TestClient(app)
     h = _pro(client)
-    assert client.post("/api/strategies/auto-trade?enabled=true", headers=h).json()["auto_trade"] is True
-    assert client.get("/api/strategies/auto-trade", headers=h).json()["auto_trade"] is True
-    assert client.post("/api/strategies/auto-trade?enabled=false", headers=h).json()["auto_trade"] is False
+    assert client.post("/api/agents/auto-trade?enabled=true", headers=h).json()["auto_trade"] is True
+    assert client.get("/api/agents/auto-trade", headers=h).json()["auto_trade"] is True
+    assert client.post("/api/agents/auto-trade?enabled=false", headers=h).json()["auto_trade"] is False
 
 
 # ---------------- Garde-fou portefeuille ----------------
@@ -105,27 +133,61 @@ def test_portfolio_guard_limits_positions():
         assert r2.status_code == 400 and "positions" in r2.json()["detail"].lower()
     finally:
         s.paper_portfolio_guard = False
-        s.paper_max_positions = 5
+        s.paper_max_positions = 0   # 0 = aucun plafond de nombre (réglage par défaut depuis le 28/07/2026)
 
 
-# ---------------- Alertes stratégie ----------------
-async def test_strategy_alert_fires_on_new_signal(monkeypatch):
+def test_zero_means_no_position_count_cap():
+    """Décision explicite du 28/07/2026 : `paper_max_positions = 0` retire le plafond de NOMBRE.
+
+    Ce qui protège encore le capital est le plafond d'EXPOSITION EN RISQUE (`paper_max_exposure_pct`)
+    juste en dessous — compter les positions une par une n'avait pas de sens : cinq positions à
+    0,2 % de risque chacune pèsent moins qu'une seule à 10 %.
+    """
+    from app.core.config import get_settings
+
+    s = get_settings()
+    assert s.paper_max_positions == 0, "le réglage par défaut doit rester « aucun plafond »"
+    s.paper_portfolio_guard = True
+    s.paper_max_positions = 0
+    try:
+        client = TestClient(app)
+        h = _pro(client)
+        cid = client.post("/api/execution/brokers", json={"broker": "paper", "mode": "paper"}, headers=h).json()["id"]
+        body = {"conn_id": cid, "symbol": "BTC/USDT", "side": "buy", "qty": 0.001}
+        # Six ouvertures d'affilée : aucune n'est refusée pour une histoire de NOMBRE de positions.
+        for _ in range(6):
+            r = client.post("/api/execution/orders", json=body, headers=h)
+            assert r.status_code == 201, r.json()
+    finally:
+        s.paper_portfolio_guard = False
+
+
+# ---------------- Alertes de la stratégie du desk ----------------
+async def test_strategy_alert_fires_on_a_new_playbook_signal(monkeypatch):
+    """L'alerte suit LA stratégie du desk et annonce SES niveaux, pas un calcul parallèle."""
     from app.data import markets
+    from app.domain.playbook import PlaybookSetup
     from app.repositories.store import get_store
-    from app.services import strategy_alert_service as sas
+    from app.services import playbook_service, strategy_alert_service as sas
 
     client = TestClient(app)
     h = _pro(client)
-    client.post("/api/strategies/select?strategy=ichimoku", headers=h)
 
-    candles = _uptrend()  # tendance haussière -> ichimoku renvoie BUY
-    async def _load(symbol, interval="1h", limit=200):  # noqa: ANN001
-        return candles
-    monkeypatch.setattr(markets, "load_candles", _load)
+    setup = PlaybookSetup(
+        symbol="EUR/USD", direction="BUY", ready=True, entry=1.1000, stop_loss=1.0950,
+        take_profit_1=1.1120, risk_reward=2.4, trigger="cassure — confirmée par le volume",
+    )
+
+    async def _build(symbol, *, now=None):  # noqa: ANN001
+        return setup
+
+    monkeypatch.setattr(playbook_service, "build_setup", _build)
     monkeypatch.setattr(markets, "is_real", lambda s: True)
     sent_msgs = []
+
     async def _push(token, msg):  # noqa: ANN001
         sent_msgs.append(msg)
+
     monkeypatch.setattr(sas.notifier, "send_push", _push)
 
     store = get_store()
@@ -137,3 +199,5 @@ async def test_strategy_alert_fires_on_new_signal(monkeypatch):
     second = await sas.check_strategy_alerts(store)
     assert first >= 1
     assert second == 0
+    # Le message porte les niveaux DU PLAYBOOK et son déclencheur.
+    assert any("Playbook" in m and "1.095" in m and "cassure" in m for m in sent_msgs)

@@ -3,6 +3,7 @@ import {
   LayoutDashboard,
   Radar,
   Star,
+  Brain,
   Map,
   Layers,
   History,
@@ -36,6 +37,10 @@ export const NAV_GROUPS: NavGroup[] = [
       { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
       { href: '/scanner', label: 'Scanner', icon: Radar },
       { href: '/daily', label: 'Trades du jour', icon: Star, accent: true },
+      // Volontairement à côté des « Trades du jour » : les deux se lisent ensemble, mais répondent
+      // à des questions différentes (la méthode dit « trade ou pas », l'analyse dit « ce que je
+      // pense du marché »).
+      { href: '/analyse', label: 'Analyse du jour', icon: Brain },
     ],
   },
   {

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from pydantic import BaseModel
@@ -69,41 +71,36 @@ async def daily_picks(
     user: User = Depends(require_feature("backtesting")),
     store: AppStore = Depends(store_dep),
 ) -> dict:
-    """Sélection du jour par marché (graduée, mise en cache par timeframe).
+    """Sélection du jour par marché (graduée, servie depuis un instantané précalculé).
 
     `timeframe` : 15m | 1h | 4h | 1d | 1w | 1M (ou les libellés 15min/1h/4h/1d/1week/1month).
     Les unités plus longues (4h, 1d) filtrent le bruit -> signaux généralement plus fiables.
+
+    **Réponse immédiate** : cette route ne calcule plus rien en temps normal. Une boucle de fond
+    (`scheduler.daily_picks_loop`) précalcule les six unités de temps, exactement comme
+    `live_snapshot` le fait pour les trades du jour. Avant ce changement, chaque première visite
+    d'une unité de temps lançait jusqu'à 32 backtests complets DANS la requête. Chaque réponse porte
+    son âge (`age_seconds`, `stale`) ; `refresh=true` force un recalcul synchrone.
     """
-    from datetime import UTC, datetime
+    from app.services import daily_picks_cache
 
     tf = _DAILY_TF.get(timeframe, timeframe)
-    today = datetime.now(UTC).date().isoformat()
-    # Le 1h garde la clé historique (compat digest) ; les autres TF ont leur propre cache.
-    key = today if tf == "1h" else f"{today}:{tf}"
-    cached = store.records.get("daily_picks", key)
-    if cached and not refresh:
-        return cached
-    picks = await signal_service.daily_picks(timeframe=tf)
-    return store.records.put(
-        "daily_picks", key,
-        {"date": today, "timeframe": tf, "picks": picks, "generated_at": datetime.now(UTC).isoformat()},
-    )
+    return await daily_picks_cache.get(store, tf, force=refresh)
 
 
 @router.get("/top-trades")
 async def top_trades(
     refresh: bool = False,
-    count: int = 5,
+    count: int = 0,
     user: User = Depends(current_user),
     store: AppStore = Depends(store_dep),
 ) -> dict:
     """LES trades du jour, produits par la STRATÉGIE du desk (playbook multi-unités de temps).
 
-    Cascade : Mensuel + Journalier (tendance de fond + supports/résistances majeurs) → Journalier
-    détaillé (RSI14, MA20/MA50, volume, tendance VWAP, divergences RSI/MACD, Fibonacci en cas de
-    correction) → 4 h (mêmes facteurs) → **entrée en 15 min uniquement**. Le stop vient de la
-    structure 15 min, l'objectif est borné par le prochain niveau 1 h, le R/R tient dans la bande
-    1:1,2 – 1:1,3.
+    Trois étapes, appliquées à tous les marchés : la tendance est mesurée par six indicateurs sur
+    D1/4h/1h/15min puis FIGÉE ; l'entrée en 15 min n'est autorisée que si au moins trois
+    confirmations pondérées se rejoignent ; le stop est posé sur le niveau qui invaliderait le
+    scénario et les objectifs devant le premier obstacle réel, avec un R/R entre 1:2 et 1:3.
 
     **Réponse immédiate** : cette route ne calcule rien, elle sert l'instantané produit en continu
     par la boucle de fond (cf. `services.live_snapshot`). C'est ce qui permet à la page de se
@@ -113,8 +110,12 @@ async def top_trades(
     Chaque setup est étiqueté `ready` (déclencheur 15 min actif, exécutable) ou `armed` (contexte
     validé) — les setups armés sont ouverts AUTOMATIQUEMENT en compte démo dès que le déclencheur
     15 min se forme, sans aucune action de l'utilisateur.
+
+    `count=0` (défaut) rend TOUS les setups conformes, sans plafond : la stratégie ne dit pas « les
+    cinq meilleurs », elle dit « ceux qui remplissent les trois étapes ». `count>0` n'extrait que
+    les N premiers du classement.
     """
-    return await live_snapshot.get(store, count=max(1, min(count, 10)), force=refresh)
+    return await live_snapshot.get(store, count=max(0, count), force=refresh)
 
 
 @router.get("/auto-entry")
@@ -141,11 +142,23 @@ async def auto_entry_status(
         "enabled": auto_entry_service.enabled(),
         "mode": "paper",
         "interval_seconds": s.playbook_auto_entry_interval,
+        "cooldown_min": s.playbook_auto_entry_cooldown_min,
+        # Ce qui pourrait encore refuser une entrée dont le déclencheur s'est formé. Affiché parce
+        # qu'un refus silencieux est exactement ce qui a fait croire à une panne.
+        "pair_gating": s.playbook_pair_gating,
         "watching": watching,
+        "ready_now": [w["symbol"] for w in watching if w["tier"] == "ready"],
         "recent": auto_entry_service.recent_events(store, user.tenant_id),
+        # Setups marqués EXÉCUTABLES à l'écran mais refusés au dernier passage de veille pour CE
+        # compte (garde-fou de portefeuille, corrélation, anti-doublon…) — sans ce champ, un refus
+        # légitime est indiscernable d'une panne du robot.
+        "blocked": auto_entry_service.blocked_for(store, user.tenant_id),
         "note": (
             "Les setups armés sont ouverts automatiquement en COMPTE DÉMO dès que le déclencheur "
             "15 min se forme. Aucun clic, aucun argent réel."
+            + ("" if s.playbook_pair_gating else
+               f" Aucun filtre de verdict ne s'y oppose : tout déclencheur formé part, sauf "
+               f"doublon dans les {s.playbook_auto_entry_cooldown_min} dernières minutes.")
             if auto_entry_service.enabled()
             else "Auto-entrée désactivée : les setups armés attendent une ouverture manuelle."
         ),
@@ -161,6 +174,33 @@ async def auto_entry_run(
     from app.services import auto_entry_service
 
     return await auto_entry_service.run_auto_entry(store)
+
+
+@router.post("/auto-entry/reset")
+async def auto_entry_reset(
+    close_positions: bool = True,
+    relaunch: bool = True,
+    user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """REMET L'AUTO-ENTRÉE À ZÉRO : positions démo en cours neutralisées + traces effacées.
+
+    N'affecte QUE le compte démo de l'utilisateur : la boucle d'auto-entrée ne connaît pas d'autre
+    mode, et le reset ne regarde que les ordres `paper`. Les trades déjà clôturés sont conservés —
+    ce sont eux qui portent la mesure, les effacer reviendrait à ne plus rien savoir.
+
+    Les positions rouvertes ne sont pas comptées gagnantes ou perdantes mais `reset` : elles n'ont
+    pas été jouées jusqu'au bout, leur donner une issue serait inventer un résultat.
+
+    `relaunch=true` (défaut) enchaîne aussitôt sur un passage de veille, pour que la remise à zéro
+    ne laisse pas le desk inactif jusqu'au prochain tour de boucle.
+    """
+    from app.services import auto_entry_service
+
+    out = auto_entry_service.reset(store, user.tenant_id, close_positions=close_positions)
+    if relaunch:
+        out["run"] = await auto_entry_service.run_auto_entry(store)
+    return out
 
 
 @router.get("/playbook/{symbol:path}")
@@ -204,10 +244,15 @@ async def scan(
     user: User = Depends(current_user),
     store: AppStore = Depends(store_dep),
 ) -> dict:
-    """Scanner de marché : classe les symboles par conviction (flag haute-conviction ADX>25).
+    """Scanner de marché — c'est LA STRATÉGIE DU DESK qui a le dernier mot sur chaque ligne.
+
+    Chaque symbole porte le verdict de la stratégie (`ready` / `armed` / refusé), ses métriques
+    (score de tendance, confirmations réunies et leur poids, R/R, niveaux) et surtout `why` :
+    comment la tendance a été établie, quelles confirmations se sont réunies, et — quand il n'y a
+    pas de trade — ce qui a bloqué. Un symbole que la stratégie refuse ne peut pas s'afficher en
+    BUY : le scanner, les trades du jour et l'analyse détaillée lisent le même calcul.
 
     `session` (asian|london|newyork) restreint l'univers aux paires liquides de cette session.
-    Le scanner utilise TON contexte (exposition + apprentissage) -> ★ identique à ton analyse.
     """
     universe = None
     if session:
@@ -215,15 +260,27 @@ async def scan(
         universe = sessions_mod.session_universe(session)
         if asset_class:
             universe = [u for u in universe if u["asset_class"] == asset_class]
+    # Plafond relevé à 100 : la stratégie balaie désormais tout le catalogue, et un scanner qui n'en
+    # montre que 40 afficherait « non balayé » sur des symboles qu'elle a bel et bien analysés.
     results = await signal_service.scan_market(
-        asset_class=asset_class, timeframe=timeframe, limit=min(limit, 40),
+        asset_class=asset_class, timeframe=timeframe, limit=min(limit, 100),
         high_conviction_only=high_conviction_only, symbols=universe,
         confirm_mtf=True,  # consolidation = même décision (et même contexte) que ton analyse
         user=user, store=store,
     )
+    tiers = Counter(r.get("playbook_tier") or "non balayé" for r in results)
     return {
         "count": len(results),
         "high_conviction": sum(1 for r in results if r["high_conviction"]),
+        # Ce que LA STRATÉGIE a conclu sur l'univers scanné, en une ligne.
+        "ready": tiers.get("ready", 0),
+        "armed": tiers.get("armed", 0),
+        "refused": sum(v for k, v in tiers.items() if k not in ("ready", "armed", "non balayé")),
+        "not_scanned": tiers.get("non balayé", 0),
+        "strategy": (
+            "Playbook — tendance multi-indicateurs figée (D1/4h/1h/15min) → entrée par confluence "
+            "pondérée (≥ 3 confirmations dont une forte) → stop et objectifs posés sur des niveaux"
+        ),
         "results": results,
     }
 

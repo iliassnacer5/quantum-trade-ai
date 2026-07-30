@@ -115,6 +115,114 @@ def test_journal_lifecycle(monkeypatch):
     assert exp.status_code == 200 and len(exp.json()["explanation"]) > 0
 
 
+# ---------------- Journal : trades PLAYBOOK réunis avec les signaux (28/07/2026) ----------------
+def _open_playbook_order(store, tenant_id: str, *, symbol="GOOGL", side="buy"):
+    import asyncio
+
+    from app.services import execution_service
+
+    conn_id = execution_service.ensure_paper_connection(store, tenant_id)
+    return asyncio.run(
+        execution_service.place_order(
+            store, tenant_id, conn_id=conn_id, symbol=symbol, side=side, qty=1.0,
+            stop_loss=95.0, take_profit=110.0,
+        )
+    )
+
+
+def test_journal_shows_playbook_trades_not_just_signals(monkeypatch):
+    """LE bug rapporté : un compte avec des positions démo (auto-entrée / « Ouvrir en démo »)
+    voyait le Journal afficher zéro partout, alors que ces trades sont bien réels — ils vivaient
+    juste dans un flux distinct (`execution_service`) que le Journal ne lisait jamais."""
+    from app.data import markets
+    from app.domain.indicators import Candle
+    from app.repositories.store import get_store
+    from app.services import journal_service
+
+    async def _flat(symbol, interval="1h", limit=200):  # noqa: ANN001
+        return [Candle(100.0, 100.0, 100.0, 100.0, 1000.0)] * 60
+
+    monkeypatch.setattr(markets, "load_candles", _flat)
+
+    client = TestClient(app)
+    h = _register(client)
+    _upgrade(client, h, "pro")
+    store = get_store()
+    user = store.users.list_all()[-1]   # le compte qu'on vient d'enregistrer
+    _open_playbook_order(store, user.tenant_id)
+
+    # Bout en bout, par l'API que la page appelle réellement.
+    entries = client.get("/api/journal", headers=h).json()
+    assert any(e.get("source") == "playbook" for e in entries), entries
+    ins = client.get("/api/journal/insights", headers=h).json()
+    assert ins["stats"]["open"] >= 1
+
+    # Détail au niveau service.
+    playbook_rows = journal_service.playbook_entries(store, user.tenant_id)
+    assert len(playbook_rows) == 1
+    assert playbook_rows[0]["source"] == "playbook"
+    assert playbook_rows[0]["direction"] == "BUY"
+    assert playbook_rows[0]["outcome"] == "open"
+
+
+def test_playbook_entries_exclude_neutral_outcomes(monkeypatch):
+    """Une position `reset` ou `invalid` n'a jamais été jouée jusqu'au bout : elle ne doit ni
+    gonfler le compteur « ouverts » ni fausser le taux de réussite du Journal."""
+    from app.data import markets
+    from app.domain.indicators import Candle
+    from app.repositories.store import get_store
+    from app.services import execution_service, journal_service
+
+    async def _flat(symbol, interval="1h", limit=200):  # noqa: ANN001
+        return [Candle(100.0, 100.0, 100.0, 100.0, 1000.0)] * 60
+
+    monkeypatch.setattr(markets, "load_candles", _flat)
+
+    store = get_store()
+    client = TestClient(app)
+    h = _register(client)
+    _upgrade(client, h, "pro")
+    user = store.users.list_all()[-1]
+    order = _open_playbook_order(store, user.tenant_id)
+    store.records.put(execution_service.ORDER, order["id"],
+                      {**order, "outcome": "reset"}, tenant_id=user.tenant_id)
+
+    rows = journal_service.playbook_entries(store, user.tenant_id)
+    assert rows == []
+
+
+def test_reliability_falls_back_to_training_when_only_playbook_trades_exist(monkeypatch):
+    """Sans signal classique mais avec un entraînement nocturne déjà passé, la fiabilité par
+    agent doit venir de LÀ plutôt que d'afficher un « pas assez de trades » trompeur."""
+    from app.data import markets
+    from app.domain.indicators import Candle
+    from app.repositories.store import get_store
+    from app.services import training_service
+
+    async def _flat(symbol, interval="1h", limit=200):  # noqa: ANN001
+        return [Candle(100.0, 100.0, 100.0, 100.0, 1000.0)] * 60
+
+    monkeypatch.setattr(markets, "load_candles", _flat)
+    training_service._STATE = {
+        "trades": 42,
+        "factor_competence": {"ma": {"observations": 12, "accuracy": 66.7}},
+    }
+    try:
+        client = TestClient(app)
+        h = _register(client)
+        _upgrade(client, h, "pro")
+        store = get_store()
+        user = store.users.list_all()[-1]
+        _open_playbook_order(store, user.tenant_id)
+
+        ins = client.get("/api/journal/insights", headers=h).json()
+        assert ins["reliability_source"] == "training"
+        assert ins["reliability"][0]["agent"] == "ma"
+        assert ins["trades_learned"] == 42
+    finally:
+        training_service._STATE = {}
+
+
 def test_journal_stats_helper():
     entries = [
         {"outcome": "win", "pnl": 100},

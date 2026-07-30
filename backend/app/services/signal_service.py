@@ -96,19 +96,21 @@ def learning_multipliers(store: AppStore | None, tenant_id: str | None, market: 
 async def daily_top_trades(count: int | None = None, *, now=None) -> dict:
     """LES trades du jour, produits par la STRATÉGIE du desk (playbook).
 
-    Cascade appliquée à chaque symbole : Mensuel + Journalier (tendance de fond + niveaux majeurs)
-    → Journalier détaillé (RSI14, MA20/MA50, volume, VWAP, divergences RSI/MACD, Fibonacci si
-    correction) → 4 h (mêmes facteurs) → entrée 15 min UNIQUEMENT, avec R/R ≥ 1:2 et objectif
-    ≥ 100 pips. L'univers scanné privilégie le chevauchement Londres/New York.
+    Méthode appliquée à chaque symbole, tous marchés confondus : tendance mesurée par six
+    indicateurs sur D1/4h/1h/15min puis FIGÉE — l'accord du 4 h et du 1 h suffit à la valider, le
+    journalier pèse dans le score sans être obligatoire → entrée 15 min autorisée par au moins
+    trois confirmations pondérées → stop et objectifs posés sur les niveaux qui les justifient,
+    avec un R/R entre 1:2 et 1:3 et un objectif d'au moins 50 pips.
 
-    Retourne au plus `count` setups, chacun étiqueté `ready` (exécutable) ou `armed` (contexte
-    validé, en attente du déclencheur 15 min). Aucun remplissage artificiel : s'il n'y a pas
-    5 setups conformes, on le dit.
+    Retourne TOUS les setups conformes (aucun plafond par défaut), chacun étiqueté `ready`
+    (exécutable) ou `armed` (contexte validé, en attente du déclencheur 15 min). Aucun remplissage
+    artificiel dans un sens comme dans l'autre : ni trade inventé pour atteindre un quota, ni trade
+    conforme supprimé parce qu'il arrivait 6e.
     """
     from app.core.config import get_settings
     from app.services import playbook_service
 
-    n = count or get_settings().daily_top_trades_count
+    n = get_settings().daily_top_trades_count if count is None else count
     return await playbook_service.top_trades(n, now=now)
 
 
@@ -120,33 +122,70 @@ async def daily_picks(
     """Sélection quotidienne GRADUÉE par marché — toujours utile sans jamais mentir.
 
     Deux niveaux de fiabilité :
-    - ``confirmed`` : ★ haute-conviction (ADX>25) ET backtest fiable (réussite>55 %, PF>1,3, ≥5 trades).
+    - ``confirmed`` : ★ setup COMPLET de la stratégie du desk ET backtest fiable (réussite > 55 %,
+      profit factor > 1,3, au moins 5 trades).
     - ``watch``     : meilleurs setups directionnels du moment, à surveiller mais NON confirmés.
 
     On privilégie les ``confirmed`` ; s'il n'y en a pas assez, on complète avec des ``watch`` clairement
     étiquetés. Mieux vaut proposer les meilleures opportunités honnêtement qualifiées qu'une page vide.
+
+    PERFORMANCE (30/07/2026) : les classes d'actifs et les backtests de chaque classe sont désormais
+    évalués EN PARALLÈLE, avec le même sémaphore que le reste du projet
+    (`playbook_max_parallel`). L'ancienne version enchaînait 4 scans puis jusqu'à 4 × 8 = 32
+    backtests complets **les uns après les autres**, dans la requête HTTP — c'est ce qui rendait la
+    page « Trades du jour » interminable au premier affichage de chaque unité de temps. Le
+    parallélisme est BORNÉ volontairement : au-delà, les fournisseurs de données limitent le débit
+    (mesuré : 12 connexions simultanées font échouer les 6 chargements, cf. `markets._cascade`).
     """
-    out: list[dict] = []
-    for cls in classes:
+    import asyncio
+
+    from app.core.config import get_settings
+
+    sem = asyncio.Semaphore(max(1, get_settings().playbook_max_parallel))
+
+    async def _evaluate(cand: dict, cls: str) -> dict:
+        """Backtest d'UN candidat + mise en forme. Sous sémaphore : le coût réseau reste borné."""
+        async with sem:
+            bt = await backtest_metrics(cand["symbol"], timeframe)
+        reliable = bool(bt and bt["trades"] >= 5 and bt["win_rate"] > 55 and bt["profit_factor"] > 1.3)
+        return {
+            "symbol": cand["symbol"], "asset_class": cls, "direction": cand["direction"],
+            "price": cand["price"], "rsi": cand["rsi"],
+            # Ce que la STRATÉGIE mesure — c'est cela que les pages affichent.
+            "trend_score": cand.get("trend_score"), "confirmations": cand.get("confirmations"),
+            "risk_reward": cand.get("risk_reward"), "playbook_tier": cand.get("playbook_tier"),
+            "trend": cand["trend"], "conviction": cand["conviction"], "backtest": bt,
+            "high_conviction": cand["high_conviction"], "reliable": reliable,
+            "tier": "confirmed" if (cand["high_conviction"] and reliable) else "watch",
+            "timeframe": timeframe,
+        }
+
+    async def _one_market(cls: str) -> list[dict]:
         scanned = await scan_market(asset_class=cls, timeframe=timeframe, limit=12)
         directional = [c for c in scanned if c["direction"] != "HOLD"]
+        evaluated = await asyncio.gather(
+            *(_evaluate(cand, cls) for cand in directional[:8]),  # borne les backtests (coût)
+            return_exceptions=True,
+        )
         confirmed: list[dict] = []
         watch: list[dict] = []
-        for cand in directional[:8]:  # borne les backtests (coût)
-            bt = await backtest_metrics(cand["symbol"], timeframe)
-            reliable = bool(bt and bt["trades"] >= 5 and bt["win_rate"] > 55 and bt["profit_factor"] > 1.3)
-            item = {
-                "symbol": cand["symbol"], "asset_class": cls, "direction": cand["direction"],
-                "price": cand["price"], "adx": cand["adx"], "rsi": cand["rsi"],
-                "trend": cand["trend"], "conviction": cand["conviction"], "backtest": bt,
-                "high_conviction": cand["high_conviction"], "reliable": reliable,
-                "tier": "confirmed" if (cand["high_conviction"] and reliable) else "watch",
-                "timeframe": timeframe,
-            }
+        for item in evaluated:
+            if isinstance(item, Exception):  # un symbole KO n'invalide pas le marché entier
+                logger.warning("Sélection du jour : candidat %s échoué (%s)", cls, item)
+                continue
             (confirmed if item["tier"] == "confirmed" else watch).append(item)
         picks = confirmed[:per_market]
         if len(picks) < per_market:
             picks += watch[: per_market - len(picks)]
+        return picks
+
+    # `return_exceptions` : un marché indisponible ne doit pas vider la page des trois autres.
+    per_class = await asyncio.gather(*(_one_market(cls) for cls in classes), return_exceptions=True)
+    out: list[dict] = []
+    for cls, picks in zip(classes, per_class, strict=True):
+        if isinstance(picks, Exception):
+            logger.warning("Sélection du jour : marché %s indisponible (%s)", cls, picks)
+            continue
         out.extend(picks)
     return out
 
@@ -172,9 +211,16 @@ async def verify_signal(
     checks.append({"label": "Consensus ≥ 70 %", "pass": consensus_pct >= 70, "value": f"{consensus_pct}%"})
     if mtf_total:
         checks.append({"label": "Multi-timeframe ≥ 2/3 alignés", "pass": mtf_aligned >= 2, "value": f"{mtf_aligned}/{mtf_total}"})
-    # Bande de la stratégie : R/R entre 1,2 et 1,3 pour la prise de décision.
-    checks.append({"label": "R/R ≥ 1:1,2", "pass": risk_reward >= 1.2, "value": f"1 : {risk_reward}"})
-    checks.append({"label": "Tendance forte (ADX > 25)", "pass": (adx or 0) > 25, "value": round(adx, 1) if adx else "—"})
+    # Bande imposée par la stratégie — lue depuis la configuration pour qu'une seule source de
+    # vérité gouverne le domaine, l'API et cette vérification.
+    from app.core.config import get_settings
+
+    s_cfg = get_settings()
+    checks.append({
+        "label": f"R/R entre 1:{s_cfg.playbook_min_rr:g} et 1:{s_cfg.playbook_max_rr:g}",
+        "pass": s_cfg.playbook_min_rr <= risk_reward <= s_cfg.playbook_max_rr,
+        "value": f"1 : {risk_reward}",
+    })
 
     passed = sum(1 for c in checks if c["pass"])
     total = len(checks)
@@ -246,18 +292,15 @@ def finalize_decision(card, mtf_res: dict, blackout: tuple[bool, str] | None = N
         _to_hold(f"⏸️ Setup filtré (qualité insuffisante : {quality.rejection_reason(card, mode=mode)}) — pas de trade.")
     card.metrics["signal_mode"] = mode
 
-    adx = card.metrics.get("adx")
     pb = card.metrics.get("playbook") or {}
-    session = card.metrics.get("session") or {}
-    # ★ Haute conviction : soit la voie classique (ADX + consensus + multi-TF), soit — et c'est la
-    # voie privilégiée — un setup de PLAYBOOK complet (4 étapes validées, déclencheur 15 min actif)
-    # pris dans une fenêtre à forte valeur (ouverture Londres/NY ou chevauchement).
+    # ★ Haute conviction = un setup COMPLET de la stratégie du desk : tendance validée sur les
+    # unités supérieures, entrée déclenchée en 15 min, stop et objectifs posés sur des niveaux.
+    # L'ancienne voie « ADX > 25 + consensus » a été retirée : la mesure a montré que l'ADX coupait
+    # surtout de bons trades, et le desk n'a plus qu'une définition de ce qu'est un bon setup.
     card.high_conviction = bool(
         card.direction.value != "HOLD"
-        and (
-            (adx and adx > 25 and card.consensus_pct >= 70 and mtf_res.get("aligned", 0) >= 2)
-            or (pb.get("ready") and pb.get("direction") == card.direction.value and session.get("prime"))
-        )
+        and pb.get("ready")
+        and pb.get("direction") == card.direction.value
     )
     # Scores explicatifs (contexte marché + timing) — informatifs, non bloquants.
     card.metrics["context_score"] = quality.context_score(card)
@@ -302,16 +345,19 @@ async def scan_market(
             candle_cache[sym] = candles
             a = ta.analyze(candles)
             m = a["metrics"]
-            adx = m.get("adx", 0) or 0
             direction = Direction.BUY if a["score"] > 0.12 else Direction.SELL if a["score"] < -0.12 else Direction.HOLD
-            high_conv = direction != Direction.HOLD and ta.is_high_conviction(a["score"], adx, item["asset_class"])
+            # Le classement de la 1re passe est une PRÉ-sélection rapide : la conviction réelle est
+            # celle de la stratégie du desk, attribuée en 2e passe. L'ADX ne pondère plus rien.
             results.append({
                 "symbol": sym, "asset_class": item["asset_class"], "direction": direction.value,
-                "score": a["score"], "adx": round(adx, 1), "adx_state": m.get("adx_state"),
+                "score": a["score"], "adx": round(m.get("adx", 0) or 0, 1),
                 "trend": m.get("trend"), "rsi": m.get("rsi"), "price": m.get("price"),
-                "conviction": round(abs(a["score"]) * (1 + adx / 50), 3),
-                "high_conviction": high_conv, "mtf_aligned": None, "mtf_total": None,
-                "consolidated": False,
+                "conviction": round(abs(a["score"]), 3),
+                "high_conviction": direction != Direction.HOLD,
+                "mtf_aligned": None, "mtf_total": None, "consolidated": False,
+                # Métriques de la stratégie, renseignées par la 2e passe.
+                "trend_score": None, "trend_status": None, "confirmations": None,
+                "risk_reward": None, "tier": None,
             })
         except Exception as exc:  # noqa: BLE001
             logger.warning("Scan %s échoué (%s)", sym, exc)
@@ -377,6 +423,22 @@ def _apply_playbook_verdicts(rows: list[dict]) -> None:
         row["playbook_reason"] = v["reason"]
         row["playbook_edge"] = v.get("edge_score", 0.0)
         row["reliability_score"] = v.get("reliability_score") or v.get("context_reliability") or 0
+        # Métriques DE LA STRATÉGIE : c'est ce que le scanner doit montrer, et rien d'autre.
+        row["tier"] = v["tier"]
+        row["trend_score"] = v.get("trend_score")
+        row["trend_status"] = v.get("trend_status")
+        row["confirmations"] = v.get("confirmations")
+        row["confirmation_score"] = v.get("confirmation_score")
+        row["risk_reward"] = v.get("risk_reward")
+        row["trigger"] = v.get("trigger")
+        row["entry"] = v.get("entry")
+        row["stop_loss"] = v.get("stop_loss")
+        row["take_profit_1"] = v.get("take_profit_1")
+        row["take_profit_2"] = v.get("take_profit_2")
+        row["horizon_label"] = v.get("horizon_label")
+        row["pair_verdict"] = v.get("pair_verdict")
+        # POURQUOI la stratégie décide cela : c'est ce qui distingue un scanner d'une liste de codes.
+        row["why"] = v.get("why")
         # La stratégie refuse le trade, ou le veut dans l'autre sens -> le scanner n'affirme rien.
         if v["tier"] not in ("ready", "armed") or (
             v["direction"] in ("BUY", "SELL") and row["direction"] != v["direction"]

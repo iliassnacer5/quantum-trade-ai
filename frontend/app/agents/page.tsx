@@ -113,8 +113,9 @@ export default function AgentsPage() {
       <PageHeader
         title="Agents IA — supervision et entraînement"
         subtitle={
-          `Tous les agents appliquent LA MÊME stratégie : mensuel + journalier → 4 h → 1 h → ` +
-          `entrée 15 min · objectif ≥ ${strat?.min_target_pips ?? 200} pips · ` +
+          `Tous les agents appliquent LA MÊME stratégie : tendance 4 h + 1 h (le journalier ` +
+          `pèse sans être obligatoire) → entrée 15 min · ` +
+          `objectif ≥ ${strat?.min_target_pips ?? 50} pips · ` +
           `R/R 1:${strat?.min_risk_reward ?? 2} à 1:${strat?.max_risk_reward ?? 3} · ` +
           `stop sécurisé à +${strat?.secure_at_r ?? 2}R.`
         }

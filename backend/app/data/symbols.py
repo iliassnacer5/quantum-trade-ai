@@ -1,13 +1,14 @@
-"""Catalogue multi-marchés (crypto / forex / actions) + recherche.
+"""Catalogue multi-marchés (crypto / forex / actions / indices / métaux) + recherche.
 
 Sert l'UI (sélecteur de symboles) et valide les actifs. La génération de signal accepte tout symbole
 (repli synthétique si le connecteur de marché n'a pas de données), mais le catalogue fournit une
 liste organisée des paires/symboles populaires par classe d'actif.
+
+La stratégie du desk s'applique à TOUTES ces classes sans distinction : elle lit une tendance et des
+niveaux, ce que tout graphique fournit.
 """
 
 from __future__ import annotations
-
-from app.data import markets
 
 # --- Crypto (paires sur USDT) ---
 _CRYPTO_BASES = [
@@ -34,11 +35,20 @@ STOCKS = [
 # --- Métaux précieux (or spot & co, données futures COMEX via Yahoo) ---
 COMMODITIES = ["XAU/USD", "XAG/USD", "XPT/USD", "XPD/USD"]
 
-_LABELS = {"crypto": "Crypto", "forex": "Forex", "stock": "Actions", "commodity": "Or & Métaux"}
+# --- Indices boursiers (noms des brokers CFD ; correspondance Yahoo dans `data.yahoo._INDEX_MAP`) ---
+INDICES = [
+    "SPX500", "NAS100", "US30",                     # États-Unis
+    "GER40", "UK100", "FRA40", "EU50",              # Europe
+    "JPN225", "HK50", "AUS200",                     # Asie-Pacifique
+]
+
+_LABELS = {"crypto": "Crypto", "forex": "Forex", "stock": "Actions",
+           "commodity": "Or & Métaux", "index": "Indices"}
 
 
 def catalog() -> dict[str, list[str]]:
-    return {"crypto": CRYPTO, "forex": FOREX, "stock": STOCKS, "commodity": COMMODITIES}
+    return {"crypto": CRYPTO, "forex": FOREX, "stock": STOCKS,
+            "commodity": COMMODITIES, "index": INDICES}
 
 
 def all_symbols() -> list[dict]:
@@ -59,7 +69,7 @@ def search(query: str | None = None, asset_class: str | None = None, limit: int 
 
 
 def is_known(symbol: str) -> bool:
-    return symbol.upper() in {s.upper() for s in (CRYPTO + FOREX + STOCKS + COMMODITIES)}
+    return symbol.upper() in {s.upper() for s in (CRYPTO + FOREX + STOCKS + COMMODITIES + INDICES)}
 
 
 def normalize(symbol: str) -> str:

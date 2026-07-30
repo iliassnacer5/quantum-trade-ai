@@ -26,13 +26,13 @@ def test_classification():
     assert edge_map_service._classify(0.0, 0.8, trades=30) == "red"
 
 
-async def test_sweep_stores_map_and_streak(monkeypatch):
-    """Le sweep classe les combos, persiste la carte et incrémente le streak des verts stables."""
+async def test_sweep_maps_where_the_desk_strategy_works(monkeypatch):
+    """Le sweep dit OÙ la stratégie du desk a un edge, et n'accorde le vert qu'à ce qui tient."""
     from app.repositories.store import get_store
 
-    async def _fake_wf(symbol, tf, folds=4, strategy_id=None, preloaded=None, **kw):  # noqa: ANN001
-        # mtf_ema sur BTC = vert ; tout le reste = rouge.
-        good = strategy_id == "mtf_ema" and symbol == "BTC/USDT"
+    async def _fake_wf(symbol, tf, folds=4, preloaded=None, **kw):  # noqa: ANN001
+        # La stratégie du desk marche sur BTC dans ce scénario, et nulle part ailleurs.
+        good = symbol == "BTC/USDT"
         return {"avg_alpha_pct": 8.0 if good else -5.0, "avg_profit_factor": 1.3 if good else 0.6,
                 "avg_win_rate": 45.0, "total_trades": 20, "verdict": "robuste" if good else "non_prouve",
                 "data_real": True}
@@ -49,14 +49,31 @@ async def test_sweep_stores_map_and_streak(monkeypatch):
     p1 = await edge_map_service.run_edge_sweep(store, timeframes=["4h"], markets=["crypto"])
     assert p1["greens"] == 1
     green = next(r for r in p1["rows"] if r["status"] == "green")
-    assert green["strategy"] == "mtf_ema" and green["symbol"] == "BTC/USDT" and green["green_streak"] == 1
+    # Une seule stratégie balayée : toutes les lignes portent son identifiant.
+    assert {r["strategy"] for r in p1["rows"]} == {"playbook"}
+    assert green["symbol"] == "BTC/USDT" and green["green_streak"] == 1
     # 2e sweep -> streak = 2 (stabilité)
     p2 = await edge_map_service.run_edge_sweep(store, timeframes=["4h"], markets=["crypto"])
     green2 = next(r for r in p2["rows"] if r["status"] == "green")
     assert green2["green_streak"] == 2
     # is_combo_green respecte le streak minimal
-    assert edge_map_service.is_combo_green(store, "mtf_ema", "BTC/USDT", min_streak=2)
-    assert not edge_map_service.is_combo_green(store, "ichimoku", "BTC/USDT")
+    assert edge_map_service.is_combo_green(store, "playbook", "BTC/USDT", min_streak=2)
+    assert not edge_map_service.is_combo_green(store, "playbook", "ETH/USDT")
+
+
+def test_the_sweep_covers_every_market_including_indices():
+    """La stratégie s'appliquant à tous les marchés, la carte doit tous les balayer.
+
+    Et pas un échantillon : l'univers de la carte est désormais le catalogue COMPLET, sinon elle
+    répond « où gagne-t-on parmi ceux que j'ai choisi de regarder », ce qui n'est pas la question.
+    """
+    from app.data import symbols as symbols_catalog
+
+    uni = edge_map_service.universe()
+    assert set(uni) == {"forex", "commodity", "index", "stock", "crypto"}
+    assert "SPX500" in uni["index"]
+    assert "GER40" in uni["index"]
+    assert sum(len(v) for v in uni.values()) == len(symbols_catalog.all_symbols())
 
 
 def test_edge_map_endpoint_empty_then_available():

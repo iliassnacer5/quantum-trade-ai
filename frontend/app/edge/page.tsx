@@ -14,6 +14,9 @@ import { EdgeStatusDot, PairVerdictsPanel } from '@/components/domain';
 
 const MARKET_LABEL: Record<string, string> = {
   crypto: '₿ Crypto', forex: '💱 Forex', stock: '📈 Actions', commodity: '🥇 Or & Métaux',
+  // Les indices étaient absents de cette table : leur section s'affichait sous la clé brute
+  // « index » alors que la stratégie les trade comme les autres.
+  index: '📊 Indices',
 };
 
 // Couleur d'une cellule de heatmap selon statut + intensité (|alpha|).
@@ -89,6 +92,31 @@ export default function EdgePage() {
           </div>
           <p className="text-sm text-white">{data.note}</p>
 
+          {/* Ce que LA STRATÉGIE gagne, à distinguer du walk-forward affiché en dessous : celui-ci
+              répond « bat-on le buy & hold ? », celle-là « que rapporte la méthode par trade, et à
+              quelle cadence ? ». Deux questions différentes, deux colonnes différentes. */}
+          {data.playbook_summary && (
+            <section className="rounded-xl border border-primary/30 bg-primary/5 p-4">
+              <h2 className="mb-1 text-sm font-semibold text-white">
+                📐 {data.strategy ?? 'Stratégie du desk'} — ce qu’elle mesure
+              </h2>
+              {data.playbook_summary.measured ? (
+                <div className="flex flex-wrap gap-x-6 gap-y-1 font-mono text-xs text-muted">
+                  <span>Symboles mesurés <span className="text-white">{data.playbook_summary.symbols}</span></span>
+                  <span>Trades <span className="text-white">{data.playbook_summary.trades}</span></span>
+                  <span>
+                    Espérance{' '}
+                    <span className={(data.playbook_summary.expectancy_r ?? 0) > 0 ? 'text-buy' : 'text-sell'}>
+                      {(data.playbook_summary.expectancy_r ?? 0) > 0 ? '+' : ''}{data.playbook_summary.expectancy_r} R
+                    </span>
+                  </span>
+                  <span>Cadence <span className="text-white">{data.playbook_summary.trades_per_day} / jour · {data.playbook_summary.trades_per_week} / semaine</span></span>
+                </div>
+              ) : null}
+              <p className="mt-1 text-[11px] leading-relaxed text-muted">{data.playbook_summary.note}</p>
+            </section>
+          )}
+
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex gap-1">
               {[{ id: '', l: 'Tous' }, { id: 'green', l: '🟢 Verts' }, { id: 'yellow', l: '🟡 Jaunes' }, { id: 'red', l: '🔴 Rouges' }].map((f) => (
@@ -114,13 +142,19 @@ export default function EdgePage() {
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-xs">
                     <thead className="text-muted">
-                      <tr><th className="py-1">Statut</th><th>Stratégie</th><th>Symbole</th><th>TF</th><th>Alpha</th><th>PF</th><th>Réussite</th><th>Trades</th><th>Stabilité</th></tr>
+                      <tr>
+                        <th className="py-1">Statut</th><th>Symbole</th><th>TF</th>
+                        <th title="Sur-performance du walk-forward face au « buy & hold », frais inclus">Alpha</th>
+                        <th>PF</th><th>Réussite</th><th>Trades</th><th>Stabilité</th>
+                        <th className="border-l border-border pl-2" title="Espérance de LA STRATÉGIE par trade, en multiples du risque">Espérance</th>
+                        <th title="Trades produits par jour sur ce symbole">Cadence</th>
+                        <th title="Espérance × cadence : ce que ce symbole rapporte par mois, en R">R / mois</th>
+                      </tr>
                     </thead>
                     <tbody>
                       {mrows.map((r, i) => (
                         <tr key={i} className={`border-t border-border/40 ${r.status === 'green' ? 'bg-buy/5' : ''}`}>
                           <td className="py-1.5"><EdgeStatusDot status={r.status} /></td>
-                          <td className="text-white">{r.strategy_name}</td>
                           <td className="font-mono text-white">{r.symbol}{!r.data_real && ' ⚠︎'}</td>
                           <td className="text-muted">{r.timeframe}</td>
                           <td className={r.alpha >= 0 ? 'text-buy' : 'text-sell'}>{r.alpha >= 0 ? '+' : ''}{r.alpha}%</td>
@@ -128,6 +162,22 @@ export default function EdgePage() {
                           <td className="text-white">{r.win}%</td>
                           <td className="text-muted">{r.trades}</td>
                           <td className="text-muted">{r.green_streak ? `🟢×${r.green_streak}` : '—'}</td>
+                          {/* Métriques de la STRATÉGIE (backtest) — vides tant qu'il n'a pas tourné. */}
+                          <td className={`border-l border-border pl-2 ${
+                            (r.playbook?.expectancy_r ?? 0) > 0 ? 'text-buy' : r.playbook ? 'text-sell' : 'text-muted'}`}>
+                            {r.playbook
+                              ? `${r.playbook.expectancy_r > 0 ? '+' : ''}${r.playbook.expectancy_r} R`
+                              : '—'}
+                            {r.playbook && <span className="text-muted"> ({r.playbook.trades})</span>}
+                          </td>
+                          <td className="text-muted">
+                            {r.playbook?.days_between_trades
+                              ? `1 / ${r.playbook.days_between_trades} j`
+                              : '—'}
+                          </td>
+                          <td className={(r.playbook?.r_per_month ?? 0) > 0 ? 'text-buy' : 'text-muted'}>
+                            {r.playbook?.r_per_month != null ? `${r.playbook.r_per_month} R` : '—'}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -148,21 +198,30 @@ export default function EdgePage() {
 }
 
 /**
- * Matrice stratégie (lignes) × symbole (colonnes). Chaque cellule = meilleur combo (alpha max)
- * tous timeframes confondus, coloré par statut et intensité. Survol = détail.
+ * Matrice UNITÉ DE TEMPS (lignes) × symbole (colonnes).
+ *
+ * Le desk n'applique plus qu'UNE stratégie : mettre les stratégies en lignes ne donnerait qu'une
+ * seule ligne. La question devenue utile est « sur quelle unité de temps cette méthode a-t-elle un
+ * edge, et sur quel symbole ». Une dernière ligne résume le meilleur des unités de temps.
  */
 function EdgeHeatmap({ rows }: { rows: EdgeRow[] }) {
-  const strategies = Array.from(new Map(rows.map((r) => [r.strategy, r.strategy_name])).entries());
+  const timeframes = Array.from(new Set(rows.map((r) => r.timeframe))).sort();
   const symbols = Array.from(new Set(rows.map((r) => r.symbol)));
-  // Meilleure ligne par (stratégie, symbole).
+  const byTf = new Map<string, EdgeRow>();
   const best = new Map<string, EdgeRow>();
   for (const r of rows) {
-    const k = `${r.strategy}|${r.symbol}`;
-    const cur = best.get(k);
-    if (!cur || r.alpha > cur.alpha) best.set(k, r);
+    byTf.set(`${r.timeframe}|${r.symbol}`, r);
+    const cur = best.get(r.symbol);
+    if (!cur || r.alpha > cur.alpha) best.set(r.symbol, r);
   }
 
   if (symbols.length === 0) return <p className="text-xs text-muted">Aucune donnée.</p>;
+
+  const lines: [string, string, (sym: string) => EdgeRow | undefined][] = [
+    ...timeframes.map((tf) => [tf, `Unité de temps ${tf}`, (sym: string) => byTf.get(`${tf}|${sym}`)] as
+      [string, string, (sym: string) => EdgeRow | undefined]),
+    ['__best', 'Meilleure unité de temps', (sym: string) => best.get(sym)],
+  ];
 
   return (
     <div className="overflow-x-auto">
@@ -178,20 +237,26 @@ function EdgeHeatmap({ rows }: { rows: EdgeRow[] }) {
           </div>
         ))}
 
-        {/* Lignes stratégies */}
-        {strategies.map(([sid, sname]) => (
-          <div key={sid} className="contents">
-            <div className="sticky left-0 z-10 flex items-center truncate bg-surface pr-2 text-white" title={sname}>
-              {sname}
+        {lines.map(([key, label, pick]) => (
+          <div key={key} className="contents">
+            <div className={`sticky left-0 z-10 flex items-center truncate bg-surface pr-2 ${
+              key === '__best' ? 'font-medium text-white' : 'text-muted'}`} title={label}>
+              {label}
             </div>
             {symbols.map((sym) => {
-              const r = best.get(`${sid}|${sym}`);
+              const r = pick(sym);
               const { className, style } = cellStyle(r);
+              const pb = r?.playbook;
               return (
                 <div
                   key={sym}
                   style={style}
-                  title={r ? `${sname} · ${sym} · ${r.timeframe}\nAlpha ${r.alpha >= 0 ? '+' : ''}${r.alpha}% · PF ${r.pf} · ${r.win}% · ${r.trades} trades` : `${sname} · ${sym} — non testé`}
+                  title={r
+                    ? `${sym} · ${r.timeframe}\nAlpha ${r.alpha >= 0 ? '+' : ''}${r.alpha}% · PF ${r.pf} · ${r.win}% · ${r.trades} trades`
+                      + (pb ? `\nStratégie : ${pb.expectancy_r > 0 ? '+' : ''}${pb.expectancy_r} R sur ${pb.trades} trades`
+                              + (pb.days_between_trades ? ` · 1 trade / ${pb.days_between_trades} j` : '')
+                            : '\nStratégie : pas encore mesurée par le backtest')
+                    : `${sym} — non testé`}
                   className={`flex h-9 items-center justify-center rounded font-mono font-medium ${className}`}
                 >
                   {r ? `${r.alpha >= 0 ? '+' : ''}${r.alpha}` : '·'}
@@ -201,7 +266,11 @@ function EdgeHeatmap({ rows }: { rows: EdgeRow[] }) {
           </div>
         ))}
       </div>
-      <p className="mt-2 text-2xs text-muted">Valeur = alpha % (vs. buy &amp; hold). Vert = exploitable · orange = à surveiller · rouge = sans edge. Survole une cellule pour le détail.</p>
+      <p className="mt-2 text-2xs text-muted">
+        Valeur = alpha % (vs. buy &amp; hold), c’est-à-dire ce que la méthode ajoute par rapport à
+        détenir l’actif. Vert = exploitable · orange = à surveiller · rouge = sans edge. Survole une
+        cellule pour lire aussi l’espérance et la cadence de la stratégie sur ce symbole.
+      </p>
     </div>
   );
 }

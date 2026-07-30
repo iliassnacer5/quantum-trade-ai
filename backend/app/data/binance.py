@@ -29,8 +29,12 @@ async def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> l
     """Backfill OHLCV via REST. Retourne une liste de Candle (ancienne -> récente)."""
     import httpx
 
+    from app.data.markets import _timeout
+
     params = {"symbol": to_binance_symbol(symbol), "interval": interval, "limit": limit}
-    async with httpx.AsyncClient(timeout=10) as client:
+    # Délai de CONNEXION court (cf. `markets._timeout`) : un fournisseur injoignable ne doit pas
+    # immobiliser l'appelant 10 s pour rien.
+    async with httpx.AsyncClient(timeout=_timeout(limit)) as client:
         resp = await client.get(REST_URL, params=params)
         resp.raise_for_status()
         rows = resp.json()

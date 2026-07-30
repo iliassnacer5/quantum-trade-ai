@@ -1,30 +1,48 @@
 """PLAYBOOK — la stratégie de trading imposée à TOUS les agents du projet.
 
-Méthode, dans cet ordre STRICT (aucune étape ne peut être sautée) :
+Elle procède en **trois étapes indépendantes**, dont chacune répond à une seule question :
 
-1. **Mensuel + Journalier** — établir la tendance de fond et FIXER les supports / résistances
-   MAJEURS. Sans tendance de fond claire : pas de trade.
-2. **Journalier (détail)** — RSI 14, MA 20, MA 50, volume, tendance VWAP, divergences RSI et MACD,
-   et retracements de Fibonacci **en cas de correction**. Le journalier doit CONFIRMER le biais.
-3. **4 heures** — exactement les mêmes facteurs, pour confirmer une seconde fois.
-4. **1 heure** — DERNIÈRE confirmation avant de chercher l'entrée. Mêmes facteurs encore une fois :
-   le 1 h doit lui aussi aller dans le sens du biais.
-5. **15 minutes** — la SEULE unité de temps où l'on ENTRE. Déclencheur d'entrée : repli sur MA/zone
-   d'or Fibonacci avec bougie de reprise, cassure confirmée par le volume, ou divergence.
+**ÉTAPE 1 — QUELLE DIRECTION ?** (`domain.trend`)
+La tendance n'est jamais déduite d'un seul indicateur. Six lectures du marché — EMA 50/200,
+structure des sommets et creux (HH/HL/LH/LL), SuperTrend, MACD, RSI, volume — sont confrontées sur
+le **journalier, le 4 h, le 1 h et le 15 min**, puis agrégées en un score de confiance à poids
+configurables. Elle n'est validée que si les unités de temps EXIGÉES vont dans le même sens — le
+**4 h et le 1 h**, le journalier n'étant plus obligatoire depuis le 28/07/2026 — et qu'aucun
+conflit majeur n'oppose les indicateurs. **Une fois validée, elle est FIGÉE** : les étapes 2 et 3
+ne la rediscutent pas. Le mensuel donne le biais de fond et peut opposer son veto.
 
-NIVEAUX DU TRADE — **objectif ≥ 200 pips, R/R entre 1:2 et 1:3** :
-- L'**objectif** vaut au minimum 200 pips, et le gain visé représente 2 à 3 fois le risque.
-- Conséquence arithmétique : le **stop** vaut entre 200/3 ≈ 67 pips et 200/2 = 100 pips. Un stop de
-  cette taille ne peut pas venir de la structure 15 min (quelques pips) : il est placé derrière la
-  **structure 4 h / journalière**. Le 15 min ne porte donc pas le risque, il donne le TIMING.
-- L'objectif doit rester atteignable **avant le niveau majeur opposé** et compatible avec la
-  volatilité journalière (l'horizon estimé du trade est calculé et affiché).
+**ÉTAPE 2 — QUAND ENTRER ?** (`domain.entry_confluence`)
+Sur le 15 min, avec le 1 h en appui. Aucun de ces outils ne discute la direction : zones d'offre et
+de demande, retracements de Fibonacci, cassure de structure (BOS), changement de caractère (CHOCH),
+EMA 20/50 comme supports dynamiques, VWAP, volume, figures de retournement, RSI, supports et
+résistances multi-unités de temps classés par importance. **Règle du minimum de confirmations** :
+on entre dès que trois confirmations pondérées se rejoignent — exiger l'unanimité ne produirait
+presque aucune opportunité. Ce que le prix FAIT pèse le double de ce qui ne fait que le commenter.
 
-SÉCURISATION DU PROFIT — dès que le trade a parcouru **+2R**, le stop est automatiquement remonté
-**sur +2R** : la position ne peut plus redevenir perdante, et on la laisse courir vers le R/R
-maximum (1:3). Voir `secured_stop` ici et `execution_service.secure_open_profits`.
-- Le timing de session (ouverture Londres, ouverture New York, et surtout leur CHEVAUCHEMENT)
-  note la qualité de la fenêtre d'entrée.
+**ÉTAPE 3 — OÙ SORTIR ?** (`domain.exits`)
+Stop et objectifs sont calculés AVANT l'ordre, avec les mêmes outils. Le **stop** est posé sur le
+niveau qui rendrait le scénario faux (bord de la zone d'entrée, dernier creux plus haut, support
+majeur) et jamais à une distance calculée. L'**objectif** est posé devant le premier obstacle réel
+(résistance classée, zone opposée, extension de Fibonacci), avec un plancher de **50 pips** —
+l'ATR journalier ne participe plus à son calcul. Le **rapport risque/rendement doit tomber entre
+1:2 et 1:3** — sinon il n'y a pas de trade, c'est bloquant.
+
+**CE QUI BLOQUE ET CE QUI EST SEULEMENT AFFICHÉ.** La checklist compte onze cases, elles n'ont pas
+toutes le même pouvoir. Depuis le 28/07/2026, quatre d'entre elles sont INFORMATIVES : « le
+journalier confirme », « stop structurel cohérent », « objectif atteignable avant le niveau majeur
+opposé » et « objectif compatible avec la volatilité ». Elles restent calculées et affichées avec
+leur ❌, mais dès que le déclencheur 15 min se forme dans le sens d'une tendance validée et que le
+R/R tombe dans la bande, le trade est pris. C'est une décision assumée de l'utilisateur, et chaque
+case garde son interrupteur (`playbook_block_on_*`) pour pouvoir mesurer ce qu'elle coûtait.
+
+DEUX SÉCURISATIONS COMPLÉMENTAIRES, jamais concurrentes : dès **+2R** parcouru le stop remonte sur
++2R (la position ne peut plus perdre) ; dès que **TP1 est touché et que le momentum confirme la
+suite**, il remonte à 80 % du chemin parcouru et la position part chercher TP2. C'est toujours la
+plus favorable qui s'applique, et le stop ne recule jamais. Voir `secured_stop`, `exits`, et
+`execution_service.secure_open_profits` / `manage_tp_progression`.
+
+Le timing de session (ouverture Londres, ouverture New York, et surtout leur CHEVAUCHEMENT) note
+la qualité de la fenêtre d'entrée.
 
 **Tout est expliqué, jamais un score brut sans justification.** Chaque unité de temps produit la
 liste de ses facteurs avec, pour chacun : la valeur mesurée, sa lecture en français, son poids, sa
@@ -37,26 +55,58 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from app.domain import entry_confluence
+from app.domain import exits
 from app.domain import indicators as ind
+from app.domain import market_structure as ms_mod
 from app.domain import pips as pips_mod
+from app.domain import trend as trend_mod
+from app.domain import zones as zones_mod
 from app.domain.indicators import Candle
 
 # --- Contraintes de la stratégie (surchargables par la configuration) ---
-# Le risque/rendement est encadré dans une BANDE [1,2 ; 1,3] : un objectif proche du risque est
-# atteint beaucoup plus souvent, et le plafond empêche un stop trop serré (qui gonflerait le R/R
-# affiché tout en faisant sauter le trade au premier soubresaut).
+# Le risque/rendement est encadré dans une BANDE [1:2 ; 1:3] : le plancher garantit qu'un gagnant
+# paie au moins deux perdants, le plafond interdit un objectif si lointain qu'il ne serait presque
+# jamais atteint.
+# Le plafond a été ramené de 1:4 à 1:3 sur MESURE : sur le même échantillon, l'espérance passe de
+# +0,714 R à +0,814 R et le profit factor de 2,64 à 3,01, à drawdown identique (9,0 R). Un objectif
+# au-delà de trois fois le risque est atteint trop rarement pour ce qu'il fait perdre en chemin.
 MIN_RR = 2.0                 # risque/rendement minimum : le gain vaut au moins 2 fois le risque
 MAX_RR = 3.0                 # risque/rendement maximum
-MIN_TARGET_PIPS = 200.0      # objectif minimum, en pips (cf. domain.pips hors forex)
-# Conséquence arithmétique : viser 200 pips avec un R/R plafonné à 1:3 impose un stop d'au moins
-# 200 / 3 ≈ 67 pips. Un stop de cette taille vient de la structure 4 h / journalière, PAS du 15 min.
-MAX_STOP_PIPS = 150.0        # garde-fou absolu en pips
-TARGET_LEVEL_BUFFER = 0.15   # marge (× ATR) laissée avant le niveau majeur qui borne l'objectif
-MAX_ATR_MULTIPLE = 4.0       # objectif <= N × ATR journalier (sinon hors de portée)
+# OBJECTIF MINIMUM : 50 pips. Le plancher de 200 pips a été explicitement ramené à 50 le
+# 28/07/2026. L'unité reste comparable d'un marché à l'autre : hors forex et métaux, 1 pip vaut
+# 1 point de base du prix (cf. `domain/pips.py`), donc 50 pips = 0,5 % de mouvement, aussi bien sur
+# le DAX que sur BTC. C'est ce plancher qui commande désormais l'échelle du trade.
+MIN_TARGET_PIPS = 50.0
+MAX_STOP_PIPS = 150.0        # garde-fou absolu en pips (forex/métaux uniquement)
+
+# --- Échelle du trade, exprimée en ATR JOURNALIER (valable sur tous les marchés) ---------------
+# L'ATR NE BORNE PLUS L'OBJECTIF : `MIN_TARGET_ATR_DAILY` vaut zéro depuis le 28/07/2026, à la
+# demande explicite de l'utilisateur (« ne prends pas en considération l'ATR dans le profit »). Le
+# seul plancher d'objectif est désormais `MIN_TARGET_PIPS`.
+# Le plancher de STOP a suivi, par arithmétique et non par préférence : un stop à 0,55 × ATR
+# journalier vaut ~69 pips sur EUR/USD, ce qui imposerait un objectif d'au moins 138 pips au R/R
+# minimum de 1:2 — les 50 pips demandés seraient inatteignables. À 0,20 × ATR (~25 pips), un
+# objectif de 50 pips passe exactement à 1:2.
+MIN_STOP_ATR_DAILY = 0.20
+# Le PLAFOND, lui, ne bouge pas — c'est lui qui contient le DRAWDOWN. Mesuré : l'oublier l'a fait
+# doubler (17,0 R contre 8,9 R) pour une espérance équivalente. Un stop trop large ne perd pas plus
+# souvent, il perd beaucoup plus gros à chaque fois.
+MAX_STOP_ATR_DAILY = 0.85
+MIN_TARGET_ATR_DAILY = 0.0   # l'ATR ne participe plus au calcul de l'objectif
+# Plancher de dernier recours, en ATR 15 min, quand l'ATR journalier n'est pas calculable.
+MIN_STOP_ATR15 = 0.6
+# Objectif <= N × ATR journalier. INFORMATIF depuis le 28/07/2026 : la case est toujours calculée et
+# affichée dans la checklist, elle ne refuse plus le trade (cf. `block_reach` dans `build`).
+MAX_ATR_MULTIPLE = 4.0
 MIN_LAYER_SCORE = 0.08       # en-deçà, une unité de temps est « neutre » (pas de confirmation)
 # Sécurisation du profit : dès +2R atteint, le stop est remonté sur +2R (le trade ne peut plus
 # redevenir perdant) et on laisse courir vers le R/R maximum.
 SECURE_AT_R = 2.0
+# Seconde sécurisation, complémentaire : quand TP1 est touché ET que le momentum confirme la course
+# vers TP2, le stop monte à 80 % du chemin déjà parcouru. Les deux règles coexistent et c'est
+# toujours la plus favorable au trade qui s'applique — le stop ne recule jamais.
+TP1_LOCK_FRACTION = 0.8
 # Filtre de volatilité — seuil issu du backtest (perdants : ATR journalier 1,39 % ; gagnants 1,15 %).
 MAX_ATR_PCT = 1.3
 VOLATILITY_MAX_WIDEN = 1.6   # élargissement maximal du stop, en multiple de la distance initiale
@@ -650,6 +700,47 @@ def entry_trigger(candles: list[Candle], direction: int, layer: Layer,
     return out
 
 
+def technical_stop(candles: list[Candle], direction: int) -> tuple[float, float, float] | None:
+    """Stop technique 15 min de repli : ``(entrée, stop, ATR)``.
+
+    Le vrai stop du trade est ensuite posé par `domain.exits` sur un niveau qui invalide le
+    scénario ; celui-ci n'est qu'un point de départ, garanti d'être au moins à 0,6 × ATR pour ne
+    jamais partir d'une valeur absurde.
+    """
+    if not candles or len(candles) < 10 or direction == 0:
+        return None
+    price = candles[-1].close
+    atr = ind.atr(candles, 14) or (price * 0.001)
+    if direction > 0:
+        stop = min(min(c.low for c in candles[-10:]), price - 1.0 * atr) - 0.2 * atr
+        stop = min(stop, price - 0.6 * atr)
+    else:
+        stop = max(max(c.high for c in candles[-10:]), price + 1.0 * atr) + 0.2 * atr
+        stop = max(stop, price + 0.6 * atr)
+    return price, stop, atr
+
+
+def _trigger_from_confluence(conf: dict, candles: list[Candle], direction: int) -> dict:
+    """Traduit une évaluation de confluence en déclencheur, au format attendu par `build`.
+
+    Le type reste `"confluence"` : le champ `trigger` du setup garde la forme « type — motif »,
+    si bien que la matrice paire × déclencheur du journal et du backtest mesure la confluence
+    comme un déclencheur à part entière, comparable au repli et à la cassure.
+    """
+    out = {"fired": bool(conf.get("fired")), "type": "confluence",
+           "reason": conf.get("reason", ""), "notes": [], "confirmations": conf.get("confirmations", [])}
+    if not out["fired"]:
+        return out
+    technical = technical_stop(candles, direction)
+    if technical is None:
+        out["fired"] = False
+        out["reason"] = "données 15 min insuffisantes pour poser un stop de départ"
+        return out
+    entry, stop, atr = technical
+    out.update(entry=entry, stop=stop, atr=atr)
+    return out
+
+
 def _arguments(layer: Layer) -> list[str]:
     """Liste lisible des arguments d'une unité de temps, chacun avec son score de fiabilité."""
     lines: list[str] = []
@@ -690,9 +781,26 @@ def narrate(
     # 1 — Tendance de fond
     out.append(f"1) LA TENDANCE DE FOND EST {trend_sense}")
     out.append(
-        "   On commence toujours par le haut : sans tendance de fond claire sur le mensuel et le "
-        "journalier, on ne prend aucune position. Voici ce que disent ces deux unités de temps."
+        "   On commence toujours par le haut : sans tendance de fond claire, on ne prend aucune "
+        "position. La direction n'est pas décidée par un seul indicateur : six lectures "
+        "différentes du marché (moyennes 50 et 200, structure des sommets et des creux, "
+        "SuperTrend, MACD, RSI, volume) sont confrontées sur le journalier, le 4 h, le 1 h et le "
+        "15 min, et il faut qu'elles racontent la même histoire."
     )
+    tr = setup.trend or {}
+    if tr.get("status"):
+        adx = tr.get("adx") or {}
+        if tr["status"] == "valid":
+            out.append(
+                f"   Verdict : tendance confirmée avec une confiance de {tr.get('score_100')} sur "
+                f"100, portée par une force de mouvement réelle (ADX journalier "
+                f"{adx.get('journalier', 0):.0f}, minimum exigé {adx.get('seuil', 0):.0f}). Elle "
+                "est maintenant FIGÉE : la recherche du point d'entrée et le calcul du stop et de "
+                "l'objectif ne la remettront pas en question."
+            )
+        else:
+            out.append("   Verdict : aucune tendance exploitable — "
+                       + " ; ".join(tr.get("reasons") or []) + ".")
     out.append(f"   Mensuel — lecture {'haussière' if l_month.bias > 0 else 'baissière' if l_month.bias < 0 else 'neutre'} "
                f"(fiabilité {fmt_score(l_month.score_5)}) :")
     out += _arguments(l_month)
@@ -723,9 +831,11 @@ def narrate(
                    "arguments listés au point 1. La direction est donc cohérente d'une unité de "
                    "temps à l'autre.")
     else:
-        out.append("   Non. Le journalier ne va pas dans le sens de la tendance de fond. Prendre "
-                   "position ici, ce serait acheter (ou vendre) alors que l'unité de temps qui "
-                   "commande le mouvement du jour dit l'inverse. On attend qu'elle se réaligne.")
+        out.append("   Non — et ce n'est plus une raison de s'abstenir. Le journalier n'est pas "
+                   "obligatoire : ce sont le 4 h et le 1 h qui doivent s'accorder pour valider la "
+                   "direction. Le journalier pèse quand même le plus lourd dans le score de "
+                   "tendance, donc son désaccord se paie déjà en confiance ; il ne bloque "
+                   "simplement plus l'entrée à lui seul.")
     out.append("")
 
     # 4 — Le 4 h confirme ?
@@ -743,12 +853,24 @@ def narrate(
     out.append("5) LE DÉCLENCHEUR D'ENTRÉE EN 15 MINUTES")
     out.append(
         "   L'entrée ne se prend QUE en 15 minutes. Les unités supérieures donnent la direction, le "
-        "15 min donne le moment. Trois déclencheurs sont acceptés : un repli sur la MA20/MA50 ou "
-        "dans la zone d'or Fibonacci avec une bougie de reprise, une cassure confirmée par le "
-        "volume et le VWAP, ou une divergence en notre faveur."
+        "15 min donne le moment. Deux façons d'être autorisé à rentrer : un déclencheur classique "
+        "(repli sur la MA20/MA50 ou dans la zone d'or Fibonacci avec une bougie de reprise, "
+        "cassure confirmée par le volume et le VWAP), ou la CONFLUENCE — au moins trois "
+        "confirmations qui se rejoignent parmi les zones d'offre et de demande, la cassure de "
+        "structure, les figures de retournement, les supports et résistances, Fibonacci, le RSI, "
+        "le VWAP, les moyennes et le volume. Toutes ne pèsent pas pareil : ce que le prix FAIT "
+        "compte double par rapport à ce qui ne fait que le commenter."
     )
     if trigger.get("fired"):
         out.append(f"   Déclencheur trouvé : {trigger['reason']}.")
+        if setup.entry_confirmations:
+            # Quand l'entrée vient d'un déclencheur classique, ces confirmations ne l'ont pas
+            # motivée : on les donne comme éclairage, sans laisser croire qu'elles ont décidé.
+            out.append("   Ce que la confluence relève par ailleurs :"
+                       if trigger.get("type") != "confluence" else
+                       "   Les confirmations qui ont autorisé l'entrée :")
+            for c in setup.entry_confirmations:
+                out.append(f"   • {c['reading']}.")
     else:
         out.append(f"   Aucun déclencheur pour l'instant : {trigger.get('reason', '—')}. "
                    "C'est la raison principale de l'attente : le contexte peut être parfait, sans "
@@ -759,7 +881,7 @@ def narrate(
     out.append("")
 
     # 6 — Risque et objectif
-    out.append("6) LE RISQUE ET L'OBJECTIF — STOP 15 MIN, OBJECTIF BORNÉ PAR LE 1 H")
+    out.append("6) LE RISQUE ET L'OBJECTIF — DES NIVEAUX, PAS DES DISTANCES")
     if setup.ready:
         out.append(
             f"   Entrée à {setup.entry:.6g}, stop à {setup.stop_loss:.6g} "
@@ -768,19 +890,25 @@ def narrate(
             f"1 pour {setup.risk_reward:.2f}, dans la bande imposée de {min_rr:g} à {max_rr:g}."
         )
         out.append(
-            f"   Le stop vient de la {setup.stop_basis}. C'est un choix de méthode : l'entrée se "
-            f"prend en 15 minutes, donc c'est le 15 minutes qui dit quand elle est fausse. Un stop "
-            f"emprunté à une unité de temps supérieure ferait vivre le risque sur une échelle que "
-            f"le déclencheur ne surveille pas."
+            f"   Le stop est posé sur ce qui rendrait le scénario FAUX : {setup.stop_basis}. C'est "
+            f"toute la différence avec un stop placé à une distance calculée — s'il est touché, on "
+            f"sait pourquoi, et l'idée de départ est réellement invalidée."
         )
+        out.append(f"   L'objectif est posé de la même façon : {setup.target_basis}. On sort DEVANT "
+                   f"l'obstacle, jamais derrière : viser au-delà reviendrait à parier en plus que "
+                   f"le prix traverse un niveau que le marché défend.")
         if setup.target_level is not None:
+            out.append(f"   Le niveau majeur le plus proche sur la route se situe à "
+                       f"{setup.target_level:.6g} — c'est lui qui plafonne toute ambition.")
+        if setup.take_profit_2 is not None:
             out.append(
-                f"   L'objectif, lui, est {setup.target_basis}. Le prochain niveau horaire se situe "
-                f"à {setup.target_level:.6g} : on sort DEVANT lui, pas derrière. Viser au-delà "
-                f"reviendrait à parier que le prix traverse un niveau que le marché défend."
+                f"   Un second objectif est identifié à {setup.take_profit_2:.6g}. Dès que le "
+                f"premier est touché, deux règles protègent le gain : le stop remonte sur "
+                f"{setup.secure_stop:.6g} si le trade a parcouru deux fois son risque, et à "
+                f"{setup.tp1_lock_stop:.6g} (80 % du chemin) si le momentum confirme la suite. "
+                f"C'est toujours la plus favorable qui s'applique, et le stop ne recule jamais. "
+                f"Si le momentum ne confirme pas, on prend le gain au premier objectif."
             )
-        else:
-            out.append(f"   L'objectif est calculé ainsi : {setup.target_basis}.")
         if setup.horizon_label:
             out.append(
                 f"   Compte tenu de l'amplitude moyenne d'une bougie 15 minutes sur cet actif, "
@@ -789,11 +917,12 @@ def narrate(
             )
     else:
         floor_txt = (f" L'objectif ne peut pas descendre sous {min_target_pips:.0f} "
-                     f"{setup.pips_label}." if min_target_pips else "")
+                     f"{setup.pips_label} (l'ATR n'entre pas dans ce calcul)."
+                     if min_target_pips else "")
         out.append(f"   Aucun niveau n'est proposé puisqu'il n'y a pas d'entrée. Pour information, "
                    f"la stratégie exige un rapport risque/rendement entre {min_rr:g} et {max_rr:g}, "
-                   f"un stop pris sur la structure 15 minutes et un objectif borné par le prochain "
-                   f"niveau 1 heure.{floor_txt}")
+                   f"un stop posé sur le niveau qui invaliderait le scénario et un objectif posé "
+                   f"devant le premier obstacle réel.{floor_txt}")
     out.append("")
 
     # 7 — Le moment de la journée
@@ -832,10 +961,17 @@ def narrate(
             )
     else:
         out.append(
-            f"   Tous les points de la méthode sont réunis dans le sens {decision.lower()} : tendance "
-            f"de fond, confirmation journalière, confirmation 4 h, déclencheur 15 min, et un risque "
-            f"encadré. C'est pour cela que la décision est {decision}."
+            f"   Les points BLOQUANTS de la méthode sont réunis dans le sens {decision.lower()} : "
+            f"tendance de fond validée (4 h et 1 h d'accord), déclencheur 15 min formé, objectif "
+            f"d'au moins {min_target_pips:.0f} {setup.pips_label} et R/R dans la bande "
+            f"1:{min_rr:g}–1:{max_rr:g}. C'est pour cela que la décision est {decision}."
         )
+        unmet = [c["label"] for c in setup.checklist if not c["pass"]]
+        if unmet:
+            out.append(
+                "   Cases NON validées, laissées passer volontairement (elles informent, elles ne "
+                "refusent pas) : " + " ; ".join(unmet) + "."
+            )
         out.append(
             f"   SCORE DE FIABILITÉ DU TRADE : {fmt_score(score)} — {trade_reliability_label(score)}. "
             "Un score élevé signifie que les unités de temps s'accordent et que la fenêtre est "
@@ -847,7 +983,7 @@ def narrate(
 def structural_stop(h4: list[Candle], bias: int, entry: float, min_distance: float) -> float:
     """Stop recalé sur la STRUCTURE 4 H, garanti à au moins `min_distance` de l'entrée.
 
-    Nécessaire dès que l'objectif est ambitieux (200 pips) : un stop de 5 pips issu du bruit 15 min
+    Nécessaire dès que l'objectif est ambitieux : un stop de 5 pips issu du bruit 15 min
     donnerait un R/R de 40:1 que le marché ne paie jamais — la position serait stoppée avant d'avoir
     commencé à travailler. L'objectif et le stop doivent vivre sur la même échelle de temps ; le
     15 min, lui, ne sert qu'à choisir le MOMENT de l'entrée.
@@ -922,52 +1058,6 @@ def entry_structure(
     }
 
 
-def stop_behind_level(
-    structure: dict, entry: float, bias: int, *,
-    min_distance: float, max_distance: float, buffer_atr: float = 0.25,
-) -> tuple[float, str] | None:
-    """Place le stop JUSTE DERRIÈRE le support (ou la résistance) 15 min / 1 h le plus adapté.
-
-    On retient le niveau le plus PROCHE qui respecte encore la distance minimale exigée par la
-    stratégie : c'est le stop le plus serré qui ait un sens de marché, donc le meilleur R/R
-    possible sans placer la sortie au milieu de nulle part. Retourne ``None`` si aucun niveau ne
-    tombe dans la plage acceptable — on retombe alors sur la structure 4 h.
-    """
-    buffer = buffer_atr * (structure.get("atr") or 0.0)
-    candidates = structure["supports"] if bias > 0 else structure["resistances"]
-    for lvl in candidates:                       # déjà triés du plus proche au plus lointain
-        price = lvl - buffer if bias > 0 else lvl + buffer
-        distance = abs(entry - price)
-        if min_distance <= distance <= max_distance:
-            side = "support" if bias > 0 else "résistance"
-            return price, f"{side} {lvl:.6g} du 15 min / 1 h (stop placé juste derrière)"
-    return None
-
-
-def target_before_level(
-    structure: dict, entry: float, bias: int, *,
-    min_distance: float, max_distance: float, buffer_atr: float = 0.25,
-) -> tuple[float, str] | None:
-    """Place l'objectif JUSTE DEVANT la première résistance (ou support) qui offre la distance visée.
-
-    On vise le PREMIER niveau situé au-delà de la distance minimale : viser plus loin supposerait
-    que le prix traverse ce niveau-là, ce qui est un pari supplémentaire qu'on ne prend pas.
-    Retourne ``None`` si aucun niveau ne convient — l'objectif reste alors purement arithmétique.
-    """
-    buffer = buffer_atr * (structure.get("atr") or 0.0)
-    candidates = structure["resistances"] if bias > 0 else structure["supports"]
-    for lvl in candidates:
-        price = lvl - buffer if bias > 0 else lvl + buffer
-        distance = abs(price - entry)
-        if distance < min_distance:
-            continue                              # niveau trop proche : on le franchira
-        if distance > max_distance:
-            return None                           # le premier niveau utile est déjà hors bande
-        side = "résistance" if bias > 0 else "support"
-        return price, f"{side} {lvl:.6g} du 15 min / 1 h (objectif placé juste devant)"
-    return None
-
-
 def volatility_adjustment(
     daily: list[Candle], entry: float, bias: int, stop: float, *,
     max_atr_pct: float = MAX_ATR_PCT, mode: str = "adapt",
@@ -983,7 +1073,7 @@ def volatility_adjustment(
     Deux réponses possibles, toutes deux défendables :
     - ``adapt``  : on ÉLARGIT le stop proportionnellement à l'excès de volatilité. On garde le trade
       et on paie le vrai prix du risque. L'objectif suivant automatiquement (R/R × risque), la
-      contrainte des 200 pips reste satisfaite et la taille de position se réduit d'elle-même.
+      plancher d'objectif reste satisfait et la taille de position se réduit d'elle-même.
     - ``refuse`` : on n'entre pas au-dessus du seuil. Plus simple, mais on renonce à des mouvements
       qui sont précisément ceux qui paient le mieux quand ils partent dans le bon sens.
 
@@ -1020,51 +1110,6 @@ def secured_stop(entry: float, stop_loss: float, direction: str, *, at_r: float 
     return entry + sign * at_r * risk
 
 
-def target_barrier(
-    candles: list[Candle], bias: int, entry: float,
-    *, buffer_mult: float = TARGET_LEVEL_BUFFER, lookback: int = 120, strength: int = 3,
-) -> dict | None:
-    """Prochain niveau 1 H dans le sens du trade — c'est LUI qui borne l'objectif.
-
-    « Niveau 1 h » = sommet/creux de swing horaire CONFIRMÉ (le pivot doit dominer `strength`
-    bougies de chaque côté, soit 3 heures avant et 3 heures après), plus l'extrême de la fenêtre
-    observée. La confirmation à 3 bougies est délibérée : un micro-pivot d'une seule heure n'est pas
-    un niveau que le marché défend, et le retenir bloquerait tous les objectifs.
-
-    On place l'objectif un peu AVANT le niveau (marge de `buffer_mult` × ATR 1 h) : sortir juste
-    devant un niveau que tout le monde surveille est très différent de miser sur sa traversée.
-
-    Retourne ``{"level", "target", "atr", "source"}`` ou ``None`` si aucun niveau n'est identifiable
-    (dans ce cas l'objectif n'est borné que par les niveaux MAJEURS mensuels/journaliers).
-    """
-    if not candles or len(candles) < 20 or bias == 0:
-        return None
-    window = candles[-lookback:] if len(candles) > lookback else candles
-    atr1 = ind.atr(window, 14) or 0.0
-    buf = buffer_mult * atr1
-    sw = ind.swing_points(window, strength, strength)
-    # On retient TOUT niveau situé devant le prix, même collé à lui : un niveau à 2 pips au-dessus
-    # de l'entrée n'est pas « aucun niveau », c'est un objectif impossible — et c'est au calcul de
-    # marge de le refuser, pas à cette fonction de le masquer.
-    if bias > 0:
-        candidates = [p for _, p in sw["highs"] if p > entry]
-        top = max(c.high for c in window)
-        if top > entry:
-            candidates.append(top)
-        if not candidates:
-            return None      # la route est libre : aucun sommet 1 h devant le prix
-        level = min(candidates)
-        return {"level": round(level, 8), "target": level - buf, "atr": atr1, "source": "swing 1 h"}
-    candidates = [p for _, p in sw["lows"] if p < entry]
-    bottom = min(c.low for c in window)
-    if bottom < entry:
-        candidates.append(bottom)
-    if not candidates:
-        return None
-    level = max(candidates)
-    return {"level": round(level, 8), "target": level + buf, "atr": atr1, "source": "swing 1 h"}
-
-
 # --------------------------------------------------------------------------------------
 # Assemblage complet
 # --------------------------------------------------------------------------------------
@@ -1090,6 +1135,9 @@ class PlaybookSetup:
     # Niveau où le stop sera automatiquement remonté dès qu'il est atteint (+2R) : à partir de là
     # la position ne peut plus redevenir perdante.
     secure_stop: float | None = None
+    # Niveau où le stop remonte quand TP1 est touché ET que le momentum confirme la course vers
+    # TP2 (80 % du chemin parcouru). Coexiste avec `secure_stop` : la règle la plus favorable gagne.
+    tp1_lock_stop: float | None = None
     # Décision du filtre de volatilité (none / widen / refuse) et les chiffres qui l'ont motivée.
     volatility: dict = field(default_factory=dict)
     # Supports / résistances 15 min et 1 h qui encadrent l'entrée — ceux qui posent le SL et le TP.
@@ -1107,6 +1155,11 @@ class PlaybookSetup:
     reasons: list[str] = field(default_factory=list)
     pips_label: str = "pips"
     trend_explanation: str = ""       # comment la tendance de fond a été établie (étape 1)
+    # Sortie complète du moteur de tendance multi-indicateurs (cf. domain.trend) : statut, score de
+    # confiance, ADX, et le détail du vote de chaque unité de temps.
+    trend: dict = field(default_factory=dict)
+    # Confirmations d'entrée retenues par la confluence (outil, poids, qualité, lecture).
+    entry_confirmations: list[dict] = field(default_factory=list)
     # Score de fiabilité AFFICHÉ : +1..+5 pour un achat, -1..-5 pour une vente, 0 = pas de trade.
     reliability_score: int = 0
     # Fiabilité du CONTEXTE (étapes 1-3) — renseignée même sans déclencheur 15 min. C'est elle qui
@@ -1132,6 +1185,7 @@ class PlaybookSetup:
             "trigger": self.trigger, "stop_basis": self.stop_basis,
             "target_basis": self.target_basis, "target_level": self.target_level,
             "secure_stop": self.secure_stop, "secure_at_r": SECURE_AT_R,
+            "tp1_lock_stop": self.tp1_lock_stop, "tp1_lock_fraction": TP1_LOCK_FRACTION,
             "volatility": self.volatility, "entry_levels": self.entry_levels,
             "horizon_days": self.horizon_days, "horizon_hours": self.horizon_hours,
             "horizon_label": self.horizon_label,
@@ -1139,6 +1193,7 @@ class PlaybookSetup:
             "insufficient": self.insufficient, "checklist": self.checklist,
             "levels": self.levels, "session": self.session, "reasons": self.reasons,
             "layers": self.layers, "trend_explanation": self.trend_explanation,
+            "trend": self.trend, "entry_confirmations": self.entry_confirmations,
             "reliability_score": self.reliability_score,
             "reliability": trade_reliability_label(self.reliability_score),
             "context_reliability": self.context_reliability,
@@ -1164,6 +1219,55 @@ def _check(step: int, label: str, ok: bool, value: str, explain: str = "") -> di
     return {"step": step, "label": label, "pass": bool(ok), "value": value, "explain": explain}
 
 
+def settings_kwargs(s) -> dict:  # noqa: ANN001 — `s` est un `Settings`, importé côté appelant
+    """Tous les réglages de `build` lus depuis la configuration, en UN seul endroit.
+
+    Trois appelants exécutent la stratégie — la production (`playbook_service`), le backtest
+    (`backtest.playbook_backtest`) et l'entraînement nocturne (`training_service`) — et ils DOIVENT
+    la lancer avec exactement les mêmes réglages, sinon le backtest ne mesure plus ce qui trade.
+    Cette liste a déjà divergé une fois : `training_service` passait deux mots-clés inexistants, le
+    `AttributeError` était avalé et le walk-forward nocturne rendait zéro trade en silence. Un seul
+    point de vérité rend cette classe de bug impossible.
+
+    Le module `domain` n'importe pas la configuration : c'est l'appelant qui fournit `s`.
+    """
+    from app.domain import entry_confluence as _conf
+    from app.domain import trend as _trend
+
+    return {
+        "min_rr": s.playbook_min_rr,
+        "max_rr": s.playbook_max_rr,
+        "min_target_pips": s.playbook_min_target_pips,
+        "max_stop_pips": s.playbook_max_stop_pips,
+        "min_stop_atr_daily": s.playbook_min_stop_atr_daily,
+        "max_stop_atr_daily": s.playbook_max_stop_atr_daily,
+        "min_target_atr_daily": s.playbook_min_target_atr_daily,
+        "max_atr_multiple": s.playbook_max_atr_multiple,
+        # Filtres mesurés (déclencheur divergence, volatilité excessive).
+        "allow_divergence": s.playbook_allow_divergence_entry,
+        "volatility_filter": s.playbook_volatility_filter,
+        "volatility_mode": s.playbook_volatility_mode,
+        "max_atr_pct": s.playbook_max_atr_pct,
+        "volatility_max_widen": s.playbook_volatility_max_widen,
+        # Étape 1 — tendance multi-indicateurs.
+        "trend_engine": s.playbook_trend_engine,
+        "trend_min_score": s.playbook_trend_min_score,
+        "trend_weights": _trend.parse_weights(s.playbook_trend_weights),
+        "trend_required_tfs": _trend.parse_required_tfs(s.playbook_trend_required_tfs),
+        # Étape 2 — confluence pondérée.
+        "entry_mode": s.playbook_entry_mode,
+        "confluence_min_score": s.playbook_confluence_min_score,
+        "confluence_weights": _conf.parse_weights(s.playbook_confluence_weights),
+        # Étape 3 — sorties.
+        "tp1_lock_fraction": s.playbook_tp1_lock_fraction,
+        # Quelles cases de la checklist refusent réellement le trade.
+        "require_daily": s.playbook_require_daily_confirmation,
+        "block_stop_width": s.playbook_block_on_stop_width,
+        "block_room": s.playbook_block_on_major_level,
+        "block_reach": s.playbook_block_on_atr_reach,
+    }
+
+
 def build(
     symbol: str,
     monthly: list[Candle],
@@ -1176,7 +1280,10 @@ def build(
     min_rr: float = MIN_RR,
     min_target_pips: float = MIN_TARGET_PIPS,
     max_stop_pips: float = MAX_STOP_PIPS,
-    target_level_buffer: float = TARGET_LEVEL_BUFFER,
+    # Échelle du trade, en multiples de l'ATR journalier — valable sur tous les marchés.
+    min_stop_atr_daily: float = MIN_STOP_ATR_DAILY,
+    max_stop_atr_daily: float = MAX_STOP_ATR_DAILY,
+    min_target_atr_daily: float = MIN_TARGET_ATR_DAILY,
     max_rr: float = MAX_RR,
     max_atr_multiple: float = MAX_ATR_MULTIPLE,
     can_trade: bool = True,
@@ -1191,6 +1298,30 @@ def build(
     # n'a pas tranché.
     stop_mode: str = "structure",
     stop_atr_mult: float = 2.0,
+    # --- Étape 1 : moteur de tendance multi-indicateurs (cf. domain.trend) ---
+    # `trend_engine=False` rejoue l'ANCIEN calcul du biais (moyenne mensuel/journalier). N'existe
+    # que pour l'A/B test du backtest : la production utilise le moteur multi-indicateurs.
+    trend_engine: bool = True,
+    trend_weights: dict[str, float] | None = None,
+    trend_min_score: float = trend_mod.TREND_MIN_SCORE,
+    # Unités de temps dont l'accord est EXIGÉ pour valider la tendance. Par défaut 4 h + 1 h : le
+    # journalier pèse dans le score mais ne pose plus de veto (cf. `domain.trend.REQUIRED_TFS`).
+    trend_required_tfs: tuple[str, ...] | None = None,
+    # --- Quelles cases de la checklist REFUSENT le trade (les autres restent affichées) ---
+    require_daily: bool = False,      # « le journalier confirme »
+    block_stop_width: bool = False,   # « stop structurel cohérent »
+    block_room: bool = False,         # « objectif atteignable avant le niveau majeur opposé »
+    block_reach: bool = False,        # « objectif compatible avec la volatilité (≤ N × ATR) »
+    # Fraction du chemin TP1 verrouillée quand TP1 est touché et le momentum confirmé.
+    tp1_lock_fraction: float = TP1_LOCK_FRACTION,
+    # --- Étape 2 : comment l'entrée est autorisée ---
+    #   "legacy"     : uniquement les déclencheurs historiques (repli / cassure / divergence) ;
+    #   "confluence" : uniquement la règle du minimum de confirmations pondérées ;
+    #   "hybrid"     : l'un OU l'autre (défaut) — on garde la cassure, la mieux mesurée, et on
+    #                  ajoute les entrées que la confluence sait qualifier.
+    entry_mode: str = "hybrid",
+    confluence_weights: dict[str, float] | None = None,
+    confluence_min_score: float = entry_confluence.MIN_CONFIRMATION_SCORE,
 ) -> PlaybookSetup:
     """Exécute la stratégie de bout en bout et retourne le setup (ou un refus motivé).
 
@@ -1225,23 +1356,46 @@ def build(
     pip = pips_mod.pip_size(symbol, price)
     setup.pips_label = pips_mod.label(symbol)
 
-    # ---------------- Étape 1 : tendance de fond (mensuel + journalier) + niveaux majeurs ----------
-    trend_score = 0.5 * l_month.score + 0.5 * l_day.score
-    bias = _bias_of(trend_score)
+    # ---------------- Étape 1 : LA TENDANCE, calculée une seule fois + niveaux majeurs ----------
+    # Multi-indicateurs (EMA50/200, structure HH/HL, SuperTrend, MACD, RSI, volume) sur quatre
+    # unités de temps, avec verrou ADX. Une fois validée, elle est FIGÉE : ni la recherche du point
+    # d'entrée ni le calcul du stop et de l'objectif ne la remettent en cause.
+    sens = "INDÉTERMINÉE"
+    if trend_engine:
+        trend = trend_mod.trend_confidence(
+            monthly, daily, h4, h1 or [], m15,
+            weights=trend_weights, min_score=trend_min_score,
+            required_tfs=trend_required_tfs,
+        )
+        bias = trend["direction"]
+        setup.trend = trend
+        setup.trend_explanation = trend["explanation"]
+        trend_ok = trend["status"] == "valid"
+        sens = "HAUSSIÈRE" if bias > 0 else "BAISSIÈRE" if bias < 0 else "INDÉTERMINÉE"
+        trend_value = (
+            f"score {trend['score']:+.2f} · confiance {trend['score_100']}/100 · "
+            f"ADX journalier {trend['adx'].get('journalier', 0):.0f}"
+        )
+        req_txt = " + ".join(trend.get("required_tfs") or ["4 h", "1 h"])
+        trend_label = f"Tendance multi-indicateurs validée (accord exigé : {req_txt})"
+    else:
+        # Chemin historique, conservé uniquement pour l'A/B test : moyenne mensuel + journalier.
+        legacy_score = 0.5 * l_month.score + 0.5 * l_day.score
+        bias = _bias_of(legacy_score)
+        trend_ok = bias != 0
+        sens = "HAUSSIÈRE" if bias > 0 else "BAISSIÈRE" if bias < 0 else "INDÉTERMINÉE"
+        setup.trend_explanation = (
+            f"Tendance de fond {sens} : moyenne du mensuel ({l_month.score:+.2f}, "
+            f"{score_strength(l_month.score)}) et du journalier ({l_day.score:+.2f}, "
+            f"{score_strength(l_day.score)}) = {legacy_score:+.2f}. "
+            f"Il faut dépasser ±{MIN_LAYER_SCORE:.2f} pour engager un trade.\n"
+            f"• Mensuel — {l_month.explanation}\n• Journalier — {l_day.explanation}"
+        )
+        trend_value = (f"(mensuel {l_month.score:+.2f} + journalier {l_day.score:+.2f}) / 2 = "
+                       f"{legacy_score:+.2f} → {sens.lower()}")
+        trend_label = "Tendance de fond mensuelle + journalière établie"
     setup.bias = bias
-    sens = "HAUSSIÈRE" if bias > 0 else "BAISSIÈRE" if bias < 0 else "INDÉTERMINÉE"
-    setup.trend_explanation = (
-        f"Tendance de fond {sens} : moyenne du mensuel ({l_month.score:+.2f}, "
-        f"{score_strength(l_month.score)}) et du journalier ({l_day.score:+.2f}, "
-        f"{score_strength(l_day.score)}) = {trend_score:+.2f}. "
-        f"Il faut dépasser ±{MIN_LAYER_SCORE:.2f} pour engager un trade.\n"
-        f"• Mensuel — {l_month.explanation}\n• Journalier — {l_day.explanation}"
-    )
-    checklist.append(_check(
-        1, "Tendance de fond mensuelle + journalière établie", bias != 0,
-        f"(mensuel {l_month.score:+.2f} + journalier {l_day.score:+.2f}) / 2 = {trend_score:+.2f} → {sens.lower()}",
-        setup.trend_explanation,
-    ))
+    checklist.append(_check(1, trend_label, trend_ok, trend_value, setup.trend_explanation))
 
     levels = major_levels(monthly, daily, price)
     setup.levels = levels
@@ -1256,18 +1410,32 @@ def build(
     ))
 
     if bias == 0:
-        reasons.append("tendance de fond indéterminée (mensuel et journalier ne s'accordent pas)")
+        if trend_engine and setup.trend.get("reasons"):
+            reasons.append("tendance de fond non validée — " + " ; ".join(setup.trend["reasons"]))
+        else:
+            reasons.append("tendance de fond indéterminée (mensuel et journalier ne s'accordent pas)")
     if not has_levels:
         reasons.append("aucun niveau majeur exploitable")
 
-    # ---------------- Étape 2 : le journalier doit CONFIRMER ----------------
+    # ---------------- Étape 2 : le journalier CONFIRME (information, plus une condition) --------
+    # Le journalier n'est plus obligatoire (décision du 28/07/2026). Il pèse toujours 40 % du score
+    # de tendance — un journalier franchement contraire empêche donc encore souvent la direction
+    # d'être nommée à l'étape 1 — mais il ne pose plus de veto à lui seul. `require_daily=True`
+    # rétablit l'ancien comportement pour pouvoir en mesurer le coût.
     day_ok = l_day.bias == bias and bias != 0
     checklist.append(_check(
-        2, "Journalier confirme (RSI14, MA20/MA50, volume, VWAP, divergences, Fibonacci)", day_ok,
+        2,
+        "Journalier confirme (RSI14, MA20/MA50, volume, VWAP, divergences, Fibonacci)"
+        + ("" if require_daily else " — information"),
+        day_ok,
         f"score {l_day.score:+.2f} ({score_strength(l_day.score)})",
-        l_day.explanation,
+        l_day.explanation
+        + ("" if require_daily else
+           "\nCette case n'est PAS bloquante : le 4 h et le 1 h suffisent à valider la direction. "
+           "Un ❌ ici signale un journalier qui ne va pas dans notre sens — c'est une raison de "
+           "réduire la conviction, pas de refuser l'entrée."),
     ))
-    if bias != 0 and not day_ok:
+    if bias != 0 and not day_ok and require_daily:
         reasons.append("le journalier ne confirme pas la tendance de fond")
 
     # ---------------- Étape 3 : le 4h doit CONFIRMER ----------------
@@ -1293,36 +1461,79 @@ def build(
     if bias != 0 and not h1_ok:
         reasons.append("le 1 h ne confirme pas le biais")
 
-    context_ok = bias != 0 and has_levels and day_ok and h4_ok and h1_ok
+    # Le contexte est validé par la tendance, les niveaux majeurs et les DEUX confirmations qui
+    # portent réellement un trade dont l'entrée se prend en 15 min : le 4 h et le 1 h. Le journalier
+    # n'y entre que si `require_daily` est explicitement rétabli.
+    context_ok = (bias != 0 and has_levels and h4_ok and h1_ok
+                  and (day_ok or not require_daily))
     setup.context_ok = context_ok
 
-    # ---------------- Étape 5 : déclencheur d'entrée 15 min ----------------
-    trig = entry_trigger(m15, bias if context_ok else 0, l_m15, allow_divergence=allow_divergence)
+    # ---------------- Étape 5 : QUAND entrer — déclencheurs 15 min + confluence ----------------
+    # Deux lectures complémentaires du même graphique 15 min :
+    #  - les DÉCLENCHEURS historiques (repli, cassure, divergence), dont la cassure reste le signal
+    #    le mieux mesuré du backtest (69 % de réussite, +1,15 R) — on ne s'en prive pas ;
+    #  - la CONFLUENCE pondérée, qui autorise l'entrée dès que trois confirmations sérieuses se
+    #    rejoignent (zone d'offre/demande, cassure de structure, figure de retournement, niveau
+    #    majeur, Fibonacci, RSI, VWAP, EMA, volume).
+    # En mode « hybrid » (défaut), l'un OU l'autre suffit : la confluence ajoute des opportunités
+    # sans retirer celles que la mesure a validées.
+    entry_direction = bias if context_ok else 0
+    trig = entry_trigger(m15, entry_direction, l_m15, allow_divergence=allow_divergence)
+    # Zones et niveaux sont calculés UNE fois puis partagés entre l'étape 2 (choisir le moment) et
+    # l'étape 3 (poser le stop et les objectifs) : ce sont les mêmes outils, et `build` est appelé
+    # des dizaines de milliers de fois par un backtest.
+    last_price = m15[-1].close if m15 else price
+    sd_zones = zones_mod.supply_demand_zones(m15, tf="15m")
+    if h1:
+        sd_zones += zones_mod.supply_demand_zones(h1, tf="1h")
+    sr_levels = zones_mod.ranked_levels(m15, h1, h4, last_price)
+    market_struct = ms_mod.label_swings(m15)
+
+    conf: dict = {"fired": False, "confirmations": [], "score": 0.0, "reason": ""}
+    if entry_mode in ("confluence", "hybrid"):
+        conf = entry_confluence.evaluate_entry(
+            m15, direction=entry_direction, trend=setup.trend,
+            zones=sd_zones, sr_levels=sr_levels,
+            metrics=l_m15.metrics, session=session,
+            weights=confluence_weights, min_score=confluence_min_score,
+        )
+        setup.entry_confirmations = conf["confirmations"]
+    if entry_mode == "confluence":
+        trig = _trigger_from_confluence(conf, m15, entry_direction)
+    elif entry_mode == "hybrid" and not trig["fired"] and conf["fired"]:
+        trig = _trigger_from_confluence(conf, m15, entry_direction)
+
     checklist.append(_check(
         5, "Déclencheur d'entrée en 15 min (seule UT d'entrée)", bool(trig["fired"]),
         trig["reason"] or "—",
-        "L'entrée ne se prend QUE en 15 min, et seulement sur l'un des trois déclencheurs : repli "
-        "sur MA20/MA50 ou zone d'or Fibonacci avec bougie de reprise, cassure confirmée par le "
-        "volume et le VWAP, ou divergence en notre faveur. Le 15 min donne le TIMING ; la direction "
-        "vient des unités supérieures.\n" + l_m15.explanation,
+        "L'entrée ne se prend QU'en 15 min. Elle est autorisée soit par un déclencheur classique "
+        "(repli sur MA20/MA50 ou zone d'or Fibonacci avec bougie de reprise, cassure confirmée par "
+        "le volume et le VWAP), soit par la CONFLUENCE : au moins trois confirmations pondérées "
+        f"totalisant {confluence_min_score:g} points, dont au moins une confirmation forte (zone "
+        "d'offre/demande, cassure de structure, figure de retournement, support ou résistance "
+        "majeur). Toutes les confirmations ne se valent pas : ce que le prix FAIT pèse le double "
+        "de ce qui ne fait que le commenter. Le 15 min donne le TIMING ; la direction vient des "
+        "unités supérieures et n'est plus rediscutée.\n" + l_m15.explanation,
     ))
     if context_ok and not trig["fired"]:
         reasons.append(f"pas d'entrée 15 min : {trig['reason']}")
 
-    # --- Heures de marché : on ANALYSE toujours, on n'OUVRE que si une grande place est ouverte ---
-    # `can_trade` est la décision de l'appelant : il combine le réglage global et l'état réel des
-    # sessions. On s'y tient — re-tester la session ici rendrait le réglage impossible à désactiver.
+    # --- Heures de marché ---
+    # `can_trade` est la décision de l'appelant. Le desk travaillant tous les marchés 24 h/24, il
+    # vaut vrai par défaut ; la fenêtre de session reste mesurée et module la conviction (étape 9),
+    # elle n'interdit plus l'ouverture. Le réglage `playbook_trade_only_when_open` permet de
+    # rétablir la restriction sans toucher au code.
     sess_ctx = session or {}
     if not can_trade:
         checklist.append(_check(
-            5, "Place de Londres ou de New York ouverte", False,
+            5, "Marché ouvert à l'ouverture de position", False,
             sess_ctx.get("trade_window") or sess_ctx.get("label", "marchés fermés"),
-            "L'analyse tourne en permanence, y compris marchés fermés — c'est ainsi qu'on arrive "
-            "préparé à l'ouverture. Mais on n'OUVRE pas de position hors des heures de Londres et "
-            "de New York : le carnet d'ordres est vide, les écarts s'élargissent et les mouvements "
-            "ne sont pas représentatifs.",
+            "L'analyse tourne en permanence — c'est ainsi qu'on arrive préparé à l'ouverture. La "
+            "restriction horaire est désactivée par défaut depuis que le desk trade tous les "
+            "marchés ; quand elle est réactivée, aucune position ne s'ouvre hors des heures de "
+            "Londres et de New York.",
         ))
-        reasons.append("marchés de Londres et de New York fermés — analyse seule, pas d'ouverture")
+        reasons.append("ouverture interdite hors séance (restriction horaire activée)")
 
     # --- Score transmis au Master (informatif même sans déclencheur) ---
     alignment = sum(
@@ -1363,47 +1574,76 @@ def build(
         setup.confidence = round(0.25 + 0.35 * alignment, 3)
         return _finish(setup)
 
-    # ---------------- Étapes 6-8 : risque, objectif ≥ 200 pips, faisabilité ----------
+    # ---------------- Étapes 6-8 : stop qui invalide le scénario, objectifs, faisabilité --------
     entry = trig["entry"]
     stop = trig["stop"]
     sign = 1 if bias > 0 else -1
 
-    # --- Le stop doit permettre de loger 200 pips dans la bande de R/R ---
-    # 200 pips avec un R/R plafonné à 1:3 => stop d'au moins 200/3 ≈ 67 pips. Le stop 15 min du
-    # déclencheur (quelques pips) est donc systématiquement recalé sur la STRUCTURE 4 H : c'est la
-    # seule échelle où un stop de cette taille a un sens de marché.
-    target_floor = min_target_pips * pip
-    min_risk = target_floor / max_rr if max_rr > 0 else target_floor
-    max_risk = min(max_stop_pips * pip, target_floor / min_rr if min_rr > 0 else max_stop_pips * pip)
+    # --- ÉCHELLE DU TRADE : ce qui fait la qualité du setup ---
+    # Mesuré : un stop assez large et un objectif assez lointain valent +0,605 R et un profit factor
+    # de 2,25, contre +0,294 R et 1,49 quand on laisse la stratégie prendre des trades courts. La
+    # raison est simple : un stop serré est touché par la respiration du marché, pas par une
+    # invalidation, et un objectif proche ne paie pas le risque pris.
+    # L'échelle est exprimée en ATR JOURNALIER pour que la même règle vaille sur EUR/USD comme sur
+    # le DAX — un nombre de pips n'aurait aucun sens sur un indice.
+    atr15 = ind.atr(m15, 14) or 0.0
+    atr_daily = ind.atr(daily, 14) or 0.0
+    # Plancher de l'objectif : le plancher en PIPS (50 par défaut). Le terme en ATR journalier vaut
+    # zéro par défaut depuis le 28/07/2026 — « ne prends pas en considération l'ATR dans le profit ».
+    # Il survit comme paramètre pour pouvoir rejouer l'ancienne échelle dans un A/B.
+    target_floor = max(min_target_pips * pip, min_target_atr_daily * atr_daily)
+    # Plancher du stop : le bruit du 15 min, l'échelle en ATR journalier, et de quoi rendre le
+    # plancher d'objectif atteignable au R/R MAXIMUM (sinon un objectif de 50 pips ne pourrait
+    # jamais tomber dans la bande avec un stop minuscule).
+    min_risk = max(
+        MIN_STOP_ATR15 * atr15,
+        min_stop_atr_daily * atr_daily,
+        target_floor / max_rr if max_rr > 0 else 0.0,
+    )
+    # Plafond du risque : c'est lui qui contient le DRAWDOWN. Un stop trop large ne perd pas plus
+    # souvent, il perd beaucoup plus gros — mesuré, l'oublier double le drawdown maximal.
+    # Le plancher d'objectif ne plafonne PLUS le risque (l'ancien `target_floor / min_rr`) : avec un
+    # plancher à 50 pips, cette borne aurait imposé un stop de 25 pips maximum à TOUS les trades,
+    # sur tous les marchés. Le plancher d'objectif est un minimum à viser, pas une limite de taille.
+    max_risk = max_stop_pips * pip
+    if atr_daily > 0 and max_stop_atr_daily > 0:
+        max_risk = min(max_risk, max_stop_atr_daily * atr_daily)
+    # Garde-fou : la bande doit rester cohérente même si les réglages se contredisent.
+    max_risk = max(max_risk, min_risk)
 
-    # --- SUPPORTS / RÉSISTANCES 15 MIN et 1 H : ce sont eux qui POSENT le stop et l'objectif ---
-    # Un stop placé à une distance calculée ne correspond à rien sur le graphique ; placé derrière
-    # un support réel, il n'est franchi que si ce support cède — c'est-à-dire si le scénario est
-    # réellement invalidé. Même logique pour l'objectif, posé devant la première résistance.
+    # --- LES OUTILS DE CONFLUENCE POSENT LE STOP ET L'OBJECTIF ---
+    # Ce sont exactement ceux qui ont servi à décider de l'entrée : zones d'offre/demande, structure
+    # du marché, supports et résistances classés par importance, extensions de Fibonacci. Le stop
+    # est donc placé là où le scénario devient FAUX, et l'objectif devant le premier obstacle réel.
     structure = entry_structure(m15, h1, entry)
     setup.entry_levels = {
         "supports": [round(x, 8) for x in structure["supports"][:5]],
         "resistances": [round(x, 8) for x in structure["resistances"][:5]],
         "timeframes": "15 min + 1 h" if h1 else "15 min",
+        "ranked": sr_levels[:5],
+        "zones": [z for z in sd_zones[:4]],
+        "structure_state": market_struct["state"],
     }
 
-    anchored = stop_behind_level(structure, entry, bias,
-                                 min_distance=min_risk, max_distance=max_risk)
-    if anchored is not None:
-        stop, setup.stop_basis = anchored
-    elif abs(entry - stop) < min_risk:
-        stop = structural_stop(h4, bias, entry, min_risk)
-        setup.stop_basis = (
-            f"structure 4 h (aucun support/résistance 15 min ou 1 h à une distance exploitable "
-            f"pour viser {min_target_pips:.0f} {setup.pips_label})"
-        )
-    else:
-        setup.stop_basis = "structure 15 min (déjà assez large pour l'objectif)"
+    # Repli historique : la structure 4 h, qui reste la référence quand rien de plus fin ne tombe
+    # dans la bande de risque acceptable. Elle garantit la distance MINIMALE mais peut dépasser le
+    # plafond : on la ramène alors dans la bande plutôt que de refuser le trade — un stop plafonné
+    # reste un stop de taille saine, alors qu'un refus perd l'opportunité pour une raison de forme.
+    fb_stop = structural_stop(h4, bias, entry, min_risk)
+    fb_reason = "structure 4 h (aucun niveau plus fin à une distance exploitable)"
+    if abs(entry - fb_stop) > max_risk:
+        fb_stop = entry - sign * max_risk
+        fb_reason = "risque plafonné (la structure 4 h est trop éloignée pour être suivie telle quelle)"
+    stop, setup.stop_basis = exits.plan_stop(
+        entry=entry, direction=bias, h4=h4, zones=sd_zones, sr_levels=sr_levels,
+        structure=market_struct, atr15=atr15,
+        min_distance=min_risk, max_distance=max_risk, fallback=(fb_stop, fb_reason),
+    )
 
     # --- Variante A/B « stop_atr4h » : stop à k × ATR 4 h, borné par la bande de R/R ---
     # Réponse candidate au constat de volatilité (les stoppés ont un ATR 21 % plus haut) : un stop
     # proportionnel à la volatilité RÉELLE du moment plutôt que posé sur la structure. La borne
-    # [min_risk ; max_risk] préserve la contrainte des 200 pips et la bande de R/R.
+    # [min_risk ; max_risk] préserve le plancher d'objectif et la bande de R/R.
     if stop_mode == "atr4h":
         atr4 = ind.atr(h4, 14) or 0.0
         if atr4 > 0:
@@ -1432,39 +1672,56 @@ def build(
     risk_dist = abs(entry - stop)
     risk_pips = risk_dist / pip if pip else 0.0
 
-    stop_ok = 0 < risk_pips <= max_stop_pips
+    # Le plafond EFFECTIF est celui calculé plus haut, pas le garde-fou brut en pips : sur un marché
+    # dont l'amplitude quotidienne dépasse 1,5 % du prix (crypto, actions très volatiles), un plafond
+    # de 150 pips équivalents refuserait TOUS les stops, y compris ceux que l'échelle en ATR juge
+    # parfaitement sains. Mesuré : c'est ce qui produisait zéro trade sur la crypto.
+    # Tolérance de 1 % : `plan_stop` place le stop juste derrière son niveau, la marge peut le faire
+    # dépasser le plafond d'un cheveu sans que le trade devienne déraisonnable.
+    max_risk_pips = (max_risk / pip) if pip else max_stop_pips
+    stop_ok = 0 < risk_dist <= max_risk * 1.01
     checklist.append(_check(
-        6, f"Stop structurel cohérent (≤ {max_stop_pips:.0f} {setup.pips_label})", stop_ok,
-        f"{risk_pips:.1f} {setup.pips_label} — placé sur la {setup.stop_basis}",
-        f"Le stop est placé derrière la structure, jamais à une distance arbitraire. Il doit valoir "
-        f"au moins {min_risk / pip:.0f} {setup.pips_label} (objectif {min_target_pips:.0f} ÷ R/R "
-        f"maximum 1:{max_rr:g}) : viser {min_target_pips:.0f} pips avec un stop minuscule donnerait "
-        f"un R/R irréaliste et la position sauterait au premier soubresaut. Le 15 min donne le "
-        f"moment de l'entrée ; il ne porte pas le risque.",
+        6,
+        f"Stop structurel cohérent (≤ {max_risk_pips:.0f} {setup.pips_label})"
+        + ("" if block_stop_width else " — information"),
+        stop_ok,
+        f"{risk_pips:.1f} {setup.pips_label} — {setup.stop_basis}",
+        f"Le stop est posé sur un NIVEAU qui invalide le scénario (zone d'offre/demande, creux de "
+        f"structure, support ou résistance), jamais à une distance arbitraire : s'il est touché, "
+        f"c'est que l'idée était fausse, et on le sait. Sa taille VISÉE est entre "
+        f"{min_risk / pip:.0f} et {max_risk_pips:.0f} {setup.pips_label}, soit "
+        f"{min_stop_atr_daily:g} à {max_stop_atr_daily:g} × l'amplitude d'une journée moyenne : "
+        f"plus serré, il saute sur la respiration du marché ; plus large, chaque perte coûte trop "
+        f"cher et le drawdown s'envole."
+        + ("" if block_stop_width else
+           "\nCette case n'est PAS bloquante : quand le déclencheur 15 min se forme, le trade est "
+           "pris même si le niveau d'invalidation tombe au-delà du plafond. Le R/R reste calculé "
+           "sur le stop RÉEL, donc l'objectif suit — c'est la taille de position, dimensionnée sur "
+           "la distance au stop, qui absorbe l'écart."),
     ))
 
-    # --- Objectif : au moins 200 pips ET au moins le R/R minimum ---
-    # L'objectif satisfait SIMULTANÉMENT les deux contraintes ; le R/R qui en résulte doit ensuite
-    # tomber dans la bande [min_rr ; max_rr], sinon le setup est refusé.
-    target_dist = max(min_rr * risk_dist, target_floor)
-    setup.target_basis = (
-        f"max({min_rr:g} × risque, {min_target_pips:.0f} {setup.pips_label})"
+    # --- Objectifs : posés sur des niveaux RÉELS, dans la bande de R/R autorisée ---
+    # Mêmes outils que pour l'entrée et le stop : résistances classées, zones opposées, extensions
+    # de Fibonacci, structure. On vise le premier obstacle qui paie le risque pris — viser au-delà
+    # supposerait de traverser un niveau défendu, ce qui est un pari supplémentaire.
+    barrier = levels["major_resistance"] if bias > 0 else levels["major_support"]
+    fib_ext = ind.fibonacci_extension(m15)
+    plan = exits.plan_targets(
+        entry=entry, stop=stop, direction=bias, zones=sd_zones, sr_levels=sr_levels,
+        structure=market_struct, fib_ext=fib_ext, barrier=barrier,
+        min_rr=min_rr, max_rr=max_rr, atr15=atr15, floor_distance=target_floor,
     )
-    # L'objectif est posé DEVANT la première résistance (ou support) 15 min / 1 h qui offre au moins
-    # cette distance : viser au-delà supposerait de traverser ce niveau, pari qu'on ne prend pas.
-    aimed = target_before_level(
-        structure, entry, bias,
-        min_distance=target_dist, max_distance=max_rr * risk_dist,
-    )
-    if aimed is not None:
-        target_price, target_reason = aimed
-        target_dist = abs(target_price - entry)
-        setup.target_basis = target_reason
+    tp1 = plan["tp1"]
+    tp2 = plan["tp2"]
+    tp3 = None      # la stratégie ne définit que deux objectifs ; un troisième serait inventé
+    target_dist = abs(tp1 - entry)
+    setup.target_basis = plan["target_basis"]
+    reward_pips = target_dist / pip if pip else 0.0
+    rr = plan["rr"]
 
     # Faisabilité : l'objectif doit être atteignable AVANT le niveau MAJEUR opposé — celui que tout
     # le marché surveille (swings mensuels, extrêmes journaliers de référence). On ne borne PAS
     # l'objectif sur chaque micro-swing journalier : ils sont trop denses et bloqueraient tout.
-    barrier = levels["major_resistance"] if bias > 0 else levels["major_support"]
     room_ok = True
     if barrier is None:
         room_txt = "aucun niveau majeur sur la route"
@@ -1474,33 +1731,21 @@ def build(
         # 60 % de l'objectif en marge libre : au-delà, on suppose que le prix traverse un niveau
         # défendu, ce qui n'est plus un pari raisonnable.
         room_ok = room >= 0.6 * target_dist
-        setup.target_basis += f", sous le niveau majeur {barrier:.6g}"
         room_txt = (
             f"{room / pip:.0f} {setup.pips_label} de marge jusqu'au niveau majeur "
             f"{barrier:.6g} (objectif {target_dist / pip:.0f})"
         )
 
-    tp1 = entry + sign * target_dist
-    reward_pips = target_dist / pip if pip else 0.0
-    rr = target_dist / risk_dist if risk_dist > 0 else 0.0
-
-    # TP1 = R/R minimum (1:2) ; TP2 = R/R maximum (1:3). C'est TP1 qui sert de niveau de
-    # SÉCURISATION : dès qu'il est touché, le stop y est remonté et la position ne peut plus perdre.
-    major = levels["major_resistance"] if bias > 0 else levels["major_support"]
-    def _cap(value: float) -> float:
-        if major is None:
-            return value
-        return min(value, major) if bias > 0 else max(value, major)
-    tp2 = _cap(entry + sign * max_rr * risk_dist)
-    # La stratégie ne définit QUE deux objectifs : le R/R minimum (TP1, niveau de sécurisation) et
-    # le R/R maximum (TP2, objectif final). Un troisième palier serait un chiffre inventé — on le
-    # laisse vide plutôt que d'afficher un niveau auquel personne ne vise.
-    tp3 = None
-    if (tp2 - entry) * sign <= 0 or abs(tp2 - tp1) < 1e-9:
-        tp2 = None      # le niveau majeur est déjà atteint par TP1 : pas de second objectif distinct
+    # Deux sécurisations COMPLÉMENTAIRES, jamais concurrentes : c'est toujours la plus favorable au
+    # trade qui s'applique, et le stop ne recule jamais.
+    #  - `secure_stop` : dès +2R parcouru, le stop monte sur +2R (le trade ne peut plus perdre) ;
+    #  - `tp1_lock_stop` : dès TP1 touché ET le momentum confirmé, le stop monte à 80 % du chemin
+    #    parcouru et la position part chercher TP2.
     setup.secure_stop = round(entry + sign * SECURE_AT_R * risk_dist, 8)
+    setup.tp1_lock_stop = round(
+        exits.tp1_lock_stop(entry, tp1, bias, fraction=tp1_lock_fraction), 8)
 
-    rr_ok = min_rr - 0.01 <= rr <= max_rr + 0.01
+    rr_ok = plan["rr_ok"]
     checklist.append(_check(
         7, f"Risque / rendement dans la bande 1:{min_rr:g} – 1:{max_rr:g}", rr_ok, f"1:{rr:.2f}",
         f"L'objectif vaut {reward_pips:.1f} {setup.pips_label} pour {risk_pips:.1f} risqués, soit "
@@ -1511,34 +1756,52 @@ def build(
     if not rr_ok:
         reasons.append(f"R/R {rr:.2f} hors de la bande {min_rr:g}–{max_rr:g}")
 
-    floor_ok = reward_pips >= min_target_pips - 0.5
+    # L'objectif doit valoir au moins le plancher en PIPS (50 par défaut). L'ATR n'entre plus dans
+    # ce calcul : c'est un nombre de pips, comparable d'un marché à l'autre par construction.
+    floor_ok = target_dist >= target_floor - 1e-12
+    floor_pips = (target_floor / pip) if pip else 0.0
+    floor_atr = (target_dist / atr_daily) if atr_daily > 0 else 0.0
     checklist.append(_check(
-        7, f"Objectif ≥ {min_target_pips:.0f} {setup.pips_label}", floor_ok,
+        7, f"Objectif d'au moins {floor_pips:.0f} {setup.pips_label}", floor_ok,
         f"{reward_pips:.1f} {setup.pips_label} (TP1 {tp1:.6g}) — {setup.target_basis}",
-        f"Plancher fixé par la stratégie. TP1 ({tp1:.6g}) correspond au R/R minimum et sert de "
-        f"niveau de SÉCURISATION : dès qu'il est atteint, le stop y est remonté automatiquement et "
-        f"la position ne peut plus redevenir perdante."
-        + (f" On la laisse ensuite courir vers TP2 ({tp2:.6g}), au R/R maximum 1:{max_rr:g}."
+        f"TP1 ({tp1:.6g}) est placé devant le premier obstacle réel qui paie le risque pris, et il "
+        f"ne peut pas valoir moins de {floor_pips:.0f} {setup.pips_label}. Hors forex et métaux, "
+        f"1 pip vaut 1 point de base du prix : ce plancher représente donc {floor_pips / 100:.1f} % "
+        f"de mouvement, aussi bien sur une paire de devises que sur un indice ou une action. "
+        f"L'ATR journalier n'intervient PAS dans ce calcul — l'objectif est un nombre de pips, pas "
+        f"un multiple de volatilité (pour information, il vaut ici {floor_atr:.2f} × l'amplitude "
+        f"d'une journée moyenne). Dès que TP1 est touché et que le momentum confirme la suite, le "
+        f"stop remonte à {tp1_lock_fraction:.0%} du chemin parcouru "
+        f"({setup.tp1_lock_stop:.6g}) et la position part chercher TP2."
+        + (f" TP2 ({tp2:.6g}) — {plan['tp2_basis']}."
            if tp2 is not None else
-           " Le niveau majeur opposé ne laisse pas la place à un second objectif distinct."),
+           " Aucun second objectif distinct n'est identifiable ici : on n'en invente pas."),
     ))
     if not floor_ok:
         reasons.append(
-            f"objectif ({reward_pips:.1f} {setup.pips_label}) sous le plancher de "
-            f"{min_target_pips:.0f} — le niveau journalier opposé est trop proche"
+            f"objectif trop court ({reward_pips:.0f} {setup.pips_label}, minimum "
+            f"{floor_pips:.0f}) — le niveau opposé est trop proche"
         )
 
     checklist.append(_check(
-        8, "Objectif atteignable avant le niveau majeur opposé", room_ok, room_txt,
+        8,
+        "Objectif atteignable avant le niveau majeur opposé"
+        + ("" if block_room else " — information"),
+        room_ok, room_txt,
         "Un objectif situé derrière un support/résistance MAJEUR suppose que le prix traverse le "
         "niveau que tout le marché défend. On exige au moins 60 % de l'objectif en marge libre. "
         "Ce sont les niveaux majeurs (swings mensuels, extrêmes journaliers de référence) qui "
-        "servent ici, pas chaque micro-swing : un niveau que personne ne surveille ne borne rien.",
+        "servent ici, pas chaque micro-swing : un niveau que personne ne surveille ne borne rien."
+        + ("" if block_room else
+           "\nCette case n'est PAS bloquante : un ❌ signale un objectif ambitieux face au niveau "
+           "d'en face, pas un setup invalide. TP2 reste plafonné par ce niveau (`plan_targets`), "
+           "donc la position ne vise jamais AU-DELÀ de lui."),
     ))
-    if not room_ok:
+    if not room_ok and block_room:
         reasons.append("objectif bloqué par un niveau majeur")
 
-    # Volatilité : viser 200 pips n'a de sens que si le marché parcourt cette distance.
+    # Volatilité : information sur l'horizon du trade. Cette case ne borne plus l'objectif — l'ATR
+    # a été retiré du calcul du profit le 28/07/2026 — mais l'horizon estimé reste utile à afficher.
     daily_atr = ind.atr(daily, 14) or 0.0
     atr_multiple = (target_dist / daily_atr) if daily_atr > 0 else 0.0
     reach_ok = daily_atr <= 0 or atr_multiple <= max_atr_multiple
@@ -1547,14 +1810,19 @@ def build(
     setup.horizon_hours = round(setup.horizon_days * 24, 1) if setup.horizon_days else None
     setup.horizon_label = f"~{horizon} j" if horizon else ""
     checklist.append(_check(
-        8, f"Objectif compatible avec la volatilité (≤ {max_atr_multiple:g} × ATR journalier)", reach_ok,
+        8,
+        f"Objectif compatible avec la volatilité (≤ {max_atr_multiple:g} × ATR journalier)"
+        + ("" if block_reach else " — information"),
+        reach_ok,
         f"objectif {reward_pips:.0f} {setup.pips_label} = {atr_multiple:.1f} × l'ATR journalier "
         f"({daily_atr / pip:.0f} {setup.pips_label}) → horizon estimé {setup.horizon_label}"
         if pip and daily_atr else "—",
         f"L'ATR journalier est l'amplitude moyenne d'une journée. Un objectif de "
         f"{reward_pips:.0f} {setup.pips_label} demande environ {atr_multiple:.1f} journées moyennes "
-        f"de mouvement : ce trade est un SWING, il se tient plusieurs séances. Au-delà de "
-        f"{max_atr_multiple:g} × l'ATR, l'objectif n'est plus raisonnable sur cet horizon.",
+        f"de mouvement : c'est l'horizon à prévoir pour ce trade."
+        + ("" if block_reach else
+           " Cette case est purement INFORMATIVE : l'ATR ne participe plus au calcul de l'objectif, "
+           "elle dit seulement combien de temps le mouvement demandera."),
     ))
 
     # ---------------- Étape 9 : timing de session ----------------
@@ -1569,12 +1837,12 @@ def build(
         "conviction est réduite mais le setup reste valable.",
     ))
 
-    if not stop_ok:
+    if not stop_ok and block_stop_width:
         reasons.append(
-            f"stop trop large ({risk_pips:.0f} {setup.pips_label}, maximum {max_stop_pips:.0f}) "
-            f"pour viser {min_target_pips:.0f} pips proprement"
+            f"stop trop large ({risk_pips:.0f} {setup.pips_label}, maximum {max_risk_pips:.0f}) : "
+            f"le niveau qui invaliderait le scénario est trop loin pour un risque acceptable"
         )
-    if not reach_ok:
+    if not reach_ok and block_reach:
         reasons.append(
             f"objectif hors de portée : {atr_multiple:.1f} × l'ATR journalier "
             f"(maximum {max_atr_multiple:g})"

@@ -104,7 +104,8 @@ export function SignalCard({ s }: { s: Signal }) {
         </div>
         <div className="flex items-center gap-2">
           {s.high_conviction && (
-            <span className="rounded-md bg-buy/20 px-2 py-1 text-[10px] font-bold text-buy" title="ADX>25 + consensus≥70% + multi-timeframe aligné">
+            <span className="rounded-md bg-buy/20 px-2 py-1 text-[10px] font-bold text-buy"
+              title="Setup complet de la stratégie : tendance validée, entrée déclenchée, stop et objectifs posés sur des niveaux">
               ★ HAUTE CONVICTION
             </span>
           )}

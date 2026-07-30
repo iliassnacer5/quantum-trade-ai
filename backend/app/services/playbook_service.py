@@ -27,8 +27,9 @@ from app.domain.playbook import PlaybookSetup
 logger = logging.getLogger(__name__)
 
 # Unités de temps de la stratégie et durée de vie du cache (secondes).
-# Le 1 h ne sert PAS de confirmation supplémentaire : il fournit les niveaux qui BORNENT l'objectif
-# (cf. domain.playbook.target_barrier). Le stop, lui, vient toujours du 15 min.
+# Le 1 h est une véritable ÉTAPE DE CONFIRMATION (cf. domain.playbook.build, étape 4) : il doit
+# aller dans le sens du biais avant que le 15 min ne soit autorisé à déclencher l'entrée. Il fournit
+# aussi, avec le 15 min, les niveaux qui portent le stop et bornent l'objectif.
 _TIMEFRAMES = [
     ("monthly", "1M", 120), ("daily", "1d", 300), ("h4", "4h", 300),
     ("h1", "1h", 300), ("m15", "15m", 300),
@@ -64,8 +65,9 @@ async def load_mtf(symbol: str) -> dict:
     )
     out: dict = {"sources": {}, "real": True}
     for (name, interval, _), res in zip(_TIMEFRAMES, results, strict=True):
-        # Le 1 h ne fait que BORNER l'objectif : son absence dégrade la précision de la cible
-        # (repli sur le 4 h), elle n'invalide pas la qualité des données du trade.
+        # Le 1 h est une étape de confirmation : son absence n'a pas besoin d'être signalée ici
+        # comme un défaut de QUALITÉ des données, parce que `build` refusera de toute façon le
+        # setup (sa couche 1 h sera `ok=False` -> `insufficient`). On évite ainsi un double motif.
         optional = name == "h1"
         if isinstance(res, Exception):
             logger.warning("Playbook %s %s : chargement échoué (%s)", symbol, interval, res)
@@ -97,20 +99,11 @@ async def build_setup(symbol: str, *, now: datetime | None = None) -> PlaybookSe
         data["monthly"], data["daily"], data["h4"], data["m15"],
         h1=data.get("h1") or None,
         session=session,
-        min_rr=s.playbook_min_rr,
-        min_target_pips=s.playbook_min_target_pips,
-        max_stop_pips=s.playbook_max_stop_pips,
-        target_level_buffer=s.playbook_target_level_buffer,
-        max_rr=s.playbook_max_rr,
-        max_atr_multiple=s.playbook_max_atr_multiple,
         # Marchés fermés -> on analyse quand même, mais aucun setup n'est déclaré exécutable.
         can_trade=(not s.playbook_trade_only_when_open) or bool(session.get("can_trade")),
-        # Filtres issus du backtest (divergence peu fiable, volatilité excessive).
-        allow_divergence=s.playbook_allow_divergence_entry,
-        volatility_filter=s.playbook_volatility_filter,
-        volatility_mode=s.playbook_volatility_mode,
-        max_atr_pct=s.playbook_max_atr_pct,
-        volatility_max_widen=s.playbook_volatility_max_widen,
+        # TOUS les autres réglages viennent d'un point de vérité unique, partagé avec le backtest et
+        # l'entraînement : c'est ce qui garantit que le backtest mesure bien ce qui trade.
+        **playbook.settings_kwargs(s),
     )
     setup.levels["data_sources"] = data["sources"]
     # Garde-fou d'honnêteté : sur données de démo (synthétiques), on n'affirme AUCUN trade —
@@ -132,23 +125,78 @@ def focus_classes() -> set[str]:
     return {c.strip() for c in raw.split(",") if c.strip()}
 
 
-def daily_universe(now: datetime | None = None, limit: int | None = None) -> list[dict]:
-    """Univers à scanner — FOREX et OR d'abord, dans l'ordre de pertinence du moment.
+def watchlist_symbols() -> list[str]:
+    """La liste restreinte (mesurée) — vide si `playbook_watchlist_only` est désactivé."""
+    raw = get_settings().playbook_watchlist_symbols or ""
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
-    La stratégie est calibrée pour ces marchés : objectifs exprimés en pips, niveaux majeurs
-    mensuels, horaires de Londres et de New York. Un objectif de « 200 pips » n'a pas le même sens
-    sur une action ou une crypto, d'où la priorité donnée aux devises et aux métaux.
 
-    Ordre de balayage :
-    1. l'or et l'argent — travaillés sur toute la plage Londres/New York ;
-    2. les paires de la (des) session(s) ouverte(s), avec priorité au chevauchement ;
-    3. le reste du catalogue FOREX ;
-    4. les autres classes d'actifs, seulement si `playbook_focus_only` est désactivé.
+def excluded_classes() -> set[str]:
+    """Classes d'actifs INTERDITES au trading (`playbook_excluded_classes`).
+
+    Par défaut `commodity` : les métaux précieux (or, argent, platine, palladium). C'est une
+    exclusion dure, pas une priorité de balayage — elle vaut aussi bien pour le scan que pour
+    l'ouverture d'une position.
     """
+    raw = get_settings().playbook_excluded_classes or ""
+    return {c.strip().lower() for c in raw.split(",") if c.strip()}
+
+
+def is_excluded(symbol: str) -> str | None:
+    """Motif d'exclusion de `symbol`, ou None s'il est tradable.
+
+    Point de vérité UNIQUE de l'exclusion : le balayage l'appelle pour ne pas perdre de temps à
+    analyser ce qu'on ne tradera pas, et l'exécution l'appelle pour qu'aucun autre chemin (ordre
+    manuel, copy-trading, appel d'API direct) ne puisse la contourner.
+    """
+    from app.data import markets as markets_mod
+
+    cls = markets_mod.asset_class(symbol)
+    if cls in excluded_classes():
+        label = "métaux précieux (or, argent, platine, palladium)" if cls == "commodity" else cls
+        return f"marché exclu du desk : {label}"
+    return None
+
+
+def daily_universe(now: datetime | None = None, limit: int | None = None) -> list[dict]:
+    """Univers à scanner — TOUS les marchés, dans l'ordre de pertinence du moment.
+
+    La stratégie ne suppose plus rien de propre au forex : son échelle de trade est exprimée en ATR
+    journalier, donc la même règle vaut sur EUR/USD comme sur le DAX. L'ordre ci-dessous n'est
+    qu'une priorité de balayage (les plus liquides d'abord), pas une exclusion.
+
+    `limit=0` (le réglage par défaut) ne coupe RIEN : le catalogue entier est balayé. Un plafond
+    décidait d'avance où chercher l'edge ; c'est la mesure qui doit le dire.
+
+    `playbook_excluded_classes` (métaux précieux par défaut) retire des classes ENTIÈRES du
+    balayage : ce n'est pas un ordre de priorité mais une exclusion, et elle est doublée à
+    l'ouverture de position pour qu'aucun chemin ne la contourne (cf. `is_excluded`).
+
+    `playbook_watchlist_only` COURT-CIRCUITE tout ce qui suit : le balayage EN LIGNE (cette
+    fonction) ne porte alors que sur les symboles mesurés rentables. Il est désactivé depuis le
+    29/07/2026 — le desk trade tous les marchés, et c'est la sélection en aval (plancher de
+    fiabilité, carte de l'edge, verdict de paire) qui garde les symboles rentables, pas une liste
+    figée. Le backtest complet, lui, continue d'appeler `full_universe()` de son propre module — il
+    ne passe jamais par ici, précisément pour continuer à chercher l'edge partout.
+
+    Ordre de balayage (hors watchlist) :
+    1. les grands indices — liquides sur de larges plages horaires ;
+    2. les paires de la (des) session(s) ouverte(s), avec priorité au chevauchement ;
+    3. le reste du catalogue, toutes classes confondues.
+    """
+    from app.data import markets as markets_mod
     from app.data import symbols as symbols_catalog
 
     s = get_settings()
-    limit = limit or s.playbook_universe_limit
+    banned = excluded_classes()
+    if s.playbook_watchlist_only:
+        watch = watchlist_symbols()
+        if watch:
+            rows = [{"symbol": sym, "asset_class": markets_mod.asset_class(sym)} for sym in watch]
+            rows = [r for r in rows if r["asset_class"] not in banned]
+            return rows[:limit] if limit else rows
+
+    limit = s.playbook_universe_limit if limit is None else limit
     focus = focus_classes()
     ctx = sessions_mod.session_context(now)
     universe: list[dict] = []
@@ -157,14 +205,20 @@ def daily_universe(now: datetime | None = None, limit: int | None = None) -> lis
     def _add(items: list[dict]) -> None:
         for item in items:
             cls = item.get("asset_class", "")
+            # Exclusion DURE d'abord : une classe interdite n'est même pas analysée. Inutile de
+            # dépenser cinq requêtes réseau par symbole pour un marché qu'on ne tradera pas.
+            if cls in banned:
+                continue
             if s.playbook_focus_only and focus and cls not in focus:
                 continue
             if item["symbol"] not in seen:
                 seen.add(item["symbol"])
                 universe.append(item)
 
-    # 1. Métaux précieux : le cœur du desk avec le forex, liquides sur toute la plage Londres/NY.
-    _add([{"symbol": sym, "asset_class": "commodity"} for sym in ("XAU/USD", "XAG/USD")])
+    # 1. Grands indices : liquides sur de larges plages horaires. (Les métaux précieux ouvraient
+    #    cette liste jusqu'au 29/07/2026 ; ils sont désormais exclus, cf. `playbook_excluded_classes`.)
+    _add([{"symbol": sym, "asset_class": "index"}
+          for sym in ("SPX500", "NAS100", "US30", "GER40", "JPN225")])
     # 2. Paires de la session en cours (chevauchement en priorité).
     if ctx["overlap"]:
         _add(sessions_mod.overlap_universe())
@@ -173,7 +227,7 @@ def daily_universe(now: datetime | None = None, limit: int | None = None) -> lis
     # 3-4. Reste du catalogue, filtré (ou non) sur les classes du desk.
     _add([{"symbol": i["symbol"], "asset_class": i["asset_class"]}
           for i in symbols_catalog.all_symbols()])
-    return universe[:limit]
+    return universe[:limit] if limit and limit > 0 else universe
 
 
 def _rank_key(item: dict) -> tuple:
@@ -198,13 +252,24 @@ def _rank_key(item: dict) -> tuple:
 
 
 async def top_trades(
-    count: int = 5,
+    count: int = 0,
     *,
     universe: list[dict] | None = None,
     now: datetime | None = None,
     include_armed: bool = True,
+    min_reliability: int | None = None,
 ) -> dict:
-    """Les `count` meilleurs trades du moment, strictement selon la stratégie.
+    """TOUS les trades conformes à la stratégie, classés du plus fiable au moins fiable.
+
+    `count=0` (le défaut) ne coupe rien : on rend chaque setup que la stratégie valide. Le
+    classement sert à les ORDONNER, plus à les éliminer — un setup conforme qui arrivait 6e était
+    auparavant supprimé alors que la méthode ne dit rien de tel. Un `count > 0` reste possible pour
+    un appelant qui veut explicitement un extrait (le digest Telegram, par exemple).
+
+    Le seul filtre qui subsiste est un plancher de FIABILITÉ (`daily_min_reliability`, 2/5 par
+    défaut) : « tous les trades qui ont un potentiel fiable » n'est pas « tous les trades ». Un
+    setup dont la stratégie elle-même ne dépasse pas ce niveau de confiance reste comptabilisé dans
+    les verdicts, il n'est simplement pas proposé.
 
     Deux niveaux, explicitement étiquetés (on ne maquille jamais un setup incomplet) :
     - ``ready`` : les 4 étapes validées ET le déclencheur 15 min actif -> exécutable maintenant.
@@ -214,6 +279,7 @@ async def top_trades(
     from app.services import training_service
 
     universe = universe or daily_universe(now)
+    floor = get_settings().daily_min_reliability if min_reliability is None else min_reliability
     session = sessions_mod.session_context(now)
     sem = asyncio.Semaphore(max(1, get_settings().playbook_max_parallel))
 
@@ -257,11 +323,19 @@ async def top_trades(
             r["pair_verdict"] = verdict_service.brief_for(_store, r["symbol"])
     except Exception as exc:  # noqa: BLE001 — un verdict manquant ne casse pas la sélection
         logger.warning("Verdicts par paire indisponibles (%s)", exc)
-    found = [r for r in evaluated if r["tier"] in ("ready", "armed")]
+    conform = [r for r in evaluated if r["tier"] in ("ready", "armed")]
     if not include_armed:
-        found = [r for r in found if r["tier"] == "ready"]
+        conform = [r for r in conform if r["tier"] == "ready"]
+    # Plancher de fiabilité : un setup ARMÉ est jugé sur son contexte (`context_reliability`), un
+    # setup PRÊT sur le trade lui-même (`reliability_score`). Les deux sont signés (+ achat / −
+    # vente) : c'est la valeur absolue qui exprime le niveau de confiance.
+    def _grade(row: dict) -> int:
+        return abs(row.get("reliability_score") or row.get("context_reliability") or 0)
+
+    found = [r for r in conform if _grade(r) >= floor]
+    below = len(conform) - len(found)
     found.sort(key=_rank_key, reverse=True)
-    picks = found[:count]
+    picks = found[:count] if count and count > 0 else found
     for rank, p in enumerate(picks, 1):
         p["rank"] = rank
 
@@ -269,25 +343,41 @@ async def top_trades(
         "generated_at": (now or datetime.now(UTC)).isoformat(),
         "session": session,
         "strategy": (
-            "Playbook MTF — Mensuel/Journalier → 4 h → entrée 15 min · stop sur la structure "
-            "15 min · objectif borné par le niveau 1 h · R/R 1:1,2 à 1:1,3"
+            "Playbook — tendance multi-indicateurs (D1/4h/1h/15min, figée) → entrée par confluence "
+            "pondérée (≥ 3 confirmations) → stop sur le niveau qui invalide le scénario, objectifs "
+            "devant le premier obstacle réel · R/R 1:2 à 1:3"
         ),
         "scanned": len(universe),
         "ready": sum(1 for p in picks if p["tier"] == "ready"),
         "armed": sum(1 for p in picks if p["tier"] == "armed"),
-        "requested": count,
+        "requested": count or "tous",
+        "min_reliability": floor,
+        # Transparence sur ce que le plancher de fiabilité a écarté : un filtre qu'on ne compte pas
+        # est un filtre qu'on ne peut pas contester.
+        "conform": len(conform),
+        "below_reliability": below,
         "picks": picks,
         # Verdict de la stratégie pour CHAQUE symbole balayé, pas seulement pour les 5 retenus.
         # C'est ce qui permet au scanner et aux pages d'analyse de parler exactement le même
         # langage que les trades du jour, sans relancer un seul calcul.
         "verdicts": {r["symbol"]: _verdict_of(r) for r in evaluated},
         "auto_entry": get_settings().playbook_auto_entry_enabled,
-        "note": _selection_note(picks, count, session),
+        "note": _selection_note(picks, count, session, below=below, floor=floor),
     }
 
 
 def _verdict_of(row: dict) -> dict:
-    """Vue LÉGÈRE du verdict de la stratégie pour un symbole (sans les couches ni la narration)."""
+    """Verdict de la stratégie pour un symbole — métriques ET explication du choix.
+
+    Le scanner s'en sert pour montrer non seulement CE QUE la stratégie décide, mais POURQUOI :
+    comment la tendance a été établie, quelles confirmations se sont réunies avec leur poids, ce qui
+    a bloqué quand rien ne se passe, et les niveaux du trade. Les couches d'indicateurs complètes et
+    la narration rédigée restent hors de cette vue (elles pèsent lourd × 88 symboles) : la page
+    détaillée d'un symbole les sert à la demande.
+    """
+    trend = row.get("trend") or {}
+    layers = row.get("layers") or {}
+    confirmations = row.get("entry_confirmations") or []
     return {
         "symbol": row["symbol"],
         "asset_class": row.get("asset_class"),
@@ -303,9 +393,55 @@ def _verdict_of(row: dict) -> dict:
         "entry": row.get("entry"),
         "stop_loss": row.get("stop_loss"),
         "take_profit_1": row.get("take_profit_1"),
+        "take_profit_2": row.get("take_profit_2"),
+        "risk_pips": row.get("risk_pips"),
+        "reward_pips": row.get("reward_pips"),
+        "pips_label": row.get("pips_label"),
+        "horizon_label": row.get("horizon_label"),
         "edge_score": row.get("edge_score", 0.0),
+        "edge": row.get("edge"),
         "pair_verdict": row.get("pair_verdict"),
         "reason": (row.get("reasons") or [""])[0],
+        # Métriques de la stratégie, pour que le scanner affiche CE QU'ELLE mesure et rien d'autre.
+        "trend_score": trend.get("score_100"),
+        "trend_status": trend.get("status"),
+        "confirmations": len(confirmations),
+        "confirmation_score": round(sum(c.get("contribution", 0.0) for c in confirmations), 2),
+        "trigger": row.get("trigger"),
+        # --- POURQUOI : de quoi expliquer le choix sans rouvrir une page ------------------------
+        "why": {
+            # Étape 1 — comment la direction a été établie, et le vote de chaque unité de temps.
+            "trend_explanation": row.get("trend_explanation"),
+            "trend_reasons": trend.get("reasons") or [],
+            "timeframes": [
+                {"tf": name, "label": (layers.get(name) or {}).get("label"),
+                 "score": (layers.get(name) or {}).get("score"),
+                 "bias": (layers.get(name) or {}).get("bias"),
+                 "aligned": (layers.get(name) or {}).get("bias") == row.get("bias")
+                 and row.get("bias", 0) != 0}
+                for name in ("monthly", "daily", "h4", "h1", "m15") if name in layers
+            ],
+            # Étape 2 — les confirmations réunies, avec leur poids : ce qui a décidé du MOMENT.
+            "confirmations": [
+                {"key": c.get("key"), "weight": c.get("weight"), "quality": c.get("quality"),
+                 "contribution": c.get("contribution"), "strong": c.get("strong"),
+                 "reading": c.get("reading")}
+                for c in confirmations
+            ],
+            # Étape 3 — d'où viennent le stop et l'objectif (un niveau, jamais une distance).
+            "stop_basis": row.get("stop_basis"),
+            "target_basis": row.get("target_basis"),
+            "secure_stop": row.get("secure_stop"),
+            "tp1_lock_stop": row.get("tp1_lock_stop"),
+            "volatility": row.get("volatility"),
+            # Ce qui a BLOQUÉ, quand il n'y a pas de trade : la réponse la plus utile du scanner.
+            "blocking": row.get("reasons") or [],
+            "checklist": [
+                {"step": c.get("step"), "label": c.get("label"), "pass": c.get("pass"),
+                 "value": c.get("value")}
+                for c in (row.get("checklist") or [])
+            ],
+        },
     }
 
 
@@ -316,7 +452,8 @@ def _trigger_type(setup: PlaybookSetup) -> str | None:
     return setup.trigger.split(" — ", 1)[0].strip() or None
 
 
-def _selection_note(picks: list[dict], count: int, session: dict) -> str:
+def _selection_note(picks: list[dict], count: int, session: dict, *,
+                    below: int = 0, floor: int = 0) -> str:
     ready = sum(1 for p in picks if p["tier"] == "ready")
     armed = len(picks) - ready
     auto = get_settings().playbook_auto_entry_enabled
@@ -333,8 +470,11 @@ def _selection_note(picks: list[dict], count: int, session: dict) -> str:
                if auto else "en attente du déclencheur 15 min")
         )
     txt = " · ".join(parts)
-    if len(picks) < count:
-        txt += (f". Seulement {len(picks)}/{count} : le marché n'en offre pas davantage qui respecte "
-                "les 4 étapes, la bande de R/R 1,2–1,3 et un objectif logeable avant le niveau 1 h. "
-                "Forcer les 5 reviendrait à dégrader la stratégie.")
+    if below:
+        txt += (f". {below} autre(s) setup(s) conforme(s) écarté(s) : fiabilité sous le plancher de "
+                f"{floor}/5 — ils restent visibles dans les verdicts par symbole.")
+    if count and count > 0 and len(picks) < count:
+        txt += (f". Seulement {len(picks)}/{count} demandés : le marché n'en offre pas davantage qui "
+                "respecte les trois étapes et la bande de R/R. Compléter la liste reviendrait à "
+                "dégrader la stratégie.")
     return txt

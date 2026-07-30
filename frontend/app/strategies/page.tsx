@@ -1,33 +1,27 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { api, StrategyInfo, StrategyBacktest, StrategySignal, WalkForward, MultiValidation, StrategyComparison } from '@/lib/api';
+import { api, PlaybookTrade, StrategySpec, StrategyStep, WalkForward } from '@/lib/api';
 import { MarketSelector } from '@/components/domain';
 import { PageHeader, RouteTabs, PROVE_TABS } from '@/components/ui';
-import { MARKET_BADGE } from '@/lib/markets';
 
 const VERDICT_STYLE: Record<string, string> = {
   robuste: 'text-buy', fragile: 'text-yellow-400', non_prouve: 'text-sell', insuffisant: 'text-muted',
 };
-const CAT_LABEL: Record<string, string> = {
-  tendance: 'Tendance', 'retour-moyenne': 'Retour à la moyenne',
-  volume: 'Volume', 'smart-money': 'Smart Money', cassure: 'Cassure',
-};
 
-export default function StrategiesPage() {
-  const [list, setList] = useState<StrategyInfo[]>([]);
-  const [symbol, setSymbol] = useState('BTC/USDT');
-  const [market, setMarket] = useState('crypto');
-  const [timeframe, setTimeframe] = useState('1h');
+/**
+ * La page ne présente qu'UNE stratégie : celle du desk. Elle la décrit de A à Z, en lisant la
+ * SPÉCIFICATION servie par le backend (`/api/agents/strategy`) — donc les seuils réellement
+ * appliqués par le moteur, jamais une copie qui finirait par décrire une version disparue.
+ */
+export default function StrategyPage() {
+  const [spec, setSpec] = useState<StrategySpec | null>(null);
+  const [market, setMarket] = useState('forex');
+  const [symbol, setSymbol] = useState('EUR/USD');
   const [symbols, setSymbols] = useState<{ symbol: string }[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [bt, setBt] = useState<Record<string, StrategyBacktest>>({});
-  const [wf, setWf] = useState<Record<string, WalkForward>>({});
-  const [multi, setMulti] = useState<Record<string, MultiValidation>>({});
+  const [setup, setSetup] = useState<PlaybookTrade | null>(null);
+  const [wf, setWf] = useState<WalkForward | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [signal, setSignal] = useState<StrategySignal | null>(null);
-  const [comparison, setComparison] = useState<StrategyComparison | null>(null);
-  const [comparing, setComparing] = useState(false);
   const [autoTrade, setAutoTrade] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -36,25 +30,11 @@ export default function StrategiesPage() {
     setAutoTrade(r.auto_trade);
   }
 
-  async function compareAll() {
-    setComparing(true);
-    setError(null);
-    try {
-      setComparison(await api.compareStrategies(symbol, timeframe));
-    } catch (e: any) {
-      setError(e.message?.includes('402') ? 'Réservé au plan Pro+.' : e.message);
-    } finally {
-      setComparing(false);
-    }
-  }
-
   useEffect(() => {
-    api.strategies().then((d) => setList(d.strategies)).catch((e) => setError(e.message));
-    api.selectedStrategy().then((d) => setSelected(d.selected)).catch(() => {});
+    api.strategySpec().then(setSpec).catch((e) => setError(e.message));
     api.autoTrade().then((d) => setAutoTrade(d.auto_trade)).catch(() => {});
   }, []);
 
-  // Symboles du marché choisi (crypto / forex / actions) — tous les marchés disponibles.
   useEffect(() => {
     api.symbols(undefined, market)
       .then((d) => {
@@ -65,48 +45,25 @@ export default function StrategiesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [market]);
 
-  async function runBoth(id: string) {
-    setBusy(id);
+  async function analyse() {
+    setBusy('setup');
     setError(null);
     try {
-      const [b, w] = await Promise.all([
-        api.strategyBacktest(symbol, id, timeframe),
-        api.strategyWalkForward(symbol, id, timeframe),
-      ]);
-      setBt((m) => ({ ...m, [id]: b }));
-      setWf((m) => ({ ...m, [id]: w }));
-    } catch (e: any) {
-      setError(e.message?.includes('402') ? 'Réservé au plan Pro+ (backtesting).' : e.message);
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function validateMulti(id: string) {
-    setBusy(id + '-multi');
-    setError(null);
-    try {
-      const r = await api.strategyValidateMulti(id, timeframe, market);
-      setMulti((m) => ({ ...m, [id]: r }));
-    } catch (e: any) {
-      setError(e.message?.includes('402') ? 'Réservé au plan Pro+.' : e.message);
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function choose(id: string) {
-    await api.selectStrategy(id);
-    setSelected(id);
-  }
-
-  async function genSignal(id: string) {
-    setBusy(id + '-sig');
-    setError(null);
-    try {
-      setSignal(await api.strategySignal(symbol, id, timeframe));
+      setSetup(await api.playbook(symbol));
     } catch (e: any) {
       setError(e.message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function validate() {
+    setBusy('wf');
+    setError(null);
+    try {
+      setWf(await api.walkForward(symbol, '4h'));
+    } catch (e: any) {
+      setError(e.message?.includes('402') ? 'Réservé au plan Pro+ (backtesting).' : e.message);
     } finally {
       setBusy(null);
     }
@@ -115,173 +72,301 @@ export default function StrategiesPage() {
   return (
     <div className="p-8 space-y-6">
       <PageHeader
-        title="Stratégies"
-        subtitle="Backteste des stratégies éprouvées, valide-les (walk-forward) et choisis-en une pour travailler."
+        title="La stratégie du desk"
+        subtitle={spec?.one_liner ?? 'Une seule méthode, appliquée à tous les marchés.'}
       />
       <RouteTabs items={PROVE_TABS} />
 
-      <div className="flex flex-wrap items-center gap-3">
-        <label className="text-sm text-muted">Marché</label>
-        <MarketSelector value={market} onChange={setMarket} includeAll={false} label={null} />
-        <label className="text-sm text-muted">Tester sur</label>
-        <select value={symbol} onChange={(e) => setSymbol(e.target.value)}
-          className="rounded-lg border border-border bg-background px-3 py-1.5 font-mono text-sm text-white">
-          {(symbols.length ? symbols : [{ symbol: 'BTC/USDT' }]).map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
-        </select>
-        <select value={timeframe} onChange={(e) => setTimeframe(e.target.value)}
-          className="rounded-lg border border-border bg-background px-3 py-1.5 text-sm text-white" title="Le journalier (1d) couvre des années d'historique = validation plus fiable">
-          <option value="1h">1h (court)</option>
-          <option value="4h">4h</option>
-          <option value="1d">Journalier (long, + fiable)</option>
-        </select>
-        {selected && <span className="text-sm text-muted">Stratégie active : <b className="text-accent">{selected}</b></span>}
-        <button onClick={compareAll} disabled={comparing}
-          className="rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50">
-          {comparing ? 'Comparaison…' : '🏆 Comparer TOUTES les stratégies'}
-        </button>
-        <button onClick={toggleAutoTrade}
-          title="Forward test : chaque signal de ta stratégie active ouvre automatiquement un trade papier (1% de risque, SL/TP, clôture auto). Résultats dans le Portefeuille."
-          className={`rounded-lg border px-3 py-1.5 text-sm ${autoTrade ? 'border-buy bg-buy/15 text-buy' : 'border-border text-muted hover:bg-surface'}`}>
-          {autoTrade ? '🤖 Trading auto papier : ON' : '🤖 Trading auto papier : OFF'}
-        </button>
-      </div>
+      {error && <div className="rounded-lg border border-sell/40 bg-sell/10 p-3 text-sm text-sell">{error}</div>}
+      {!spec && !error && <p className="text-sm text-muted">Chargement de la spécification…</p>}
 
-      {error && <p className="text-sell">{error}</p>}
+      {spec && (
+        <>
+          {/* --- Ce à quoi la méthode obéit --- */}
+          <section className="rounded-xl border border-border bg-surface p-5 space-y-4">
+            <div className="flex flex-wrap items-baseline gap-3">
+              <h2 className="text-lg font-semibold text-white">{spec.name}</h2>
+              <span className="text-xs text-muted">
+                {spec.veto ? 'Droit de veto actif — aucun agent ne la contourne' : 'Veto inactif'}
+              </span>
+            </div>
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              {spec.principles.map((p) => (
+                <div key={p.title} className="rounded-lg border border-border/60 bg-background p-3">
+                  <div className="text-sm font-medium text-white">{p.title}</div>
+                  <p className="mt-1 text-xs leading-relaxed text-muted">{p.body}</p>
+                </div>
+              ))}
+            </div>
+          </section>
 
-      {/* Comparaison de toutes les stratégies sur le symbole choisi */}
-      {comparison && (
-        <section className="rounded-xl border border-border bg-surface p-4">
-          <h2 className="mb-1 text-lg font-semibold text-white">Comparaison sur {comparison.symbol} ({comparison.timeframe})</h2>
-          <p className="mb-3 text-sm">{comparison.note}</p>
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
-              <thead className="text-muted">
-                <tr>
-                  <th className="py-1">Stratégie</th><th>Alpha</th><th>PF</th><th>Réussite</th><th>P&L net</th><th>Trades</th><th>Max DD</th>
-                </tr>
-              </thead>
-              <tbody>
-                {comparison.ranking.map((r, i) => (
-                  <tr key={r.id} className={`border-t border-border/40 ${i === 0 ? 'bg-buy/5' : ''}`}>
-                    <td className="py-1.5 text-white">{i === 0 && '🏆 '}{r.name}</td>
-                    <td className={r.alpha_pct >= 0 ? 'text-buy' : 'text-sell'}>{r.alpha_pct}%</td>
-                    <td className={r.profit_factor >= 1 ? 'text-buy' : 'text-sell'}>{r.profit_factor}</td>
-                    <td className="text-white">{r.win_rate}%</td>
-                    <td className={r.pnl_pct >= 0 ? 'text-buy' : 'text-sell'}>{r.pnl_pct}%</td>
-                    <td className="text-muted">{r.trades}</td>
-                    <td className="text-muted">{r.max_drawdown_pct}%</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {comparison.recommended && (
-            <button onClick={() => choose(comparison.recommended!.id)}
-              className="mt-3 rounded-lg bg-buy px-3 py-1.5 text-sm font-medium text-white">
-              Choisir la meilleure ({comparison.recommended.name})
-            </button>
-          )}
-        </section>
+          {/* --- Le déroulé, étape par étape --- */}
+          <section className="space-y-4">
+            <h2 className="text-lg font-semibold text-white">Le déroulé, de A à Z</h2>
+            {spec.steps.map((step) => <StepCard key={step.n} step={step} />)}
+          </section>
+
+          {/* --- Gestion du risque --- */}
+          <section className="rounded-xl border border-border bg-surface p-5 space-y-3">
+            <h2 className="text-lg font-semibold text-white">Ce qui protège le capital</h2>
+            <dl className="grid gap-3 md:grid-cols-2">
+              {([
+                ['Taille de position', spec.risk.sizing],
+                ['Corrélation', spec.risk.correlation],
+                ['Gel après pertes', spec.risk.freeze],
+                ['Filtre des paires auto-tradées', spec.risk.gating],
+                ['Volatilité', spec.risk.volatility],
+              ] as const).map(([label, body]) => (
+                <div key={label} className="rounded-lg border border-border/60 bg-background p-3">
+                  <dt className="text-xs uppercase tracking-wide text-muted">{label}</dt>
+                  <dd className="mt-1 text-xs leading-relaxed text-white">{body}</dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+
+          {/* --- Périmètre --- */}
+          <section className="rounded-xl border border-border bg-surface p-5 space-y-4">
+            <h2 className="text-lg font-semibold text-white">Où et quand elle s’applique</h2>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <Fact label="Marchés" value={spec.scope.markets.join(' · ')} />
+              <Fact
+                label="Symboles balayés"
+                value={`${spec.scope.universe_size}${spec.scope.universe_capped ? ' (plafonné)' : ' — tout le catalogue'}`}
+              />
+              <Fact label="Horaires" value={spec.scope.hours} />
+              <Fact label="Trades proposés" value={String(spec.scope.proposals_per_day)} />
+              <Fact label="Tendance mesurée sur" value={spec.scope.trend_timeframes.join(' · ')} />
+              <Fact
+                label="Entrée"
+                value={`${spec.scope.entry_timeframe} (confirmation ${spec.scope.confirm_timeframe})`}
+              />
+              <Fact label="Fiabilité minimale" value={`${spec.scope.min_reliability}/5`} />
+              <Fact
+                label="Entrée automatique"
+                value={spec.scope.auto_entry ? 'Active — compte démo' : 'Désactivée'}
+              />
+            </div>
+            <p className="text-xs leading-relaxed text-muted">{spec.scope.why_all_markets}</p>
+            {spec.scope.auto_entry && (
+              <p className="text-xs text-warn">{spec.scope.auto_entry_mode}</p>
+            )}
+          </section>
+
+          {/* --- Honnêteté des données : la partie qu'on ne met jamais en avant, et qui compte --- */}
+          <section className="rounded-xl border border-border bg-surface p-5 space-y-2">
+            <h2 className="text-lg font-semibold text-white">Ce que la stratégie refuse de faire</h2>
+            <ul className="space-y-2">
+              {spec.data_honesty.map((line, i) => (
+                <li key={i} className="flex gap-2 text-xs leading-relaxed text-muted">
+                  <span className="text-warn">•</span>
+                  <span>{line}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        </>
       )}
 
-      {signal && (
-        <section className="rounded-xl border border-accent/40 bg-accent/5 p-4">
-          <div className="flex items-center justify-between">
-            <h2 className="font-semibold text-white">
-              Signal {signal.name} — {signal.symbol}
-              {signal.timeframe && <span className="ml-2 rounded bg-background px-2 py-0.5 text-[11px] font-normal text-muted">⏱ {signal.timeframe}</span>}
-            </h2>
-            <span className={`rounded px-2 py-0.5 text-sm font-bold ${signal.direction === 'BUY' ? 'bg-buy/20 text-buy' : signal.direction === 'SELL' ? 'bg-sell/20 text-sell' : 'bg-border text-muted'}`}>{signal.direction}</span>
+      {/* --- Application à un symbole --- */}
+      <section className="rounded-xl border border-border bg-surface p-5 space-y-4">
+        <h2 className="text-lg font-semibold text-white">L’appliquer maintenant à un symbole</h2>
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="text-sm text-muted">Marché</label>
+          <MarketSelector value={market} onChange={setMarket} includeAll={false} label={null} />
+          <label className="text-sm text-muted">Symbole</label>
+          <select value={symbol} onChange={(e) => setSymbol(e.target.value)}
+            className="rounded-lg border border-border bg-background px-3 py-1.5 font-mono text-sm text-white">
+            {(symbols.length ? symbols : [{ symbol: 'EUR/USD' }]).map((s) => (
+              <option key={s.symbol} value={s.symbol}>{s.symbol}</option>
+            ))}
+          </select>
+          <button onClick={analyse} disabled={busy === 'setup'}
+            className="rounded-lg bg-primary px-4 py-1.5 text-sm font-medium text-white disabled:opacity-50">
+            {busy === 'setup' ? 'Analyse…' : 'Analyser maintenant'}
+          </button>
+          <button onClick={validate} disabled={busy === 'wf'}
+            className="rounded-lg border border-border px-4 py-1.5 text-sm text-white disabled:opacity-50">
+            {busy === 'wf' ? 'Validation…' : 'Valider (walk-forward)'}
+          </button>
+          <label className="ml-auto flex items-center gap-2 text-sm text-muted">
+            <input type="checkbox" checked={autoTrade} onChange={toggleAutoTrade} className="accent-primary" />
+            Forward test automatique (compte démo)
+          </label>
+        </div>
+
+        {setup && (
+          <div className="space-y-3 border-t border-border pt-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className={`rounded-lg px-3 py-1 text-sm font-semibold ${
+                setup.direction === 'BUY' ? 'bg-buy/15 text-buy'
+                  : setup.direction === 'SELL' ? 'bg-sell/15 text-sell' : 'bg-background text-muted'}`}>
+                {setup.direction}
+              </span>
+              <span className="font-mono text-sm text-white">{setup.symbol}</span>
+              {setup.ready && setup.entry != null && (
+                <span className="font-mono text-xs text-muted">
+                  entrée {setup.entry} · SL {setup.stop_loss} · TP1 {setup.take_profit_1}
+                  {setup.take_profit_2 != null && ` · TP2 ${setup.take_profit_2}`}
+                  {' · '}R/R 1:{setup.risk_reward?.toFixed(2)}
+                </span>
+              )}
+            </div>
+            {setup.narrative && (
+              <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-lg bg-background p-4 text-xs leading-relaxed text-muted">
+                {setup.narrative}
+              </pre>
+            )}
           </div>
-          {signal.direction !== 'HOLD' ? (
-            <div className="mt-2 grid grid-cols-2 gap-1 text-xs text-muted md:grid-cols-4">
-              <span>Entrée : <span className="text-white">{signal.entry}</span></span>
-              <span>SL : <span className="text-sell">{signal.stop_loss}</span></span>
-              <span>TP : <span className="text-buy">{signal.take_profit_1}</span></span>
-              <span>R/R : <span className="text-white">1 : {signal.risk_reward}</span></span>
-            </div>
-          ) : <p className="mt-1 text-sm text-muted">{signal.rationale}</p>}
-          <p className="mt-1 text-[11px] text-muted">Source données : {signal.data_source}. Aide à la décision, pas un conseil.</p>
-        </section>
-      )}
+        )}
 
-      <section className="grid gap-3 md:grid-cols-2">
-        {list.map((s) => {
-          const w = wf[s.id];
-          const isSel = selected === s.id;
-          const fits = !s.markets || s.markets.includes(market);
-          return (
-            <div key={s.id} className={`rounded-xl border p-4 ${isSel ? 'border-accent bg-accent/5' : 'border-border bg-surface'} ${fits ? '' : 'opacity-50'}`}
-              title={fits ? '' : 'Stratégie non recommandée pour ce marché'}>
-              <div className="flex items-start justify-between">
-                <div>
-                  <span className="font-semibold text-white">{s.name}</span>
-                  <span className="ml-2 rounded bg-background px-2 py-0.5 text-[10px] text-muted">{CAT_LABEL[s.category] ?? s.category}</span>
-                  {(s.markets ?? []).map((mk) => (
-                    <span key={mk} className={`ml-1 rounded px-1.5 py-0.5 text-[10px] ${mk === market ? 'bg-accent/20 text-accent' : 'bg-background text-muted'}`}>
-                      {MARKET_BADGE[mk] ?? mk}
-                    </span>
-                  ))}
-                </div>
-                {isSel && <span className="text-xs text-accent">✓ active</span>}
-              </div>
-              <p className="mt-1 text-xs text-muted">{s.description}</p>
-
-              {bt[s.id] && (() => { const bb = bt[s.id]; const b2 = bb.metrics; return (
-                <div className="mt-3 grid grid-cols-3 gap-1 text-xs text-muted">
-                  <span>Réussite : <span className="text-white">{b2.win_rate}%</span></span>
-                  <span>PF : <span className="text-white">{b2.profit_factor}</span></span>
-                  <span>P&L net : <span className={b2.total_pnl_pct >= 0 ? 'text-buy' : 'text-sell'}>{b2.total_pnl_pct}%</span></span>
-                  <span>Trades : <span className="text-white">{b2.trades}</span></span>
-                  <span>Max DD : <span className="text-white">{b2.max_drawdown_pct}%</span></span>
-                  <span title="Frais + slippage appliqués par côté">Coûts : <span className="text-white">{bb.cost_pct_per_side}%</span></span>
-                  <span title="Acheter & garder sur la même période">Buy&amp;Hold : <span className="text-white">{bb.benchmark_pnl_pct}%</span></span>
-                  <span className="col-span-2" title="Surperformance vs simplement détenir l'actif">
-                    Alpha : <span className={(bb.alpha_pct ?? 0) >= 0 ? 'text-buy' : 'text-sell'}>{bb.alpha_pct}%</span>
-                    {(bb.alpha_pct ?? 0) <= 0 && <span className="text-sell"> — ne bat pas le buy &amp; hold</span>}
-                  </span>
-                </div>
-              ); })()}
-              {w && (
-                <p className="mt-2 text-xs">
-                  Validation : <span className={VERDICT_STYLE[w.verdict]}>{w.label}</span>
-                  <span className="text-muted"> ({w.profitable_folds}/{w.folds_evaluated} segments · bat le hold {w.beats_hold_folds ?? 0}/{w.folds_evaluated})</span>
-                </p>
-              )}
-              {multi[s.id] && (
-                <p className="mt-1 text-xs">
-                  Multi-marchés : <span className="text-white">{multi[s.id].verdict}</span>
-                  <span className="text-muted"> ({multi[s.id].robust} robuste / {multi[s.id].symbols} · bat le hold {multi[s.id].beats_hold})</span>
-                </p>
-              )}
-
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button onClick={() => runBoth(s.id)} disabled={busy === s.id}
-                  className="rounded-lg border border-border px-3 py-1 text-xs text-white hover:bg-background disabled:opacity-50">
-                  {busy === s.id ? 'Test…' : 'Backtester + valider'}
-                </button>
-                <button onClick={() => validateMulti(s.id)} disabled={busy === s.id + '-multi'}
-                  className="rounded-lg border border-border px-3 py-1 text-xs text-white hover:bg-background disabled:opacity-50">
-                  {busy === s.id + '-multi' ? 'Multi…' : 'Valider multi-marchés'}
-                </button>
-                <button onClick={() => genSignal(s.id)} disabled={busy === s.id + '-sig'}
-                  className="rounded-lg border border-border px-3 py-1 text-xs text-white hover:bg-background disabled:opacity-50">
-                  {busy === s.id + '-sig' ? '…' : 'Signal live'}
-                </button>
-                <button onClick={() => choose(s.id)} disabled={isSel}
-                  className="rounded-lg bg-accent px-3 py-1 text-xs font-medium text-white hover:opacity-90 disabled:opacity-50">
-                  {isSel ? 'Choisie' : 'Choisir cette stratégie'}
-                </button>
-              </div>
-            </div>
-          );
-        })}
+        {wf && (
+          <div className="border-t border-border pt-4 text-sm">
+            <span className="text-muted">Validation out-of-sample : </span>
+            <span className={VERDICT_STYLE[wf.verdict] ?? 'text-muted'}>{wf.label}</span>
+            <span className="ml-2 font-mono text-xs text-muted">
+              {wf.total_trades} trades · régularité {wf.consistency} · PF {wf.avg_profit_factor}
+            </span>
+          </div>
+        )}
       </section>
+    </div>
+  );
+}
 
-      <p className="text-xs text-muted">
-        Conseil : ne « choisis » une stratégie que si sa validation walk-forward est ✅ robuste sur plusieurs symboles.
-        Un bon backtest seul ne suffit pas — c&apos;est la régularité out-of-sample qui compte.
-      </p>
+/** Une étape : son résumé, ses facteurs pondérés, et ce qui la rend BLOQUANTE. */
+function StepCard({ step }: { step: StrategyStep }) {
+  return (
+    <article className="rounded-xl border border-border bg-surface p-5 space-y-4">
+      <header className="flex flex-wrap items-baseline gap-3">
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/20 font-mono text-xs font-bold text-primary">
+          {step.n}
+        </span>
+        <h3 className="text-base font-semibold text-white">{step.title}</h3>
+        {step.timeframes?.length ? (
+          <span className="rounded bg-background px-2 py-0.5 font-mono text-2xs text-muted">
+            {step.timeframes.join(' · ')}
+          </span>
+        ) : null}
+        {step.mode && (
+          <span className="rounded bg-background px-2 py-0.5 text-2xs text-muted">mode « {step.mode} »</span>
+        )}
+      </header>
+
+      <p className="text-sm leading-relaxed text-muted">{step.summary}</p>
+      {step.mode_explained && <p className="text-xs leading-relaxed text-muted">{step.mode_explained}</p>}
+
+      {/* Les facteurs et leur poids : c'est là que se voit ce qui décide vraiment. */}
+      {step.inputs?.length ? (
+        <div className="space-y-1.5">
+          {step.inputs.map((f) => (
+            <div key={f.key} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg bg-background px-3 py-2">
+              <span className="min-w-[13rem] text-xs font-medium text-white">
+                {f.label}
+                {f.strong && <span className="ml-1.5 rounded bg-buy/20 px-1.5 py-0.5 text-[10px] text-buy">forte</span>}
+              </span>
+              {f.weight != null && (
+                <span className="flex items-center gap-2">
+                  <span className="h-1.5 w-24 overflow-hidden rounded-full bg-border">
+                    <span
+                      className="block h-full rounded-full bg-primary"
+                      style={{ width: `${Math.min(100, (f.weight / 1.0) * 100)}%` }}
+                    />
+                  </span>
+                  <span className="font-mono text-2xs text-muted">
+                    {f.weight_pct != null ? `${f.weight_pct} %` : `poids ${f.weight}`}
+                  </span>
+                </span>
+              )}
+              <span className="flex-1 text-2xs text-muted">{f.role}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {step.timeframe_weights && (
+        <p className="text-2xs text-muted">
+          Poids des unités de temps dans le score global —{' '}
+          {Object.entries(step.timeframe_weights).map(([k, v]) => `${k} ${Math.round(v * 100)} %`).join(' · ')}.
+          Le 15 min ne pèse presque rien : il sert au TIMING, pas à la direction.
+        </p>
+      )}
+
+      {step.stop_candidates?.length ? (
+        <div>
+          <div className="mb-1 text-xs font-medium text-white">Où le stop est posé, par ordre de préférence</div>
+          <ol className="space-y-1">
+            {step.stop_candidates.map((c, i) => (
+              <li key={i} className="flex gap-2 text-xs leading-relaxed text-muted">
+                <span className="font-mono text-muted/60">{i + 1}.</span><span>{c}</span>
+              </li>
+            ))}
+          </ol>
+          {step.stop_rule && <p className="mt-2 text-xs leading-relaxed text-muted">{step.stop_rule}</p>}
+        </div>
+      ) : null}
+
+      {step.rules?.length ? (
+        <ul className="space-y-1">
+          {step.rules.map((r, i) => (
+            <li key={i} className="flex gap-2 text-xs leading-relaxed text-muted">
+              <span className="text-primary">▸</span><span>{r}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      {/* Ce qui BLOQUE : la partie la plus importante d'une stratégie, celle qui dit non. */}
+      {step.blocking?.length ? (
+        <div className="rounded-lg border border-sell/30 bg-sell/5 p-3">
+          <div className="mb-1.5 text-xs font-medium text-sell">Conditions bloquantes — aucun trade si l’une échoue</div>
+          <ul className="space-y-1">
+            {step.blocking.map((b, i) => (
+              <li key={i} className="flex gap-2 text-xs leading-relaxed text-muted">
+                <span className="text-sell">✕</span><span>{b}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {/* Ce qui est CALCULÉ et affiché mais qui ne bloque plus (décision du 28/07/2026) — sans
+          cette distinction, un ❌ ici se lirait à tort comme un refus de trade. */}
+      {step.informative?.length ? (
+        <div className="rounded-lg border border-border bg-background/40 p-3">
+          <div className="mb-1.5 text-xs font-medium text-white/80">
+            Calculées et affichées, mais NON bloquantes — un ❌ ici informe, il ne refuse rien
+          </div>
+          <ul className="space-y-1">
+            {step.informative.map((b, i) => (
+              <li key={i} className="flex gap-2 text-xs leading-relaxed text-muted">
+                <span className="text-muted">ⓘ</span><span>{b}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {step.scale_explained && (
+        <p className="rounded-lg bg-background p-3 text-xs leading-relaxed text-muted">{step.scale_explained}</p>
+      )}
+      {step.not_used && (
+        <p className="rounded-lg border border-warn/30 bg-warn/5 p-3 text-xs leading-relaxed text-muted">
+          {step.not_used}
+        </p>
+      )}
+      {step.measured && (
+        <p className="text-xs leading-relaxed text-muted">📏 {step.measured}</p>
+      )}
+    </article>
+  );
+}
+
+function Fact({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-xs uppercase tracking-wide text-muted">{label}</div>
+      <div className="mt-1 text-sm text-white">{value}</div>
     </div>
   );
 }

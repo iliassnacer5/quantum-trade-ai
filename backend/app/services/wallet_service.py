@@ -45,10 +45,14 @@ async def _last_price(symbol: str) -> float | None:
 async def compute_wallet(store: AppStore, tenant_id: str) -> dict:
     start = float(get_config(store, tenant_id).get("starting_balance", _DEFAULT_BALANCE))
     orders = [o for o in store.records.list(ORDER, tenant_id) if o.get("mode") == "paper"]
-    # `invalid` = position clôturée sur un résultat que le marché n'a jamais produit (quarantaine).
-    # Elle n'est ni ouverte, ni comptée dans les statistiques : elle n'a pas eu lieu.
+    # Issues NEUTRES (`invalid` : clôture que le marché n'a jamais produite ; `reset` : position
+    # neutralisée par une remise à zéro de l'auto-entrée). Ni ouvertes, ni comptées dans les
+    # statistiques : elles n'ont produit aucun résultat.
+    from app.services.execution_service import NEUTRAL_OUTCOMES
+
     closed = [o for o in orders if o.get("outcome") in ("won", "lost")]
-    open_orders = [o for o in orders if o.get("outcome") not in ("won", "lost", "invalid")]
+    open_orders = [o for o in orders
+                   if o.get("outcome") not in ("won", "lost", *NEUTRAL_OUTCOMES)]
 
     realized = sum(float(o.get("realized_pnl") or 0) for o in closed)
     wins = [o for o in closed if o.get("outcome") == "won"]

@@ -31,9 +31,17 @@ def _format_digest(picks: list[dict]) -> str:
     return "\n".join(lines)
 
 
+#: Une notification n'est pas un tableau de bord. La sélection n'est plus plafonnée (tous les
+#: setups conformes sont rendus par l'API et affichés dans l'interface), mais un message Telegram
+#: de soixante trades n'est plus lu : on n'y met que la tête du classement, en disant combien il en
+#: reste et où les voir.
+_NOTIFY_MAX = 12
+
+
 def format_top_trades(payload: dict) -> str:
     """Message des trades du jour issus de la STRATÉGIE (playbook) — format note de desk."""
-    picks = payload.get("picks") or []
+    all_picks = payload.get("picks") or []
+    picks = all_picks[:_NOTIFY_MAX]
     sess = payload.get("session") or {}
     head = f"🎯 Trades du jour — {payload.get('strategy', '')}\n🕒 {sess.get('label')} ({sess.get('utc_time')})"
     if not picks:
@@ -55,6 +63,11 @@ def format_top_trades(payload: dict) -> str:
                    else "en attente du déclencheur 15 min")
             )
     lines.append("")
+    if len(all_picks) > len(picks):
+        lines.append(
+            f"… et {len(all_picks) - len(picks)} autre(s) setup(s) conforme(s) — la liste complète "
+            "est sur la page « Trades du jour »."
+        )
     lines.append(payload.get("note", ""))
     lines.append("Aide à la décision, pas un conseil en investissement. Aucun trade n'est garanti gagnant.")
     return "\n".join(lines)
@@ -331,6 +344,42 @@ async def snapshot_loop() -> None:
         await asyncio.sleep(rest)
 
 
+async def daily_picks_loop() -> None:
+    """SCANNER COMPLÉMENTAIRE — précalcule la sélection par marché, pour les 6 unités de temps.
+
+    Même principe que `snapshot_loop`, appliqué au bas de la page « Trades du jour » : c'est cette
+    boucle qui absorbe le coût (4 classes d'actifs × jusqu'à 8 backtests complets, par unité de
+    temps) pour que la route se contente de LIRE. Avant, chaque première visite d'une unité de temps
+    déclenchait ce calcul dans la requête HTTP et faisait attendre l'utilisateur.
+
+    Les unités de temps sont traitées L'UNE APRÈS L'AUTRE, volontairement : elles se disputeraient
+    sinon les mêmes fournisseurs de données, et la saturation coûte plus cher que la file d'attente
+    (mesuré, cf. `data.markets._cascade`).
+    """
+    from app.repositories.store import get_store
+    from app.services import daily_picks_cache
+
+    await asyncio.sleep(45)  # après le premier instantané de la stratégie, qui est prioritaire
+    while True:
+        s = get_settings()
+        if not s.daily_picks_precompute_enabled:
+            await asyncio.sleep(120)
+            continue
+        started = datetime.now(UTC)
+        store = get_store()
+        for tf in daily_picks_cache.timeframes():
+            try:
+                payload = await daily_picks_cache.refresh(store, tf)
+                logger.info("Sélection du jour (%s) : %d trade(s) retenu(s)",
+                            tf, len(payload.get("picks") or []))
+            except Exception as exc:  # noqa: BLE001 — une unité de temps KO n'arrête pas les autres
+                logger.warning("Sélection du jour (%s) échouée (%s)", tf, exc)
+        # Repos GARANTI entre deux cycles, comme pour l'instantané : si un cycle dure plus longtemps
+        # que son intervalle, repartir aussitôt maintiendrait la machine à 100 % en continu.
+        elapsed = (datetime.now(UTC) - started).total_seconds()
+        await asyncio.sleep(max(60.0, s.daily_picks_precompute_interval - elapsed))
+
+
 async def auto_entry_loop() -> None:
     """AUTO-ENTRÉE — surveille les setups ARMÉS et ouvre en démo dès le déclencheur 15 min.
 
@@ -387,6 +436,50 @@ async def training_loop() -> None:
             logger.exception("Échec de l'entraînement quotidien (%s)", exc)
 
 
+async def market_opinion_loop() -> None:
+    """ANALYSE QUOTIDIENNE des marchés (forex + or), HORS stratégie du desk.
+
+    Deux déclenchements, et le premier compte autant que le second :
+
+    1. **Rattrapage au démarrage** — si l'analyse du jour manque, elle est produite peu après le
+       lancement. C'est ce qui tient la promesse « chaque jour je lance le projet, je la trouve
+       prête » : sans ce rattrapage, un projet démarré à 9 h attendrait le lendemain 6 h UTC.
+    2. **Passage quotidien** à `market_opinion_hour` UTC (06 h par défaut, soit 07 h au Maroc :
+       l'analyse est en place avant l'ouverture de Londres).
+
+    Elle ne concurrence pas la stratégie — elle répond à une autre question (cf.
+    `services.market_opinion_service`).
+    """
+    from app.repositories.store import get_store
+    from app.services import market_opinion_service
+
+    # Décalé de l'entraînement et du premier instantané : ces trois passages tapent les mêmes
+    # fournisseurs gratuits, et les lancer ensemble les fait tous ralentir.
+    await asyncio.sleep(180)
+    s = get_settings()
+    if s.market_opinion_enabled and s.market_opinion_on_startup:
+        store = get_store()
+        try:
+            if not market_opinion_service.is_fresh(market_opinion_service.latest(store)):
+                await market_opinion_service.run_daily_opinion(store)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Échec de l'analyse quotidienne au démarrage (%s)", exc)
+
+    while True:
+        s = get_settings()
+        now = datetime.now(UTC)
+        target = now.replace(hour=s.market_opinion_hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep(max(60, (target - now).total_seconds()))
+        if not get_settings().market_opinion_enabled:
+            continue
+        try:
+            await market_opinion_service.run_daily_opinion(get_store())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Échec de l'analyse quotidienne (%s)", exc)
+
+
 async def backtest_loop() -> None:
     """BACKTEST HEBDOMADAIRE de la stratégie sur toutes les paires du desk.
 
@@ -417,27 +510,97 @@ async def backtest_loop() -> None:
             logger.exception("Échec du backtest hebdomadaire (%s)", exc)
 
 
+async def deep_backtest_loop() -> None:
+    """PASSE LONGUE (5 ans) rejouée en milieu de semaine, indépendamment du backtest complet.
+
+    Le backtest hebdomadaire du dimanche enchaîne trois passes et dure plusieurs heures. La passe
+    longue, elle, est légère (journalier au lieu de 1 h : environ vingt fois moins de bougies à
+    évaluer) et c'est elle qui porte la réponse à « où cette stratégie est-elle fiable sur la
+    durée ». On la rejoue donc seule au milieu de la semaine : le classement sur cinq ans est
+    rafraîchi deux fois par semaine sans payer deux fois le prix du passage complet.
+
+    Elle ne touche PAS aux verdicts par paire (🟢/🟡/🔴) : ceux-ci sont établis par la passe portée,
+    qui mesure le réglage de production. Mélanger deux échelles de temps dans un même verdict
+    donnerait une note que rien ne trade.
+    """
+    from app.backtest import playbook_backtest as pbt
+    from app.repositories.store import get_store
+
+    await asyncio.sleep(900)  # après l'entraînement initial et le premier sweep
+    while True:
+        s = get_settings()
+        now = datetime.now(UTC)
+        target = now.replace(hour=s.playbook_backtest_hour, minute=30, second=0, microsecond=0)
+        target += timedelta(days=(s.playbook_backtest_deep_weekday - now.weekday()) % 7)
+        if target <= now:
+            target += timedelta(days=7)
+        await asyncio.sleep(max(60, (target - now).total_seconds()))
+        s = get_settings()
+        if not (s.playbook_backtest_enabled and s.playbook_backtest_deep_enabled):
+            continue
+        if pbt.run_state()["running"]:
+            logger.info("Passe longue reportée : un backtest est déjà en cours")
+            continue
+        try:
+            store = get_store()
+            payload = await pbt.run_pass(
+                pbt.full_universe(), entry_tf="1d", step=s.playbook_backtest_deep_step,
+                parallel=s.playbook_max_parallel, ladder="swing",
+                max_years=s.playbook_backtest_deep_years,
+            )
+            # Stocké à part : ce n'est pas le réglage de production, et confondre les deux dans le
+            # même enregistrement ferait lire des chiffres de swing long comme des chiffres d'intraday.
+            record = {"date": datetime.now(UTC).date().isoformat(),
+                      **{k: v for k, v in payload.items() if k != "trade_log"}}
+            store.records.put("playbook_backtest_long", record["date"], record)
+            store.records.put("playbook_backtest_long", pbt.LATEST, record)
+            o = payload["overall"]
+            logger.info(
+                "Passe longue (%s ans) : %d trades, %s %% de réussite, espérance %+.2f R, PF %s",
+                payload["years_covered"], o["trades"], o["win_rate"], o["expectancy_r"],
+                o["profit_factor"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Échec de la passe longue (%s)", exc)
+
+
 async def positions_loop() -> None:
     """Surveillance continue des positions papier : clôture auto dès qu'un SL/TP est atteint."""
     from app.repositories.store import get_store
     from app.services import execution_service
 
+    # La quarantaine est le SEUL passage qui doive regarder les positions déjà CLÔTURÉES (elle
+    # cherche des résultats que le marché n'a pas produits) : elle ne peut donc pas bénéficier du
+    # filtre « positions ouvertes » qui allège les trois autres. Or son coût croît avec tout
+    # l'historique de la plateforme. Comme c'est un filet de réparation pour un bug DÉJÀ corrigé, et
+    # non un besoin temps réel, elle tourne toutes les 10 minutes au lieu de toutes les minutes —
+    # une position corrompue reste détectée, simplement pas dans la même seconde.
+    quarantine_every = 10
+    pass_count = 0
     while True:
         interval = max(15, get_settings().position_monitor_interval)
         await asyncio.sleep(interval)
+        pass_count += 1
         try:
             store = get_store()
             # 0) Quarantaine : neutralise les clôtures impossibles (résultat que le marché n'a
             #    jamais produit). Sans ça, un P&L inventé contaminerait le portefeuille et
             #    l'apprentissage des agents.
-            report = execution_service.quarantine_impossible_closures(store)
-            if report["count"]:
-                logger.warning("Quarantaine : %d position(s) invalidée(s)", report["count"])
+            if pass_count % quarantine_every == 1:
+                report = execution_service.quarantine_impossible_closures(store)
+                if report["count"]:
+                    logger.warning("Quarantaine : %d position(s) invalidée(s)", report["count"])
             # 1) Sécuriser AVANT de vérifier les clôtures : un trade qui a atteint +2R doit voir son
             #    stop remonté au même passage, sinon un repli dans la même minute le rendrait perdant.
             secured = await execution_service.secure_open_profits(store)
             if secured:
                 logger.info("Profit sécurisé : %d position(s) — stop remonté sur +2R", secured)
+            # 1 bis) TP1 atteint : poursuivre vers TP2 en verrouillant 80 % du chemin, ou prendre
+            #    le gain si le momentum ne confirme plus. Même raison d'être AVANT les clôtures.
+            progressed = await execution_service.manage_tp_progression(store)
+            if progressed:
+                logger.info("TP1 atteint : %d position(s) arbitrée(s) entre TP2 et prise de gain",
+                            progressed)
             closed = await execution_service.monitor_positions(store)
             if closed:
                 logger.info("Moniteur positions : %d position(s) clôturée(s) automatiquement", closed)

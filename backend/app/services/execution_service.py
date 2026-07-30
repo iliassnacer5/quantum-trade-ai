@@ -30,10 +30,53 @@ KYC = "kyc"
 
 _SUPPORTED = {"paper", "alpaca"}
 
-# Issues TERMINALES d'une position : elle ne sera plus suivie ni rouverte. `invalid` désigne un
-# ordre clôturé sur un résultat que le marché n'a jamais produit (cf. quarantine_impossible_closures) :
-# il est neutralisé, ni gagnant ni perdant, et exclu de toutes les statistiques.
-_FINAL_OUTCOMES = {"won", "lost", "invalid"}
+# Issues NEUTRES : la position est terminée mais n'a produit AUCUN résultat de marché exploitable.
+# Elle ne compte ni en gain, ni en perte, ni au P&L, et sort de toutes les statistiques.
+#  - `invalid` : clôturée sur un résultat que le marché n'a jamais produit (cf.
+#    `quarantine_impossible_closures`) ;
+#  - `reset`   : neutralisée par une remise à zéro de l'auto-entrée, donc jamais jouée jusqu'au
+#    bout. La compter gagnante ou perdante inventerait un résultat.
+NEUTRAL_OUTCOMES = {"invalid", "reset"}
+# Issues TERMINALES d'une position : elle ne sera plus suivie ni rouverte.
+FINAL_OUTCOMES = {"won", "lost", *NEUTRAL_OUTCOMES}
+
+
+def _open_orders(store: AppStore, tenant_id: str | None = None) -> list[dict]:
+    """Ordres encore OUVERTS (issue non terminale), filtrés au plus près de la base.
+
+    Les boucles de surveillance (`positions_loop` : quarantaine, sécurisation +2R, gestion TP1→TP2,
+    clôtures) tournent quatre fois par minute et chargeaient chacune TOUT l'historique d'ordres de
+    TOUS les comptes pour n'en garder que les rares positions actives. Le coût suivait le nombre
+    total de trades jamais passés au lieu du nombre de positions ouvertes.
+
+    HONNÊTETÉ SUR LE GAIN (mesuré le 30/07/2026, 497 ordres en base) : le filtre ne fait pour
+    l'instant PAS gagner de temps (16,6 ms contre 16,2 ms pour le `list` complet). Raison : 213 des
+    497 ordres sont réellement ouverts, et le filtre s'exprime en `NOT LIKE` sur le document JSON —
+    donc sans index, la base parcourt tout de même la table. Ce qui est acquis, c'est la CORRECTION
+    (résultat identique, vérifié par test) et le fait que l'écart se creusera à mesure que
+    l'historique clôturé grossira par rapport au nombre de positions actives. Le vrai gain
+    demanderait une colonne `outcome` dédiée et indexée : une migration, à ne faire que lorsque la
+    mesure la justifiera — pas avant.
+    """
+    return store.records.list_where_field_not_in(ORDER, "outcome", FINAL_OUTCOMES, tenant_id)
+
+
+async def _open_orders_async(store: AppStore, tenant_id: str | None = None) -> list[dict]:
+    """`_open_orders` exécuté HORS de la boucle d'événements.
+
+    Le store est synchrone (SQLAlchemy + psycopg2) : appelé directement depuis du code `async`, il
+    bloque la boucle — donc TOUTE l'API — pendant sa durée. Mesuré : 1,75 ms pour un `get` unitaire,
+    16,2 ms pour un balayage complet de la collection d'ordres.
+
+    Ces ordres de grandeur ne justifient PAS de convertir les 151 points d'appel du store en `async`
+    (le symptôme observé, 22 s, venait du réseau, pas de la base). Mais les trois boucles de fond
+    ci-dessous rappellent ce balayage complet quatre fois par minute, en continu : c'est le seul
+    endroit où le blocage se répète assez pour valoir un `to_thread`. On cible donc ces appels-là,
+    et eux seuls — une optimisation dont on ne peut pas mesurer le bénéfice n'a pas à être écrite.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(_open_orders, store, tenant_id)
 
 
 class ExecutionError(RuntimeError):
@@ -129,6 +172,17 @@ async def place_order(
         raise ExecutionError("side invalide (buy|sell)")
     if qty <= 0:
         raise ExecutionError("quantité invalide")
+
+    # MARCHÉS INTERDITS AU DESK (métaux précieux par défaut). Le balayage les écarte déjà, mais le
+    # contrôle est REFAIT ici parce que `place_order` est le seul passage obligé de TOUS les chemins
+    # d'ouverture : trades du jour, auto-entrée, ticket manuel, copy-trading, appel d'API direct.
+    # Un filtre uniquement côté balayage laisserait ces quatre autres portes ouvertes.
+    from app.services import playbook_service as _pb
+
+    banned = _pb.is_excluded(symbol)
+    if banned:
+        raise ExecutionError(f"{symbol} : {banned} — aucune position n'est ouverte sur ce marché.")
+
     rec = store.records.get(CONN, conn_id)
     if rec is None or rec.get("tenant_id") != tenant_id:
         raise ExecutionError("connexion broker introuvable")
@@ -150,7 +204,14 @@ async def place_order(
             )
 
     broker = _build_broker(rec)
-    result: OrderResult = await broker.place_order(symbol, side, qty)
+    try:
+        result: OrderResult = await broker.place_order(symbol, side, qty)
+    except Exception as exc:  # noqa: BLE001 — un broker (papier ou réel) qui ne peut pas remplir
+        # l'ordre (prix indisponible, panne réseau…) doit REFUSER proprement, pas laisser une
+        # exception brute remonter : `execute_playbook_trades` n'attrape que `ExecutionError` pour
+        # journaliser un refus motivé et continuer avec les symboles suivants — une exception d'un
+        # autre type y interromprait TOUTE la passe au premier symbole en échec.
+        raise ExecutionError(f"Ouverture de {symbol} impossible : {exc}") from exc
     # Garde-fou portefeuille (paper) : limite le nombre de positions et l'exposition totale.
     _portfolio_check(store, tenant_id, result)
     levels = _trade_levels(result, side, stop_loss, take_profit)  # valide + calcule R/R, risque, gain
@@ -164,11 +225,13 @@ def _portfolio_check(store: AppStore, tenant_id: str, result: OrderResult) -> No
     s = get_settings()
     if not s.paper_portfolio_guard:
         return
-    open_orders = [
-        o for o in store.records.list(ORDER, tenant_id)
-        if o.get("mode") == "paper" and o.get("outcome") not in _FINAL_OUTCOMES
-    ]
-    if len(open_orders) >= s.paper_max_positions:
+    open_orders = [o for o in _open_orders(store, tenant_id) if o.get("mode") == "paper"]
+    # Plafond de NOMBRE de positions retiré le 28/07/2026 (décision explicite) : `0` = aucune
+    # limite. Ce qui protège réellement le capital reste actif juste après — le plafond
+    # d'EXPOSITION EN RISQUE (% du capital réellement en jeu si tous les stops sautaient). Compter
+    # les positions une par une n'avait pas de sens : cinq positions à 0,2 % de risque chacune sont
+    # bien moins dangereuses qu'une seule à 10 %, or le plafond de nombre les traitait pareil.
+    if s.paper_max_positions and len(open_orders) >= s.paper_max_positions:
         raise ExecutionError(
             f"Limite de {s.paper_max_positions} positions ouvertes atteinte — clôture-en une avant d'en ouvrir une nouvelle."
         )
@@ -252,6 +315,33 @@ def list_orders(store: AppStore, tenant_id: str, limit: int = 100) -> list[dict]
     return store.records.list(ORDER, tenant_id)[:limit]
 
 
+def _outcome_from_pnl(realized: float) -> str:
+    """Issue d'une position clôturée, décidée par ce qu'elle a RAPPORTÉ.
+
+    Point de vérité unique, partagé par la clôture automatique et la clôture manuelle : c'est la
+    seule façon de garantir qu'une même position ne soit jamais étiquetée différemment selon le
+    chemin qui l'a fermée.
+    """
+    return "won" if realized >= 0 else "lost"
+
+
+def _close_reason(rec: dict, replay_reason: str, outcome: str) -> str:
+    """Motif de clôture LISIBLE — dit quel stop a été touché quand le stop a bougé.
+
+    « stop touché » sur un trade gagnant n'explique rien. Si le stop avait été remonté (2R sécurisés,
+    ou verrouillage après TP1), c'est ce déplacement qui a fermé la position en profit : on le dit.
+    """
+    if outcome != "won" or "stop" not in replay_reason.lower():
+        return replay_reason
+    if rec.get("tp1_reached"):
+        return "stop de protection touché après TP1 — gain verrouillé"
+    if rec.get("profit_secured"):
+        at_r = rec.get("secured_at_r")
+        return (f"stop de sécurisation touché — gain de +{at_r}R verrouillé"
+                if at_r else "stop de sécurisation touché — gain verrouillé")
+    return replay_reason
+
+
 async def check_order_outcome(store: AppStore, tenant_id: str, order_id: str) -> dict:
     """Vérifie si un trade papier a touché son TP (gagné) ou son SL (perdu) depuis l'entrée.
 
@@ -264,7 +354,7 @@ async def check_order_outcome(store: AppStore, tenant_id: str, order_id: str) ->
     rec = store.records.get(ORDER, order_id)
     if rec is None or rec.get("tenant_id") != tenant_id:
         raise ExecutionError("ordre introuvable")
-    if rec.get("outcome") in _FINAL_OUTCOMES:
+    if rec.get("outcome") in FINAL_OUTCOMES:
         return rec  # déjà clôturé
 
     entry = rec.get("entry") if rec.get("entry") is not None else rec.get("filled_price")
@@ -299,13 +389,113 @@ async def check_order_outcome(store: AppStore, tenant_id: str, order_id: str) ->
                 "note": "horodatage de clôture antérieur à l'ouverture — résultat rejeté"}
 
     realized = (exit_price - entry) * qty if side == "buy" else (entry - exit_price) * qty
+    # L'ISSUE EST CELLE DU RÉSULTAT, PAS CELLE DU NIVEAU TOUCHÉ.
+    #
+    # Le rejeu répond à une question de prix (« quel niveau a été franchi en premier ? ») et
+    # étiquette mécaniquement le stop en `lost`. Mais un stop DÉPLACÉ n'est plus une perte : la
+    # sécurisation +2R (`secure_open_profits`) et le verrouillage après TP1 (`manage_tp_progression`)
+    # remontent le stop DU CÔTÉ DU PROFIT. Le toucher encaisse alors un gain — et la carte affichait
+    # « ❌ Perdu · +198,71 », soit une contradiction dans la même ligne.
+    #
+    # La règle est donc celle du P&L, la même que la clôture manuelle (`close_order_manual`) :
+    # gagné si le trade a rapporté, perdu s'il a coûté. Une sortie exactement à zéro est comptée
+    # gagnante, comme en clôture manuelle : elle n'a rien coûté.
+    outcome = _outcome_from_pnl(realized)
     updated = {
         **rec, "outcome": outcome, "status": "closed", "exit_price": exit_price,
-        "realized_pnl": round(realized, 2), "close_reason": verdict["reason"],
+        "realized_pnl": round(realized, 2),
+        "close_reason": _close_reason(rec, verdict["reason"], outcome),
         "closed_at": datetime.fromtimestamp(closed_ts, UTC).isoformat() if closed_ts else None,
     }
     from app.core import metrics
     metrics.inc("paper_orders_closed_total", outcome=outcome)
+    return store.records.put(ORDER, order_id, updated, tenant_id=tenant_id)
+
+
+async def update_order_levels(
+    store: AppStore, tenant_id: str, order_id: str, *,
+    stop_loss: float | None = None, take_profit: float | None = None,
+) -> dict:
+    """Modifie MANUELLEMENT le stop et/ou l'objectif d'une position papier encore ouverte.
+
+    Même contrôle de cohérence directionnelle qu'à l'ouverture (`_trade_levels`) : le stop doit
+    rester du bon côté de l'entrée et l'objectif de l'autre, sinon ce ne serait plus un stop ni un
+    objectif. Refuse aussi un niveau que le prix ACTUEL a déjà franchi — la position se
+    clôturerait sinon dès le prochain passage de surveillance, sans que rien ne l'explique à
+    l'écran.
+
+    Ce qui ne change PAS : le risque d'ORIGINE (`initial_risk`), qui définit ce que vaut 1R pour
+    cette position depuis l'ouverture. Le redéfinir à chaque ajustement manuel ferait dériver la
+    sécurisation automatique (+2R) — c'est exactement le bug que ce champ a été figé pour éviter
+    (cf. `_trade_levels`). Un ajustement manuel déplace le NIVEAU, pas la définition du risque pris
+    à l'entrée. `risk_amount` / `potential_profit` / `risk_reward`, eux, sont recalculés : ce sont
+    des informations sur le plan ACTUEL, pas sur le risque d'origine.
+    """
+    if stop_loss is None and take_profit is None:
+        raise ExecutionError("indique au moins un nouveau stop ou un nouvel objectif")
+    rec = store.records.get(ORDER, order_id)
+    if rec is None or rec.get("tenant_id") != tenant_id:
+        raise ExecutionError("ordre introuvable")
+    if rec.get("mode") != "paper":
+        raise ExecutionError("seules les positions papier peuvent être modifiées manuellement")
+    if rec.get("outcome") in FINAL_OUTCOMES:
+        raise ExecutionError("position déjà clôturée : rien à modifier")
+
+    entry = rec.get("entry") if rec.get("entry") is not None else rec.get("filled_price")
+    side = rec.get("side")
+    if entry is None or side not in ("buy", "sell"):
+        raise ExecutionError("position sans entrée exploitable : modification impossible")
+    buy = side == "buy"
+    new_sl = stop_loss if stop_loss is not None else rec.get("stop_loss")
+    new_tp = take_profit if take_profit is not None else rec.get("take_profit")
+
+    if buy:
+        if new_sl is not None and new_sl >= entry:
+            raise ExecutionError(f"Achat : le stop ({new_sl}) doit rester SOUS l'entrée ({entry}).")
+        if new_tp is not None and new_tp <= entry:
+            raise ExecutionError(f"Achat : l'objectif ({new_tp}) doit rester AU-DESSUS de l'entrée ({entry}).")
+    else:
+        if new_sl is not None and new_sl <= entry:
+            raise ExecutionError(f"Vente : le stop ({new_sl}) doit rester AU-DESSUS de l'entrée ({entry}).")
+        if new_tp is not None and new_tp >= entry:
+            raise ExecutionError(f"Vente : l'objectif ({new_tp}) doit rester SOUS l'entrée ({entry}).")
+
+    price = await _reference_price(rec.get("symbol", ""))
+    if price:
+        if new_sl is not None and ((buy and price <= new_sl) or (not buy and price >= new_sl)):
+            raise ExecutionError(
+                f"Le prix actuel ({price:.6g}) a déjà franchi ce niveau de stop — la position se "
+                "clôturerait immédiatement. Choisis un niveau que le prix n'a pas encore atteint."
+            )
+        if new_tp is not None and ((buy and price >= new_tp) or (not buy and price <= new_tp)):
+            raise ExecutionError(
+                f"Le prix actuel ({price:.6g}) a déjà atteint cet objectif — clôture la position "
+                "directement (« Clôturer maintenant ») si c'est le gain que tu veux prendre."
+            )
+
+    qty = rec.get("qty") or 0.0
+    risk_per_unit = abs(entry - new_sl) if new_sl is not None else None
+    reward_per_unit = abs(new_tp - entry) if new_tp is not None else None
+    updated = dict(rec)
+    if stop_loss is not None:
+        updated["stop_loss"] = stop_loss
+    if take_profit is not None:
+        updated["take_profit"] = take_profit
+        # Garde le déclencheur TP1 (utilisé par `manage_tp_progression`) aligné sur le NOUVEL
+        # objectif — sinon la progression automatique continuerait de viser l'ancien niveau,
+        # invisible sur cette carte depuis la modification.
+        if rec.get("take_profit_1") is not None:
+            updated["take_profit_1"] = take_profit
+    if risk_per_unit:
+        updated["risk_amount"] = round(risk_per_unit * qty, 2)
+    if reward_per_unit:
+        updated["potential_profit"] = round(reward_per_unit * qty, 2)
+    if risk_per_unit and reward_per_unit:
+        updated["risk_reward"] = round(reward_per_unit / risk_per_unit, 2)
+    updated["levels_edited_manually"] = True
+    updated["levels_edited_at"] = datetime.now(UTC).isoformat()
+    logger.info("Niveaux modifiés manuellement sur %s (%s) : SL=%s TP=%s",
+                rec.get("symbol"), order_id, new_sl, new_tp)
     return store.records.put(ORDER, order_id, updated, tenant_id=tenant_id)
 
 
@@ -318,7 +508,7 @@ async def close_order_manual(store: AppStore, tenant_id: str, order_id: str) -> 
     rec = store.records.get(ORDER, order_id)
     if rec is None or rec.get("tenant_id") != tenant_id:
         raise ExecutionError("ordre introuvable")
-    if rec.get("outcome") in _FINAL_OUTCOMES:
+    if rec.get("outcome") in FINAL_OUTCOMES:
         return rec  # déjà clôturé
 
     entry = rec.get("entry") if rec.get("entry") is not None else rec.get("filled_price")
@@ -341,7 +531,7 @@ async def close_order_manual(store: AppStore, tenant_id: str, order_id: str) -> 
         raise ExecutionError(f"Aucune bougie disponible pour {rec['symbol']} — clôture impossible.")
     price = candles[-1].close
     pnl = ((price - entry) if side == "buy" else (entry - price)) * qty
-    outcome = "won" if pnl >= 0 else "lost"
+    outcome = _outcome_from_pnl(pnl)
     updated = {
         **rec, "outcome": outcome, "status": "closed", "exit_price": round(price, 8),
         "realized_pnl": round(pnl, 2), "closed_at": datetime.now(UTC).isoformat(), "closed_manually": True,
@@ -367,25 +557,88 @@ def ensure_paper_connection(store: AppStore, tenant_id: str) -> str:
     )["id"]
 
 
+# Cache COURT du prix de référence : {symbole -> (expire_à, prix)}. La page Positions se
+# rafraîchit seule toutes les 10 s, et plusieurs comptes démo (auto-provisionnés) peuvent avoir la
+# MÊME position ouverte au même instant. Sans ce cache, chaque rafraîchissement de chaque
+# utilisateur relançait un appel réseau par symbole ouvert — mesuré en production : c'est ce qui
+# faisait grimper `/api/execution/positions` à 10-22 s (un fournisseur gratuit comme Yahoo, sans
+# clé, répond plus lentement sous ce volume de requêtes répétées). Un TTL de 15 s reste imperceptible
+# pour un P&L latent affiché, et se dimensionner sur un prix vieux de quelques secondes ne change
+# rien à la validité d'un trade — le contrôle « le prix a-t-il déjà sorti de la zone d'entrée » qui
+# suit l'utilise de toute façon en supposant qu'il a pu bouger depuis le calcul du setup.
+_PRICE_CACHE_TTL = 15.0
+_price_cache: dict[str, tuple[float, float]] = {}
+
+
 async def _reference_price(symbol: str) -> float | None:
     """Dernier prix connu, à la MÊME source que celle du broker papier (cohérence du fill)."""
+    import time
+
     from app.data import markets
 
+    now = time.monotonic()
+    cached = _price_cache.get(symbol)
+    if cached and cached[0] > now:
+        return cached[1]
     try:
         candles = await markets.load_candles(symbol, interval="1h", limit=60)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Prix de référence %s indisponible (%s)", symbol, exc)
         return None
-    return candles[-1].close if candles else None
+    price = candles[-1].close if candles else None
+    if price is not None:
+        _price_cache[symbol] = (now + _PRICE_CACHE_TTL, price)
+    return price
 
 
 def _already_open(store: AppStore, tenant_id: str, symbol: str, side: str) -> bool:
     """Évite d'empiler deux fois le même trade (relances successives de la veille de session)."""
     return any(
         o.get("mode") == "paper" and o.get("symbol") == symbol and o.get("side") == side
-        and o.get("outcome") not in _FINAL_OUTCOMES
-        for o in store.records.list(ORDER, tenant_id)
+        for o in _open_orders(store, tenant_id)
     )
+
+
+def _recent_entry(store: AppStore, tenant_id: str, symbol: str, side: str,
+                  minutes: int) -> str | None:
+    """Motif de refus si le MÊME symbole/sens a déjà été ouvert il y a moins de `minutes`.
+
+    `_already_open` ne couvre que les positions ENCORE ouvertes. Or un déclencheur 15 min reste
+    souvent actif plusieurs passages de veille d'affilée : dès que la position précédente se
+    referme, la suivante repart aussitôt, au même prix à quelques dixièmes de pourcent près. C'est
+    exactement ce qui a produit quatre entrées ETH/USDT en quatre minutes — quatre fois le même
+    pari, donc quatre fois le risque prévu pour un seul.
+
+    `minutes <= 0` désactive le garde (ouverture manuelle : l'utilisateur sait ce qu'il fait).
+    """
+    if minutes <= 0:
+        return None
+    from datetime import timedelta
+
+    horizon = datetime.now(UTC) - timedelta(minutes=minutes)
+    for o in store.records.list(ORDER, tenant_id):
+        if o.get("symbol") != symbol or o.get("side") != side or o.get("mode") != "paper":
+            continue
+        # Un ordre NEUTRALISÉ (remise à zéro, clôture impossible) n'a jamais été joué : il ne peut
+        # pas valoir « ce déclencheur a déjà été pris ». Sans cette exception, une remise à zéro
+        # laisserait le délai courir et le bouton ne relancerait rien — ce qu'il promet pourtant.
+        if o.get("outcome") in NEUTRAL_OUTCOMES:
+            continue
+        created = o.get("created_at")
+        if not created:
+            continue
+        try:
+            when = datetime.fromisoformat(str(created))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        if when >= horizon:
+            age = (datetime.now(UTC) - when).total_seconds() / 60
+            return (f"{symbol} {side.upper()} déjà ouvert il y a {age:.0f} min "
+                    f"(délai anti-doublon : {minutes} min) — le même déclencheur ne se prend "
+                    f"qu'une fois")
+    return None
 
 
 def _currencies(symbol: str) -> set[str]:
@@ -412,8 +665,8 @@ def _correlation_conflict(store: AppStore, tenant_id: str, symbol: str) -> str |
     if not wanted:
         return None
     exposure: dict[str, int] = {}
-    for o in store.records.list(ORDER, tenant_id):
-        if o.get("mode") != "paper" or o.get("outcome") in _FINAL_OUTCOMES:
+    for o in _open_orders(store, tenant_id):
+        if o.get("mode") != "paper":
             continue
         for cur in _currencies(o.get("symbol", "")) & wanted:
             exposure[cur] = exposure.get(cur, 0) + 1
@@ -428,13 +681,16 @@ def _correlation_conflict(store: AppStore, tenant_id: str, symbol: str) -> str |
 
 async def execute_playbook_trades(
     store: AppStore, tenant_id: str, *, count: int = 5, picks: list[dict] | None = None,
+    cooldown_min: int = 0,
 ) -> dict:
     """Ouvre en COMPTE DÉMO (papier) les setups PRÊTS du playbook, avec leur stop et leur TP1.
 
     - la taille de position vient du profil de risque de l'utilisateur (% du capital risqué au stop) ;
     - le stop et l'objectif sont ceux calculés par la stratégie (jamais recalculés ici) ;
     - les garde-fous habituels s'appliquent (nb max de positions, risque total, données réelles) ;
-    - un même symbole/sens déjà ouvert n'est pas repris.
+    - un même symbole/sens déjà ouvert n'est pas repris ;
+    - `cooldown_min` (>0) refuse en plus un symbole/sens ouvert RÉCEMMENT, même déjà refermé :
+      c'est le garde de l'auto-entrée contre un déclencheur qui reste actif plusieurs passages.
 
     Retourne un rapport ligne par ligne : ce qui a été ouvert, et pourquoi le reste ne l'a pas été.
     """
@@ -483,6 +739,10 @@ async def execute_playbook_trades(
             continue
         if _already_open(store, tenant_id, symbol, side):
             skipped.append({"symbol": symbol, "reason": "position identique déjà ouverte"})
+            continue
+        recent = _recent_entry(store, tenant_id, symbol, side, cooldown_min)
+        if recent:
+            skipped.append({"symbol": symbol, "reason": recent})
             continue
         conflict = _correlation_conflict(store, tenant_id, symbol)
         if conflict:
@@ -535,6 +795,15 @@ async def execute_playbook_trades(
             "trigger_type": (p.get("trigger") or "").split(" — ", 1)[0].strip() or None,
             "session_window": (sess_ctx.get("kill_zones") or ["hors_fenetre"])[0],
             "atr_pct": daily_metrics.get("atr_pct"),
+            # Niveaux nécessaires à la gestion TP1 -> TP2 (cf. `manage_tp_progression`). Ils sont
+            # figés à l'ouverture : le plan de sortie ne se redécide pas en cours de route.
+            "take_profit_1": tp,
+            "take_profit_2": p.get("take_profit_2"),
+            "tp1_lock_stop": p.get("tp1_lock_stop"),
+            # Risque d'ORIGINE, mesuré sur le prix réellement rempli : c'est la référence du R, et
+            # elle doit être figée avant tout déplacement du stop, sinon elle dérive à chaque
+            # sécurisation.
+            "initial_risk": abs((order.get("filled_price") or fill) - sl),
         }, tenant_id=tenant_id)
         opened.append({
             "order_id": order["id"], "symbol": symbol, "side": side, "qty": qty,
@@ -591,6 +860,19 @@ async def execute_playbook_symbol(store: AppStore, tenant_id: str, symbol: str) 
     return report
 
 
+def _held_seconds(opened_iso: str | None, closed_iso: str | None) -> float | None:
+    """Durée de détention en secondes : entrée -> sortie, ou entrée -> maintenant si encore ouverte."""
+    from app.data import replay
+
+    opened = replay.iso_to_unix(opened_iso)
+    if opened is None:
+        return None
+    end = replay.iso_to_unix(closed_iso) if closed_iso else datetime.now(UTC).timestamp()
+    if end is None or end < opened:
+        return None
+    return round(end - opened, 1)
+
+
 async def positions_snapshot(store: AppStore, tenant_id: str, limit: int = 100) -> dict:
     """Photo COMPLÈTE des positions, prête à afficher — sans aucun clic de vérification.
 
@@ -599,38 +881,76 @@ async def positions_snapshot(store: AppStore, tenant_id: str, limit: int = 100) 
     la progression vers l'objectif. Les positions clôturées portent leur P&L réalisé.
 
     Un seul appel réseau côté interface -> la page peut se rafraîchir toute seule.
+
+    Les prix de référence des positions OUVERTES sont chargés en PARALLÈLE (un par symbole
+    distinct), pas les uns après les autres : mesuré en production, la version séquentielle
+    faisait grimper cette route à 26-34 s dès que plusieurs symboles différents étaient ouverts en
+    même temps (chaque connecteur Yahoo/OANDA qui échoue attend son propre délai avant d'abandonner
+    — ces délais s'additionnaient au lieu de se chevaucher). Avec plusieurs symboles, le temps total
+    devient celui du plus lent, pas la somme de tous.
     """
-    orders = list_orders(store, tenant_id, limit)
-    prices: dict[str, float | None] = {}
+    import asyncio
+
+    from app.domain import pips as pips_mod
+
+    # Lecture du store HORS de la boucle d'événements : c'est la route la plus sollicitée du site
+    # (rafraîchie automatiquement par la page Paper Trading), et le store est synchrone — l'appeler
+    # directement bloquerait toute l'API pendant sa durée.
+    orders = await asyncio.to_thread(list_orders, store, tenant_id, limit)
+
+    # Distincts symboles encore ouverts -> un seul appel réseau par symbole, tous en parallèle.
+    open_symbols = list(dict.fromkeys(
+        rec.get("symbol", "") for rec in orders if rec.get("outcome") not in FINAL_OUTCOMES
+    ))
+    fetched = await asyncio.gather(*(_reference_price(sym) for sym in open_symbols))
+    prices: dict[str, float | None] = dict(zip(open_symbols, fetched, strict=True))
+
     out: list[dict] = []
     open_pnl = realized_pnl = 0.0
     wins = losses = invalid = 0
 
     for rec in orders:
         row = dict(rec)
+        symbol = rec.get("symbol", "")
         entry = rec.get("entry") if rec.get("entry") is not None else rec.get("filled_price")
         sl, tp = rec.get("stop_loss"), rec.get("take_profit")
         side, qty = rec.get("side"), rec.get("qty") or 0.0
-        closed = rec.get("outcome") in _FINAL_OUTCOMES
+        closed = rec.get("outcome") in FINAL_OUTCOMES
         row["closed"] = closed
+        # HEURE D'ENTRÉE, sur toutes les lignes : sans elle, impossible de rattacher une position à
+        # une séance ni de juger de sa durée de vie. `created_at` est l'horodatage d'ouverture posé
+        # par le store ; on l'expose sous un nom qui dit ce qu'il est.
+        row["opened_at"] = rec.get("created_at")
+        # Niveaux exprimés en pips, TOUJOURS signés dans le sens du trade : l'objectif est positif
+        # par construction, et le stop est négatif tant qu'il est en perte — mais positif une fois
+        # remonté du côté du profit (sécurisation +2R, verrouillage après TP1). Une valeur non
+        # signée aurait affiché la même chose pour un stop qui coûte 40 pips et un stop qui en
+        # verrouille 40.
+        row["pips_label"] = pips_mod.label(symbol)
+        row["target_pips"] = pips_mod.signed_pips(symbol, side, entry, tp)
+        row["stop_pips"] = pips_mod.signed_pips(symbol, side, entry, sl)
         if closed:
-            # Une position INVALIDÉE (clôturée sur un résultat que le marché n'a pas produit) ne
-            # compte ni en gain, ni en perte, ni au P&L : elle n'a jamais eu lieu.
-            if rec.get("outcome") == "invalid":
+            # Une position NEUTRALISÉE (clôture impossible, ou remise à zéro de l'auto-entrée) ne
+            # compte ni en gain, ni en perte, ni au P&L : elle n'a produit aucun résultat de marché.
+            if rec.get("outcome") in NEUTRAL_OUTCOMES:
                 invalid += 1
                 out.append(row)
                 continue
             realized_pnl += float(rec.get("realized_pnl") or 0.0)
             wins += 1 if rec.get("outcome") == "won" else 0
             losses += 1 if rec.get("outcome") == "lost" else 0
+            # Pips RÉELLEMENT gagnés ou perdus, mesurés entrée -> sortie. C'est la lecture la plus
+            # directe de ce que le trade a fait, indépendante de la taille de position.
+            row["pips"] = pips_mod.signed_pips(symbol, side, entry, rec.get("exit_price"))
+            row["held_seconds"] = _held_seconds(rec.get("created_at"), rec.get("closed_at"))
             out.append(row)
             continue
 
-        symbol = rec.get("symbol", "")
-        if symbol not in prices:
-            prices[symbol] = await _reference_price(symbol)
-        price = prices[symbol]
+        price = prices.get(symbol)
+        row["held_seconds"] = _held_seconds(rec.get("created_at"), None)
         if price and entry:
+            # Pips LATENTS : où en est le trade en ce moment, dans la même unité qu'à la clôture.
+            row["pips"] = pips_mod.signed_pips(symbol, side, entry, price)
             pnl = (price - entry) * qty if side == "buy" else (entry - price) * qty
             row["current_price"] = round(price, 8)
             row["unrealized_pnl"] = round(pnl, 2)
@@ -679,8 +999,8 @@ async def secure_open_profits(store: AppStore) -> int:
 
     secured = 0
     prices: dict[str, float | None] = {}
-    for rec in store.records.list(ORDER):  # tous tenants
-        if rec.get("mode") != "paper" or rec.get("outcome") in _FINAL_OUTCOMES:
+    for rec in await _open_orders_async(store):  # tous tenants, positions ouvertes, hors boucle
+        if rec.get("mode") != "paper":
             continue
         entry = rec.get("entry") if rec.get("entry") is not None else rec.get("filled_price")
         sl, side = rec.get("stop_loss"), rec.get("side")
@@ -717,6 +1037,102 @@ async def secure_open_profits(store: AppStore) -> int:
         secured += 1
         await _notify_secured(store, rec.get("tenant_id"), rec, new_stop, progress_r)
     return secured
+
+
+async def manage_tp_progression(store: AppStore) -> int:
+    """TP1 touché : faut-il prendre le gain, ou aller chercher TP2 ?
+
+    La règle demandée par le desk : quand TP1 est atteint ET que la continuation est probable, le
+    stop remonte à **80 % du chemin déjà parcouru** et la position part vers TP2. « Probable » n'est
+    pas une impression : c'est le momentum 15 min qui doit encore pousser dans notre sens — RSI non
+    épuisé, MACD favorable, aucun changement de caractère récent à contresens (cf.
+    `domain.exits.momentum_still_supports`). Si l'un de ces trois points manque, on ne prolonge pas
+    le risque : le stop est amené sur TP1, ce qui revient à prendre le gain sur le prochain retour.
+
+    Cette règle est COMPLÉMENTAIRE de la sécurisation +2R : le stop retient toujours le niveau le
+    plus favorable des deux, et ne recule jamais.
+
+    Retourne le nombre de positions dont le stop a été relevé sur ce passage.
+    """
+    from app.core.config import get_settings
+    from app.domain import exits
+    from app.services import playbook_service
+
+    s = get_settings()
+    if not s.playbook_tp2_management:
+        return 0
+
+    moved = 0
+    prices: dict[str, float | None] = {}
+    momentum: dict[tuple[str, str], dict] = {}
+    for rec in await _open_orders_async(store):  # tous tenants, positions ouvertes, hors boucle
+        if rec.get("mode") != "paper":
+            continue
+        tp1, tp2 = rec.get("take_profit_1"), rec.get("take_profit_2")
+        lock = rec.get("tp1_lock_stop")
+        entry = rec.get("entry") if rec.get("entry") is not None else rec.get("filled_price")
+        sl, side = rec.get("stop_loss"), rec.get("side")
+        if not (tp1 and tp2 and lock) or entry is None or sl is None or rec.get("tp1_reached"):
+            continue
+        symbol = rec.get("symbol", "")
+        if symbol not in prices:
+            prices[symbol] = await _reference_price(symbol)
+        price = prices[symbol]
+        if not price:
+            continue
+        buy = side == "buy"
+        if (buy and price < tp1) or (not buy and price > tp1):
+            continue          # TP1 pas encore touché : rien à décider
+
+        key = (symbol, side)
+        if key not in momentum:
+            candles, _ = await playbook_service._load(symbol, "15m", 300)
+            momentum[key] = exits.momentum_still_supports(candles, 1 if buy else -1)
+        check = momentum[key]
+        # Continuation confirmée -> on verrouille 80 % et on laisse courir. Sinon -> stop sur TP1,
+        # ce qui revient à encaisser le gain dès que le prix revient le chercher.
+        target_stop = lock if check["ok"] else tp1
+        new_stop = max(sl, target_stop) if buy else min(sl, target_stop)
+        if (buy and new_stop >= price) or (not buy and new_stop <= price):
+            # Le stop tomberait du mauvais côté du prix courant : on garde le stop existant.
+            continue
+        if abs(new_stop - sl) < 1e-12:
+            continue
+        store.records.put(ORDER, rec["id"], {
+            **rec, "stop_loss": round(new_stop, 8),
+            "tp1_reached": True,
+            "tp1_reached_at": datetime.now(UTC).isoformat(),
+            "tp_lock_rule": "tp1_80pct" if check["ok"] else "tp1_exit",
+            "momentum_check": {"ok": check["ok"], "reasons": check["reasons"],
+                               "rsi": check.get("rsi")},
+            "original_stop_loss": rec.get("original_stop_loss", sl),
+        }, tenant_id=rec.get("tenant_id"))
+        moved += 1
+        await _notify_tp1(store, rec.get("tenant_id"), rec, new_stop, check)
+    return moved
+
+
+async def _notify_tp1(store: AppStore, tenant_id: str, order: dict, new_stop: float,
+                      check: dict) -> None:
+    """Annonce l'atteinte de TP1 et la décision prise : poursuivre vers TP2, ou prendre le gain."""
+    from app.realtime import bus
+
+    if check["ok"]:
+        msg = (
+            f"🎯 {order['symbol']} : TP1 atteint et le momentum tient — stop remonté sur "
+            f"{new_stop:.6g} (80 % du chemin verrouillé), la position part chercher TP2."
+        )
+    else:
+        why = " ; ".join(check["reasons"]) or "momentum insuffisant"
+        msg = (
+            f"🎯 {order['symbol']} : TP1 atteint mais la continuation n'est pas confirmée "
+            f"({why}) — stop amené sur TP1, on prend le gain."
+        )
+    try:
+        await bus.publish(tenant_id, {"type": "tp1_reached",
+                                      "data": {**order, "stop_loss": new_stop, "message": msg}})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Diffusion TP1 échouée (%s)", exc)
 
 
 async def _notify_secured(store: AppStore, tenant_id: str, order: dict, new_stop: float, progress_r: float) -> None:
@@ -784,8 +1200,8 @@ async def monitor_positions(store: AppStore) -> int:
     Diffuse un événement temps réel + notifie l'utilisateur à chaque clôture automatique.
     Retourne le nombre d'ordres clôturés sur ce passage."""
     closed = 0
-    for rec in store.records.list(ORDER):  # tous tenants
-        if rec.get("mode") != "paper" or rec.get("outcome") in _FINAL_OUTCOMES:
+    for rec in await _open_orders_async(store):  # tous tenants, positions ouvertes, hors boucle
+        if rec.get("mode") != "paper":
             continue
         if rec.get("stop_loss") is None and rec.get("take_profit") is None:
             continue

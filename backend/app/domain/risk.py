@@ -83,7 +83,7 @@ def compute_levels_from_prices(
 ) -> RiskOutput:
     """Dimensionne une position sur des niveaux DÉJÀ décidés (stop structurel du playbook).
 
-    Le playbook place le stop derrière la structure et l'objectif à max(2 × risque, 200 pips) :
+    Le playbook place le stop derrière la structure et l'objectif à max(2 × risque, plancher en pips) :
     ces niveaux ont un sens de marché, on ne les remplace pas par un multiple d'ATR. Ici on se
     contente d'en déduire le R/R et la taille de position. Les objectifs supérieurs peuvent être
     absents (`None`) : la stratégie n'en définit pas toujours.

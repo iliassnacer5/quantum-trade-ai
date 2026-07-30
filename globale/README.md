@@ -5,7 +5,7 @@
 > (orienté carte de l'edge multi-stratégies) en se concentrant sur la **stratégie playbook**, la
 > **mise en production** et le **chemin commercial**.
 
-## Les 4 documents
+## Les documents
 
 | Fichier | Contenu |
 |---|---|
@@ -13,6 +13,9 @@
 | [02_STRATEGIE_PLAYBOOK.md](02_STRATEGIE_PLAYBOOK.md) | Analyse de la stratégie + **7 améliorations classées par preuve mesurée**, avec critère de validation pour chacune |
 | [03_PLAN_IMPLEMENTATION.md](03_PLAN_IMPLEMENTATION.md) | Feuille de route en 6 phases : fondations → stratégie → risque → forward test → production → exploitation quotidienne |
 | [04_SAAS_1M.md](04_SAAS_1M.md) | Chemin commercial vers 1 M$ ARR : pricing, économie unitaire, jalons, légal, go-to-market |
+| [05_ETAT_IMPLEMENTATION.md](05_ETAT_IMPLEMENTATION.md) | Où en est réellement l'implémentation du plan, phase par phase |
+| [06_PLAN_DEPLOIEMENT.md](06_PLAN_DEPLOIEMENT.md) | **Mise en ligne de A à Z** : recommandation d'hébergement justifiée pour 150 DH, procédure pas à pas, HTTPS, vérification, exploitation |
+| [07_PLAN_PERFORMANCE.md](07_PLAN_PERFORMANCE.md) | **Pourquoi le site est lent** : diagnostic mesuré (base de données synchrone, backtests séquentiels, polling agressif) et plan d'action priorisé |
 
 ## Résumé exécutif
 

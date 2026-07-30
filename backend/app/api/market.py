@@ -37,12 +37,19 @@ async def ohlcv(
     données inventées en les faisant passer pour du marché réel."""
     from app.data.ohlcv import get_ohlcv_with_source
 
+    import asyncio
+
     interval = _TF_INTERVAL.get(timeframe, "1h")
     payload = await get_ohlcv_with_source(asset, interval=interval, limit=limit)
     # Ingestion best-effort vers TimescaleDB (no-op en mode in-memory) — jamais de données fictives.
+    #
+    # Déportée HORS de la boucle d'événements : c'est une écriture de plusieurs centaines de lignes,
+    # synchrone, et elle bloquait la réponse (mesuré le 30/07/2026 : 715 ms sur un appel dont les
+    # bougies venaient pourtant du cache — tout le temps passait dans cette écriture). Le graphique
+    # n'a pas à attendre l'archivage de ses propres bougies pour s'afficher.
     if payload["real"]:
         try:
-            store.market.upsert_ohlcv(asset, interval, payload["candles"])
+            await asyncio.to_thread(store.market.upsert_ohlcv, asset, interval, payload["candles"])
         except Exception as exc:  # noqa: BLE001
             logger.warning("Ingestion OHLCV échouée (%s)", exc)
     return payload

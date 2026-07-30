@@ -1,0 +1,31 @@
+# Fins de ligne — indispensable sur un poste Windows qui construit des images Linux.
+#
+# Sans cette règle, Git convertit les fichiers en CRLF à la sortie du dépôt. Un script shell copié
+# tel quel dans un conteneur devient alors illisible : le shell voit un « \r » à la fin de chaque
+# ligne et échoue sur « $'\r': command not found ». C'est ce qui a mis le service de sauvegarde de
+# la base en boucle de redémarrage, sans que rien ne le signale ailleurs que dans ses logs.
+
+# Par défaut : Git décide, mais normalise en LF dans le dépôt.
+* text=auto eol=lf
+
+# Tout ce qui est exécuté PAR UN SYSTÈME UNIX doit rester en LF, quoi qu'il arrive.
+*.sh text eol=lf
+*.bash text eol=lf
+Dockerfile text eol=lf
+*.dockerfile text eol=lf
+entrypoint* text eol=lf
+
+# Fichiers propres à Windows : eux gardent CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binaires : jamais de conversion.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.pdf binary

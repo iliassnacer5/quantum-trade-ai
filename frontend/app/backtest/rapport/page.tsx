@@ -15,13 +15,14 @@ import {
   type PlaybookBacktest,
   type PlaybookBacktestMetrics,
   type PlaybookBacktestPass,
+  type PlaybookMarketTop,
   type PlaybookPairRank,
 } from '@/lib/api';
 import { Button, Card, PageHeader, RouteTabs, PROVE_TABS, Segmented, Table, THead, TBody, TR, TH, TD } from '@/components/ui';
 
 /** Lecture pédagogique de chaque métrique — au survol du libellé. */
 const GLOSSARY: Record<string, string> = {
-  trades: "Nombre de fois où la cascade complète a été satisfaite et où une position aurait été ouverte.",
+  trades: "Nombre de fois où les trois étapes de la stratégie ont été satisfaites (tendance validée, confirmations réunies, R/R dans la bande) et où une position aurait été ouverte.",
   win_rate: "Part des trades sortis en gain. Seul, ce chiffre ne dit rien : 40 % de réussite avec un R/R 1:3 est rentable, 70 % avec un R/R 1:0,5 ne l'est pas.",
   expectancy_r: "Gain moyen par trade, exprimé en multiples du risque (R). C'est LA mesure qui compte : elle combine le taux de réussite et le rapport gain/perte. Positive = la stratégie gagne de l'argent sur la durée.",
   profit_factor: "Somme des gains ÷ somme des pertes. Au-dessus de 1,5 le résultat est solide ; en dessous de 1, la stratégie perd. « ∞ » signifie aucun trade perdant sur l'échantillon.",
@@ -117,6 +118,70 @@ function Ranking({ rows, minTrades }: { rows: PlaybookPairRank[]; minTrades: num
   );
 }
 
+/**
+ * LES 10 MEILLEURS INSTRUMENTS DE CHAQUE MARCHÉ.
+ *
+ * Le classement général mélange EUR/USD et NVDA, dont ni la volatilité ni les horaires ne se
+ * comparent : le marché le plus volatil occupe alors tout le haut du tableau et les autres
+ * deviennent invisibles. On classe donc À L'INTÉRIEUR de chaque marché, sur le même critère —
+ * l'espérance en R.
+ */
+function MarketTops({ tops }: { tops: Record<string, PlaybookMarketTop> }) {
+  const blocks = Object.values(tops).filter((b) => b.top.length > 0);
+  if (blocks.length === 0) return null;
+  return (
+    <Card className="p-4">
+      <h4 className="text-sm font-semibold text-white">🏆 Les 10 meilleurs de chaque marché</h4>
+      <p className="mt-0.5 text-[11px] leading-relaxed text-muted">
+        Un instrument sous le seuil d&apos;échantillon n&apos;y figure pas : on ne met pas en tête
+        ce qu&apos;on n&apos;a pas mesuré. Et « meilleur du marché » ne veut pas dire
+        « rentable » — le compte des espérances positives est donné pour chaque marché.
+      </p>
+      <div className="mt-3 grid gap-3 lg:grid-cols-2">
+        {blocks.map((b) => (
+          <div key={b.market} className="rounded-lg border border-border/60 bg-background/40 p-3">
+            <div className="flex items-baseline justify-between gap-2">
+              <h5 className="text-xs font-semibold text-white">{b.label}</h5>
+              <span className="text-[10px] text-muted">
+                {b.profitable}/{b.top.length} rentables · {b.unrated} non mesuré(s)
+              </span>
+            </div>
+            <div className="mt-2 overflow-x-auto">
+              <table className="w-full min-w-[360px] text-[11px]">
+                <thead>
+                  <tr className="text-[10px] uppercase tracking-wide text-muted">
+                    <th className="pb-1 text-left font-medium">#</th>
+                    <th className="pb-1 text-left font-medium">Instrument</th>
+                    <th className="pb-1 text-right font-medium">Trades</th>
+                    <th className="pb-1 text-right font-medium">Réussite</th>
+                    <th className="pb-1 text-right font-medium">Espérance</th>
+                    <th className="pb-1 text-right font-medium">PF</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {b.top.map((r) => (
+                    <tr key={r.symbol} className="border-t border-border/40">
+                      <td className="py-1 pr-2 text-muted">{r.market_rank}</td>
+                      <td className="py-1 pr-2 font-mono text-white/90">{r.symbol}</td>
+                      <td className="py-1 pr-2 text-right text-muted">{r.trades}</td>
+                      <td className="py-1 pr-2 text-right text-white/80">{r.win_rate} %</td>
+                      <td className={`py-1 pr-2 text-right font-semibold ${r.expectancy_r > 0 ? 'text-buy' : 'text-sell'}`}>
+                        {r.expectancy_r > 0 ? '+' : ''}{r.expectancy_r} R
+                      </td>
+                      <td className="py-1 text-right text-muted">{r.profit_factor ?? '∞'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="mt-1.5 text-[10px] leading-relaxed text-muted">{b.note}</p>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
 function GroupTable({ title, data, note, minTrades }: {
   title: string; data: Record<string, PlaybookBacktestMetrics>; note: string; minTrades: number;
 }) {
@@ -163,12 +228,13 @@ function PassSection({ pass, title, method }: { pass: PlaybookBacktestPass; titl
 
       {pass.overall.trades === 0 ? (
         <Card className="p-5 text-sm text-muted">
-          Aucun trade conforme sur cette passe : la cascade complète n&apos;a jamais été entièrement
-          satisfaite. C&apos;est un résultat en soi, pas une panne.
+          Aucun trade conforme sur cette passe : les trois étapes de la stratégie n&apos;ont jamais
+          été entièrement satisfaites. C&apos;est un résultat en soi, pas une panne.
         </Card>
       ) : (
         <>
           <MetricsGrid m={pass.overall} />
+          {pass.market_tops && <MarketTops tops={pass.market_tops} />}
           <Card className="p-4">
             <h4 className="mb-1 text-sm font-semibold text-white">Classement des paires par fiabilité</h4>
             <p className="mb-2 text-[11px] text-muted">
@@ -270,7 +336,7 @@ export default function BacktestReportPage() {
     <div className="space-y-6 p-8">
       <PageHeader
         title="Rapport de backtest — stratégie du desk"
-        subtitle="La cascade complète rejouée sur l'historique réel du forex et de l'or, avec sa méthode et ses limites."
+        subtitle="La stratégie rejouée sur l'historique réel de tous les marchés — forex, métaux, indices, actions et crypto — avec sa méthode et ses limites."
       />
       <RouteTabs items={PROVE_TABS} />
 

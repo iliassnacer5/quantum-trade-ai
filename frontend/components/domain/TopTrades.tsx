@@ -3,13 +3,15 @@
 /**
  * Les trades du jour issus de la STRATÉGIE du desk.
  *
- * Cascade appliquée côté backend :
- *   1. Mensuel + Journalier -> tendance de fond + supports/résistances majeurs
- *   2. Journalier -> RSI14, MA20/MA50, volume, tendance VWAP, divergences RSI/MACD, Fibonacci
- *   3. 4 h -> mêmes facteurs, confirmation
- *   4. 15 min -> déclencheur d'entrée (seule unité de temps d'entrée)
- * Le STOP vient de la structure 15 min, l'OBJECTIF est borné par le prochain niveau 1 h, et le
- * R/R tient dans la bande 1:1,2 – 1:1,3.
+ * Trois étapes, côté backend, appliquées à tous les marchés (forex, métaux, indices, actions,
+ * crypto) :
+ *   1. TENDANCE — six indicateurs (EMA 50/200, structure HH/HL, SuperTrend, MACD, RSI, volume) sur
+ *      D1, 4 h, 1 h et 15 min. L'accord du 4 h et du 1 h suffit à la valider (le journalier pèse
+ *      dans le score mais n'est pas obligatoire). Une fois validée, elle est FIGÉE.
+ *   2. ENTRÉE — en 15 min, autorisée dès qu'au moins trois confirmations pondérées se rejoignent
+ *      (zones d'offre/demande, cassure de structure, figures, supports/résistances, Fibonacci…).
+ *   3. SORTIES — stop posé sur le niveau qui invaliderait le scénario, objectif devant le premier
+ *      obstacle réel et d'au moins 50 pips, avec un R/R entre 1:2 et 1:3.
  *
  * Principe d'affichage : AUCUN score technique brut. Chaque facteur porte un score de fiabilité
  * lisible de -5 à +5 (positif = argument d'achat, négatif = argument de vente), l'explication est
@@ -366,7 +368,34 @@ function ExecutionReport({ report }: { report: PaperExecutionReport }) {
 }
 
 /** Bandeau d'auto-entrée : ce que le robot surveille, et ce qu'il a ouvert pendant ton absence. */
-function AutoEntryBanner({ status }: { status: AutoEntryStatus }) {
+function AutoEntryBanner({ status, onReset }: { status: AutoEntryStatus; onReset: () => void }) {
+  const [resetting, setResetting] = useState(false);
+  const [done, setDone] = useState<string | null>(null);
+
+  async function reset() {
+    // Action destructive sur le journal DÉMO : on demande confirmation, et on dit exactement ce
+    // qui va être touché plutôt qu'un « êtes-vous sûr ? » qui n'informe personne.
+    const ok = window.confirm(
+      'Remettre l’auto-entrée à zéro ?\n\n' +
+      '• les positions DÉMO encore ouvertes seront neutralisées (issue « reset », P&L à zéro, ' +
+      'exclues des statistiques) ;\n' +
+      '• l’historique des entrées automatiques sera effacé, ce qui remet aussi le délai ' +
+      'anti-doublon à zéro ;\n' +
+      '• les trades déjà clôturés sont CONSERVÉS, et aucune position réelle n’est touchée.',
+    );
+    if (!ok) return;
+    setResetting(true);
+    try {
+      const res = await api.resetAutoEntry();
+      setDone(res.note);
+      onReset();
+    } catch (e: any) {
+      setDone(`Échec de la remise à zéro : ${e.message}`);
+    } finally {
+      setResetting(false);
+    }
+  }
+
   if (!status.enabled) {
     return (
       <div className="rounded-xl border border-border bg-surface px-4 py-2 text-xs text-muted">
@@ -376,24 +405,53 @@ function AutoEntryBanner({ status }: { status: AutoEntryStatus }) {
   }
   return (
     <div className="rounded-xl border border-accent/40 bg-accent/5 px-4 py-3 text-sm">
-      <p className="font-semibold text-accent">
-        🤖 Auto-entrée active — compte DÉMO · vérification toutes les {status.interval_seconds} s
-      </p>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <p className="font-semibold text-accent">
+          🤖 Auto-entrée active — compte DÉMO · vérification toutes les {status.interval_seconds} s
+        </p>
+        <Button size="sm" variant="danger" onClick={reset} loading={resetting}>
+          Remettre à zéro
+        </Button>
+      </div>
       <p className="mt-0.5 text-[11px] text-muted">
         Tu n&apos;as rien à cliquer : dès qu&apos;un setup armé voit son déclencheur 15 min se former,
-        la position est ouverte automatiquement avec son stop 15 min et son objectif borné 1 h.
-        Aucun argent réel n&apos;est engagé.
+        la position est ouverte automatiquement avec son stop et son objectif. Aucun argent réel
+        n&apos;est engagé.
+      </p>
+      <p className="mt-0.5 text-[11px] text-muted">
+        {status.pair_gating === false
+          ? 'Aucun verdict de paire ne peut s’y opposer : tout déclencheur formé part.'
+          : 'Filtre de verdict actif : seules les paires 🟢 sont auto-tradées.'}
+        {status.cooldown_min
+          ? ` Un même symbole/sens ne se reprend pas avant ${status.cooldown_min} min (anti-doublon).`
+          : ''}
       </p>
       {status.watching.length > 0 && (
         <p className="mt-1 text-[11px] text-muted">
           Sous surveillance : {status.watching.map((w) => `${w.symbol} ${w.direction}`).join(' · ')}
         </p>
       )}
+      {/* Exécutable à l'écran mais refusé au dernier passage : sans cette ligne, ça ressemble à
+          une panne du robot alors qu'un garde-fou (portefeuille, corrélation, anti-doublon) a
+          fait exactement ce qu'on lui a demandé. */}
+      {(status.blocked?.length ?? 0) > 0 && (
+        <div className="mt-1.5 rounded border border-warn/30 bg-warn-soft/20 px-2 py-1.5">
+          <p className="text-[11px] font-medium text-white/85">
+            Prêt(s) mais non ouvert(s) au dernier passage :
+          </p>
+          <ul className="mt-0.5 space-y-0.5 text-[11px] text-muted">
+            {status.blocked!.map((b, i) => (
+              <li key={i}>{b.symbol} — {b.reason}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       {status.recent.length > 0 && (
         <ul className="mt-2 space-y-0.5 text-[11px] text-buy">
           {status.recent.slice(0, 4).map((e) => <li key={e.id}>{e.message}</li>)}
         </ul>
       )}
+      {done && <p className="mt-2 text-[11px] leading-relaxed text-white/80">{done}</p>}
     </div>
   );
 }
@@ -411,7 +469,7 @@ export function TopTrades() {
   // quelques millisecondes, ce qui permet de relire toutes les 10 s sans jamais bloquer la page.
   const load = useCallback(async () => {
     try {
-      const [trades, status] = await Promise.all([api.topTrades(false, 5), api.autoEntry()]);
+      const [trades, status] = await Promise.all([api.topTrades(false, 0), api.autoEntry()]);
       setData(trades);
       setAutoEntry(status);
       setError(null);
@@ -434,7 +492,7 @@ export function TopTrades() {
     setRecomputing(true);
     setError(null);
     try {
-      setData(await api.topTrades(true, 5));
+      setData(await api.topTrades(true, 0));
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -462,11 +520,22 @@ export function TopTrades() {
     <section className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h2 className="text-lg font-semibold text-white">🎯 Les 5 trades du jour — stratégie du desk</h2>
+          <h2 className="text-lg font-semibold text-white">
+            🎯 Trades du jour — stratégie du desk
+            {data?.picks?.length ? <span className="ml-2 text-sm font-normal text-muted">
+              {data.picks.length} setup{data.picks.length > 1 ? 's' : ''} conforme{data.picks.length > 1 ? 's' : ''}
+            </span> : null}
+          </h2>
           <p className="text-xs text-muted">
-            Mensuel + Journalier (tendance de fond &amp; niveaux majeurs) → Journalier détaillé →
-            4 h → <strong className="text-white/80">entrée en 15 min uniquement</strong> · stop sur
-            la structure 15 min · objectif borné par le niveau 1 h · R/R entre 1,2 et 1,3.
+            Tendance mesurée sur D1, 4 h, 1 h et 15 min puis figée →{' '}
+            <strong className="text-white/80">entrée en 15 min uniquement</strong>, sur au moins
+            trois confirmations pondérées → stop sur le niveau qui invalide le scénario, objectifs
+            devant le premier obstacle réel · R/R entre 1:2 et 1:3.
+          </p>
+          <p className="mt-0.5 text-[11px] text-muted">
+            La liste n’est plus plafonnée : TOUS les setups conformes sont affichés, classés du plus
+            fiable au moins fiable. La stratégie ne dit pas « les cinq meilleurs », elle dit « ceux
+            qui remplissent les trois étapes ».
           </p>
           <p className="mt-0.5 text-[11px] text-muted">
             <span className={auto.refreshing ? 'text-accent' : ''}>🔄 Mise à jour automatique</span> ·{' '}
@@ -489,7 +558,7 @@ export function TopTrades() {
         </div>
       </div>
 
-      {autoEntry && <AutoEntryBanner status={autoEntry} />}
+      {autoEntry && <AutoEntryBanner status={autoEntry} onReset={() => void load()} />}
       {data && <SessionBanner data={data} />}
       {error && <p className="text-sell">{error}</p>}
       {report && <ExecutionReport report={report} />}
