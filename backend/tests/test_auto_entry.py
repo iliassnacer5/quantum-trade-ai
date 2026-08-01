@@ -97,6 +97,31 @@ async def test_armed_setup_is_opened_automatically_when_the_trigger_fires(market
     assert len(orders) == 1 and orders[0]["mode"] == "paper"
 
 
+async def test_an_opened_position_carries_the_justification_of_its_levels(market):
+    """Chaque position doit porter POURQUOI son stop et son objectif sont là.
+
+    La stratégie ne place pas le stop à une distance calculée : elle le pose sur ce qui rendrait le
+    scénario FAUX, et l'objectif devant le premier obstacle réel. Elle l'explique déjà en clair
+    (`stop_basis`, `target_basis`) — mais ces explications n'étaient pas conservées sur l'ordre. La
+    carte affichait donc un stop à 72.7987919 sans que rien ne dise pourquoi ce nombre-là, et un
+    niveau qu'on ne sait pas justifier ne peut être ni discuté, ni appris.
+    """
+    store = get_store()
+    user = _user(store, "justif@test.com")
+    await auto_entry_service.run_auto_entry(
+        store, candidates=[{"symbol": "EUR/USD", "asset_class": "forex", "tier": "armed"}],
+    )
+    ordre = execution_service.list_orders(store, user.tenant_id)[0]
+
+    assert ordre.get("stop_basis"), "le stop doit dire ce qui invaliderait le scénario"
+    assert ordre.get("target_basis"), "l'objectif doit dire ce qui le borne"
+    # Les distances en pips accompagnent les niveaux : c'est la lecture indépendante de la taille.
+    assert ordre.get("risk_pips") is not None and ordre.get("reward_pips") is not None
+    assert ordre.get("pips_label")
+    # Et la justification de l'ENTRÉE reste distincte de celle des NIVEAUX.
+    assert ordre.get("trigger") and ordre["trigger"] != ordre["stop_basis"]
+
+
 async def test_auto_entry_records_and_announces_the_opening(market):
     """Chaque entrée automatique laisse une trace consultable : on sait ce que le robot a fait."""
     store = get_store()

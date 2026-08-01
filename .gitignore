@@ -31,6 +31,12 @@ build/
 .docker-data/
 pgdata/
 
+# ---- Sauvegardes base de données ----
+# Dumps bruts : empreintes de mots de passe et données personnelles réelles des utilisateurs.
+# Ne doivent JAMAIS entrer dans l'historique Git.
+backups/
+*.dump
+
 # ---- IDE / OS ----
 .vscode/
 .idea/

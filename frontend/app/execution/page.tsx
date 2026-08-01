@@ -400,6 +400,46 @@ export default function ExecutionPage() {
             <p className="mt-0.5 text-[11px] leading-relaxed text-muted">
               Déclencheur 15 min — <span className="text-white/80">{o.trigger}</span>
             </p>
+
+            {/*
+              POURQUOI CES NIVEAUX-LÀ. La stratégie ne place pas le stop à une distance calculée :
+              elle le pose sur ce qui rendrait le scénario FAUX, et l'objectif devant le premier
+              obstacle réel. C'est toute la différence entre un niveau qu'on peut défendre et un
+              nombre sorti d'une formule — mais encore faut-il l'afficher.
+            */}
+            {(o.stop_basis || o.target_basis) && (
+              <div className="mt-1.5 space-y-1 border-t border-border/50 pt-1.5">
+                {o.stop_basis && (
+                  <p className="text-[11px] leading-relaxed text-muted">
+                    <span className="text-sell">Stop {o.stop_loss}</span>
+                    {o.risk_pips != null && (
+                      <span className="text-muted"> ({o.risk_pips} {o.pips_label ?? 'pips'})</span>
+                    )}
+                    {' '}— posé sur ce qui invaliderait le scénario :{' '}
+                    <span className="text-white/80">{o.stop_basis}</span>
+                  </p>
+                )}
+                {o.target_basis && (
+                  <p className="text-[11px] leading-relaxed text-muted">
+                    <span className="text-buy">Objectif {o.take_profit}</span>
+                    {o.reward_pips != null && (
+                      <span className="text-muted"> ({o.reward_pips} {o.pips_label ?? 'pips'})</span>
+                    )}
+                    {' '}— <span className="text-white/80">{o.target_basis}</span>
+                    {o.target_level != null && (
+                      <span className="text-muted">
+                        {' '}· niveau majeur le plus proche sur la route : {o.target_level}
+                      </span>
+                    )}
+                  </p>
+                )}
+                {o.horizon_label && (
+                  <p className="text-[10.5px] text-muted">
+                    Durée estimée pour atteindre l&apos;objectif : {o.horizon_label} de marché ouvert.
+                  </p>
+                )}
+              </div>
+            )}
             <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-[10.5px] text-muted">
               {o.session_window && (
                 <span>Fenêtre à l&apos;entrée : <span className="text-white/75">{o.session_window}</span></span>

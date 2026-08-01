@@ -920,6 +920,19 @@ async def execute_playbook_trades(
             "trigger_type": (p.get("trigger") or "").split(" — ", 1)[0].strip() or None,
             "session_window": (sess_ctx.get("kill_zones") or ["hors_fenetre"])[0],
             "atr_pct": daily_metrics.get("atr_pct"),
+            # D'OÙ VIENNENT LE STOP ET L'OBJECTIF — la justification des NIVEAUX, distincte de celle
+            # de l'ENTRÉE (`trigger`). La stratégie les calcule déjà et les explique en clair (« zone
+            # de demande 355.45 (force 0.71) — traversée, elle invalide l'entrée »), mais ces
+            # explications n'étaient pas conservées sur l'ordre : la position affichait un stop à
+            # 72.7987919 sans que rien ne dise POURQUOI ce nombre-là. Un niveau qu'on ne sait pas
+            # justifier ne peut pas être discuté, ni appris.
+            "stop_basis": p.get("stop_basis"),
+            "target_basis": p.get("target_basis"),
+            "target_level": p.get("target_level"),
+            "risk_pips": p.get("risk_pips"),
+            "reward_pips": p.get("reward_pips"),
+            "pips_label": p.get("pips_label"),
+            "horizon_label": p.get("horizon_label"),
             # Niveaux nécessaires à la gestion TP1 -> TP2 (cf. `manage_tp_progression`). Ils sont
             # figés à l'ouverture : le plan de sortie ne se redécide pas en cours de route.
             "take_profit_1": tp,

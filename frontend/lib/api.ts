@@ -512,6 +512,15 @@ export type PaperPosition = Order & {
   pair_verdict?: string | null;   // verdict mesuré de la paire au backtest hebdomadaire
   conviction_mult?: number | null;// multiplicateur de taille issu de ce verdict
   risk_pct?: number | null;       // % du capital réellement risqué sur ce trade
+  // D'OÙ VIENNENT LES NIVEAUX — la justification du stop et de l'objectif, distincte de celle de
+  // l'entrée (`trigger`). Sans elle, la carte affiche un stop à 72.7987919 sans dire pourquoi ce
+  // nombre-là : un niveau qu'on ne sait pas justifier ne peut être ni discuté, ni appris.
+  stop_basis?: string | null;     // ce qui rendrait le scénario faux (zone, structure, volatilité)
+  target_basis?: string | null;   // ce qui borne l'objectif (obstacle réel, ou R/R arithmétique)
+  target_level?: number | null;   // niveau majeur le plus proche sur la route
+  risk_pips?: number | null;      // distance entrée -> stop, en pips
+  reward_pips?: number | null;    // distance entrée -> objectif, en pips
+  horizon_label?: string | null;  // durée estimée pour atteindre l'objectif
 };
 
 export type PositionsSnapshot = {
