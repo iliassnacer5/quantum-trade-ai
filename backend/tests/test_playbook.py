@@ -1137,7 +1137,7 @@ def playbook_on(monkeypatch):
         "15m": _m15_with_pullback_entry(True, end_close=_END),
     }
 
-    async def _load(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _load(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return series.get(interval, series["4h"])
 
     monkeypatch.setattr(markets, "load_candles", _load)

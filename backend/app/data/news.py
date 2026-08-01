@@ -80,6 +80,32 @@ async def _newsapi(query: str, limit: int) -> list[NewsItem]:
     return [NewsItem(headline=a.get("title", "")) for a in articles[:limit] if a.get("title")]
 
 
+async def _massive(symbol: str, limit: int) -> list[NewsItem]:
+    """News Massive (ex-Polygon.io) — le seul de ses services exploitable sur ce plan.
+
+    Mesuré le 01/08/2026 : les agrégats HORAIRES rendent 0 barre et les indices répondent
+    « NOT_AUTHORIZED » ; seul le journalier et les actualités sont servis. Comme la stratégie entre
+    en 15 min, ses bougies n'apportent rien — ses news, si.
+
+    Le filtre par ticker n'existe que pour les actions ; pour la crypto, le forex et les métaux on
+    prend le flux général, qui reste pertinent pour le sentiment de marché.
+    """
+    s = get_settings()
+    if not s.massive_news_key:
+        return []
+    import httpx
+
+    params: dict[str, object] = {"limit": max(1, min(limit, 50)), "apiKey": s.massive_news_key,
+                                 "order": "desc", "sort": "published_utc"}
+    if markets.asset_class(symbol) == "stock":
+        params["ticker"] = symbol.split("/")[0].split("-")[0].upper()
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get("https://api.polygon.io/v2/reference/news", params=params)
+        resp.raise_for_status()
+        results = resp.json().get("results", []) or []
+    return [NewsItem(headline=a.get("title", "")) for a in results[:limit] if a.get("title")]
+
+
 async def _finnhub(symbol: str, limit: int) -> list[NewsItem]:
     """News Finnhub, adaptées à la classe d'actif.
 
@@ -126,8 +152,13 @@ async def fetch_news(symbol: str, limit: int = 20) -> list[NewsItem]:
     """
     query = _query_for(symbol)
     finnhub = ("Finnhub", _finnhub(symbol, limit))
+    # Massive (ex-Polygon) : ajouté le 01/08/2026. Ses BOUGIES sont inutilisables ici (0 barre en
+    # horaire, indices non autorisés) mais ses news fonctionnent — c'est donc là, et seulement là,
+    # qu'il est branché. Un fournisseur de plus, c'est une page de moins qui reste vide.
+    massive = ("Massive", _massive(symbol, limit))
     keyword = [("NewsAPI", _newsapi(query, limit)), ("newsdata.io", _newsdata(query, limit))]
-    providers = [finnhub, *keyword] if markets.asset_class(symbol) == "stock" else [*keyword, finnhub]
+    providers = ([finnhub, massive, *keyword] if markets.asset_class(symbol) == "stock"
+                 else [*keyword, finnhub, massive])
     for provider, coro in providers:
         try:
             items = await coro

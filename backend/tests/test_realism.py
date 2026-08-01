@@ -101,6 +101,34 @@ def test_the_project_knows_only_the_desk_strategy():
     assert client.get("/api/strategies", headers=h).status_code == 404
 
 
+def test_the_strategy_is_described_in_exactly_one_place():
+    """La méthode n'est décrite QU'UNE fois — toute copie finit par mentir sur la règle.
+
+    Cette phrase existait en trois exemplaires (instantané des trades du jour, prompt LLM de l'agent
+    playbook, narration). Le prompt du LLM a dérivé et décrivait encore la méthode d'avant
+    (« stop sur la structure 15 min, objectif borné par le prochain niveau 1 h ») : l'agent
+    commentait donc les setups d'après une stratégie qui n'est plus appliquée. On vérifie ici que
+    les consommateurs pointent vers la constante, et que la constante dit la règle en vigueur.
+    """
+    import pathlib
+
+    from app.domain import playbook as pb
+
+    summary = pb.STRATEGY_SUMMARY
+    # La règle EN VIGUEUR : le stop vient du niveau qui invalide le scénario, pas d'une unité de
+    # temps fixe ; et la bande de R/R est celle réellement appliquée par le domaine.
+    assert "niveau qui invalide le scénario" in summary
+    assert f"1:{pb.MIN_RR:g} à 1:{pb.MAX_RR:g}" in summary
+    assert "structure 15 min" not in summary, "description périmée du stop"
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "app"
+    for module in ("services/playbook_service.py", "agents/playbook.py"):
+        source = (root / module).read_text(encoding="utf-8")
+        assert "STRATEGY_SUMMARY" in source, (
+            f"{module} doit reprendre la description canonique, pas en garder une copie"
+        )
+
+
 def test_auto_trade_toggle_endpoint():
     """Le forward test automatique reste pilotable — il suit désormais la stratégie du desk."""
     client = TestClient(app)

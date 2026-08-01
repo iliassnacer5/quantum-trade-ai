@@ -843,9 +843,22 @@ async def run_pass(
 
     async def _one(symbol: str) -> dict:
         async with sem:
-            return await backtest_symbol(symbol, entry_tf=entry_tf, step=step, overrides=overrides,
-                                         ladder=ladder, max_years=max_years)
+            try:
+                return await backtest_symbol(symbol, entry_tf=entry_tf, step=step,
+                                             overrides=overrides, ladder=ladder,
+                                             max_years=max_years)
+            finally:
+                # AVANCEMENT RÉEL, symbole par symbole.
+                #
+                # `_set_phase` n'était appelé QU'UNE FOIS par passe, avec `done=0`, et jamais
+                # réactualisé : la page affichait « 0/88 » du début à la fin. Sur une passe qui dure
+                # une dizaine de minutes, un compteur figé à zéro est indiscernable d'un plantage —
+                # au point que je l'ai moi-même diagnostiqué à tort comme un blocage.
+                # Le compteur est incrémenté dans un `finally` : un symbole en échec fait avancer la
+                # progression comme un autre, sinon la barre se bloquerait au premier fournisseur KO.
+                _state["done"] = _state.get("done", 0) + 1
 
+    _state["done"] = 0
     results = await asyncio.gather(*(_one(sym) for sym in universe), return_exceptions=True)
 
     trades: list[dict] = []
@@ -1133,13 +1146,18 @@ def write_conclusion(payload: dict) -> dict:
                 "long": {}, "frequency": scope.get("frequency") or {},
                 "volume_levers": volume_levers(scope)}
 
-    verdict = ("exploitable" if o["expectancy_r"] >= 0.25 and (o["profit_factor"] or 0) >= 1.5
+    # `profit_factor is None` signifie « aucun perdant », donc INFINI — la même convention que
+    # `_verdict`. L'écrire `(o["profit_factor"] or 0)` rétrogradait le meilleur résultat possible
+    # (aucune perte) en « marginal », et l'affichait « profit factor de None ».
+    pf_value = float("inf") if o["profit_factor"] is None else o["profit_factor"]
+    pf_txt = "∞ (aucun perdant)" if o["profit_factor"] is None else f"{o['profit_factor']}"
+    verdict = ("exploitable" if o["expectancy_r"] >= 0.25 and pf_value >= 1.5
                else "marginal" if o["expectancy_r"] > 0 else "non exploitable")
     headline = (
         f"Sur {scope['years_covered']} ans et {scope['pairs_tested']} paires, la stratégie a produit "
         f"{o['trades']} trades : {o['wins']} gagnants et {o['losses']} perdants, soit "
         f"{o['win_rate']} % de réussite, pour une espérance de {o['expectancy_r']:+.2f} R par trade "
-        f"et un profit factor de {o['profit_factor']}. Verdict global : {verdict}."
+        f"et un profit factor de {pf_txt}. Verdict global : {verdict}."
     )
 
     lines.append(

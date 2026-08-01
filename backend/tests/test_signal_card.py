@@ -30,6 +30,37 @@ def test_prediction_detail_endpoint():
     assert client.get(f"/api/signals/{sig['id']}", headers=h2).status_code == 404
 
 
+def test_every_prediction_can_be_dated():
+    """Une prédiction porte TOUJOURS sa date de calcul, sur les trois chemins qui la servent.
+
+    Les cartes sont persistées puis réaffichées telles quelles, narration comprise — et celle-ci
+    parle au présent (« Fenêtre actuelle : session asiatique (23:02 UTC) »). Sans `created_at`,
+    l'interface ne peut pas distinguer une analyse de l'instant d'une analyse de la veille, et la
+    session décrite n'est alors plus celle du marché.
+    """
+    from datetime import datetime
+
+    client = TestClient(app)
+    r = client.post("/api/auth/register",
+                    json={"email": f"u{uuid.uuid4().hex[:8]}@t.co", "password": "password123"})
+    h = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+    generated = client.post("/api/signals/generate",
+                            json={"asset": "BTC/USDT", "timeframe": "1h", "notify": False},
+                            headers=h).json()
+    detail = client.get(f"/api/signals/{generated['id']}", headers=h).json()
+    listed = next(s for s in client.get("/api/signals", headers=h).json()
+                  if s.get("id") == generated["id"])
+
+    for source, payload in (("généré", generated), ("détail", detail), ("liste", listed)):
+        stamp = payload.get("created_at")
+        assert stamp, f"la prédiction servie par « {source} » doit porter sa date de calcul"
+        # Horodatage lisible ET porteur d'un fuseau : sans lui, l'interface daterait l'analyse dans
+        # le fuseau du navigateur et afficherait un décalage silencieux.
+        parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        assert parsed.tzinfo is not None, f"« {source} » : date sans fuseau horaire"
+
+
 def test_blocked_trade_is_memorized():
     """Un signal gaté vers HOLD mémorise la direction/niveaux bloqués (base des « trades évités »)."""
     from app.services.signal_service import finalize_decision
@@ -41,6 +72,30 @@ def test_blocked_trade_is_memorized():
     assert card.direction == Direction.HOLD
     assert card.metrics["blocked_direction"] == "BUY"
     assert card.metrics["blocked_sl"] == 98 and card.metrics["blocked_tp"] == 104
+    assert card.metrics["blocked_entry"] == 100
+
+
+def test_a_hold_card_carries_no_levels_at_all():
+    """PAS DE TRADE = PAS DE NIVEAUX. Ni le prix courant recopié, ni un R/R de 0.
+
+    Les niveaux étaient aplatis sur le prix d'entrée quand un signal était bloqué : la carte
+    affichait « Entrée 100 · Stop 100 · TP 100 · R/R 1:0 », trois niveaux d'apparence exploitable
+    qui ne veulent rien dire. Ils vivent désormais dans `blocked_*` (pour mesurer ce que les filtres
+    ont évité) et valent `None` sur la carte.
+    """
+    from app.services.signal_service import finalize_decision
+
+    card = SignalCard(asset="BTC/USDT", direction=Direction.BUY, entry=100, stop_loss=98,
+                      take_profit_1=104, risk_reward=2.0, confidence=80, timeframe=Timeframe.H1,
+                      rationale="x", consensus_pct=80, metrics={"adx": 30})
+    finalize_decision(card, {"aligned": 0, "total": 3})
+
+    assert card.direction == Direction.HOLD
+    assert card.entry is None, "un HOLD ne propose pas d'entrée"
+    assert card.stop_loss is None and card.take_profit_1 is None
+    assert card.risk_reward is None, "un R/R de 0 se lit comme une mesure ; il n'y en a pas"
+    # ...mais ce qui a été bloqué reste mesurable après coup.
+    assert card.metrics["blocked_entry"] == 100 and card.metrics["blocked_sl"] == 98
 
 
 def test_track_record_endpoint(monkeypatch):

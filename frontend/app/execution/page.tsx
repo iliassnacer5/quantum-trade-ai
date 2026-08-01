@@ -46,6 +46,10 @@ export default function ExecutionPage() {
   // d'erreur, ce qui ressemblait à un bouton cassé. Un état de confirmation en JSX fonctionne
   // partout où React fonctionne.
   const [confirmCloseId, setConfirmCloseId] = useState<string | null>(null);
+  // Échec de clôture, rattaché à SA position. L'erreur partait dans le bandeau global, en haut de
+  // page : l'utilisateur qui clique « Clôturer » est scrollé sur sa position et ne la voyait jamais
+  // — le bouton semblait donc ne rien faire.
+  const [closeError, setCloseError] = useState<{ id: string; message: string } | null>(null);
   const [dataSrc, setDataSrc] = useState<{ source: string; real: boolean; label: string } | null>(null);
 
   // Modification manuelle du stop / de l'objectif d'une position ouverte : une seule ligne
@@ -164,11 +168,13 @@ export default function ExecutionPage() {
     setConfirmCloseId(null);
     setChecking(id);
     setError(null);
+    setCloseError(null);
     try {
       await api.closeOrder(id);
       await refresh();
     } catch (e: any) {
-      setError(e.message);
+      // Rattachée à la position : c'est là que l'utilisateur regarde quand il clique.
+      setCloseError({ id, message: e?.message ?? 'Clôture impossible.' });
     } finally {
       setChecking(null);
     }
@@ -299,6 +305,13 @@ export default function ExecutionPage() {
           )}
         </div>
 
+        {/* Pourquoi la clôture a échoué, À CÔTÉ de la position concernée. */}
+        {closeError?.id === o.id && (
+          <p className="mt-2 rounded border border-sell/40 bg-sell/10 px-3 py-2 text-xs text-sell">
+            {closeError.message}
+          </p>
+        )}
+
         {/* Ce qui a été choisi au lancement du trade — ou le formulaire de modification. */}
         {editingId === o.id ? (
           <div className="mt-2 space-y-2 rounded border border-border bg-background/60 p-2">
@@ -352,6 +365,39 @@ export default function ExecutionPage() {
           {!closed && o.current_price != null && <span>Prix actuel : <span className="text-white">{o.current_price}</span></span>}
           {!closed && o.r_multiple != null && <span>En multiples de risque : <span className="text-white">{o.r_multiple} R</span></span>}
         </div>
+        )}
+
+        {/*
+          POURQUOI CE TRADE A ÉTÉ PRIS. Ces informations sont enregistrées à l'ouverture et ne sont
+          jamais recalculées : c'est le raisonnement du moment, pas une reconstruction après coup.
+          Sans elles, une position ouverte automatiquement n'a aucune justification consultable —
+          on voit le résultat, jamais la décision qui l'a produit.
+        */}
+        {o.trigger && (
+          <div className="mt-2 rounded border border-border/60 bg-background/40 px-3 py-2">
+            <p className="text-[11px] font-medium text-white/85">Pourquoi ce trade a été ouvert</p>
+            <p className="mt-0.5 text-[11px] leading-relaxed text-muted">
+              Déclencheur 15 min — <span className="text-white/80">{o.trigger}</span>
+            </p>
+            <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-[10.5px] text-muted">
+              {o.session_window && (
+                <span>Fenêtre à l&apos;entrée : <span className="text-white/75">{o.session_window}</span></span>
+              )}
+              {o.atr_pct != null && (
+                <span>Volatilité journalière : <span className="text-white/75">{o.atr_pct} %</span></span>
+              )}
+              {o.risk_pct != null && (
+                <span>Capital risqué : <span className="text-white/75">{o.risk_pct} %</span></span>
+              )}
+              {o.pair_verdict && (
+                <span>Verdict de la paire : <span className="text-white/75">{o.pair_verdict}</span>
+                  {o.conviction_mult != null && o.conviction_mult !== 1 && (
+                    <span className="text-muted"> (taille ×{o.conviction_mult})</span>
+                  )}
+                </span>
+              )}
+            </div>
+          </div>
         )}
 
         {/* Progression vers l'objectif, sans aucun clic. */}

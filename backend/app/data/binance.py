@@ -34,10 +34,14 @@ async def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> l
     params = {"symbol": to_binance_symbol(symbol), "interval": interval, "limit": limit}
     # Délai de CONNEXION court (cf. `markets._timeout`) : un fournisseur injoignable ne doit pas
     # immobiliser l'appelant 10 s pour rien.
-    async with httpx.AsyncClient(timeout=_timeout(limit)) as client:
-        resp = await client.get(REST_URL, params=params)
-        resp.raise_for_status()
-        rows = resp.json()
+    # Client partagé : 150 chargements crypto par cycle passent ici. Ouvrir une connexion neuve à
+    # chaque fois produisait les `ConnectError` intermittents observés (cf. `data/http.py`).
+    from app.data.http import client as shared_client
+
+    client = await shared_client("binance", timeout=_timeout(limit))
+    resp = await client.get(REST_URL, params=params)
+    resp.raise_for_status()
+    rows = resp.json()
     # Format Binance : [open_time, open, high, low, close, volume, ...]
     return [
         Candle(float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in rows

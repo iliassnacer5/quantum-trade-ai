@@ -45,7 +45,7 @@ def _order(store, tenant_id, **over) -> dict:
 
 
 def _patch_price(monkeypatch, price: float) -> None:
-    async def fake_price(symbol):
+    async def fake_price(symbol, *, fresh: bool = False):  # `fresh` : cf. _reference_price
         return price
 
     monkeypatch.setattr(execution_service, "_reference_price", fake_price)
@@ -60,7 +60,7 @@ def _patch_momentum(monkeypatch, ok: bool, reasons=None) -> None:
 
     monkeypatch.setattr(exits, "momentum_still_supports", fake)
 
-    async def fake_load(symbol, interval, limit):
+    async def fake_load(symbol, interval, limit, **kw):
         return [_c(1.10, 1.101, 1.099, 1.1005) for _ in range(60)], "real"
 
     from app.services import playbook_service

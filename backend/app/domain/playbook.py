@@ -80,6 +80,19 @@ MAX_RR = 3.0                 # risque/rendement maximum
 MIN_TARGET_PIPS = 50.0
 MAX_STOP_PIPS = 150.0        # garde-fou absolu en pips (forex/métaux uniquement)
 
+# DESCRIPTION CANONIQUE DE LA MÉTHODE — une seule source, et c'est délibéré.
+#
+# Cette phrase était recopiée à trois endroits (l'instantané des trades du jour, le prompt du LLM
+# de l'agent playbook, et la narration). Les copies ont dérivé : le prompt décrivait encore
+# « stop sur la structure 15 min, objectif borné par le prochain niveau 1 h », c'est-à-dire la
+# méthode d'AVANT — le LLM commentait donc les setups d'après une stratégie qui n'est plus celle
+# qu'on applique. Toute copie d'une règle finit par mentir sur la règle : il n'y en a plus qu'une.
+STRATEGY_SUMMARY = (
+    "tendance multi-indicateurs (D1/4h/1h/15min, figée) → entrée par confluence pondérée "
+    "(≥ 3 confirmations) → stop sur le niveau qui invalide le scénario, objectifs devant le "
+    f"premier obstacle réel · R/R 1:{MIN_RR:g} à 1:{MAX_RR:g}"
+)
+
 # --- Échelle du trade, exprimée en ATR JOURNALIER (valable sur tous les marchés) ---------------
 # L'ATR NE BORNE PLUS L'OBJECTIF : `MIN_TARGET_ATR_DAILY` vaut zéro depuis le 28/07/2026, à la
 # demande explicite de l'utilisateur (« ne prends pas en considération l'ATR dans le profit »). Le
@@ -1129,7 +1142,11 @@ class PlaybookSetup:
     reward_pips: float = 0.0
     risk_reward: float = 0.0
     trigger: str | None = None
-    stop_basis: str = "structure 15 min"   # d'où vient le stop (toujours le 15 min)
+    # D'où vient le stop. TOUJOURS écrasé par `exits.plan_stop` (le stop est posé sur le niveau qui
+    # invalide le scénario, pas sur une unité de temps fixe) : le défaut ne s'affiche jamais. Il
+    # annonçait « structure 15 min », la règle d'avant — un défaut qui décrit une méthode abandonnée
+    # finit par être lu comme la méthode en vigueur.
+    stop_basis: str = ""
     target_basis: str = ""                 # d'où vient l'objectif (borné ou non par un niveau)
     target_level: float | None = None      # niveau journalier qui borne l'objectif
     # Niveau où le stop sera automatiquement remonté dès qu'il est atteint (+2R) : à partir de là

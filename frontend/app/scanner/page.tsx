@@ -146,6 +146,11 @@ export default function ScannerPage() {
         setError(`${sym} : signal consolidé HOLD — pas de trade (les agents divergent).`);
         return;
       }
+      // Sans niveaux, aucun ordre n'est envoyé : on ne devine pas un stop.
+      if (sig.entry == null || sig.stop_loss == null) {
+        setError(`${sym} : aucun niveau proposé — pas d'ordre possible.`);
+        return;
+      }
       const conns = await api.brokers();
       const paper = conns.find((c) => c.mode === 'paper') ?? (await api.connectBroker('paper', 'paper'));
       const riskPerUnit = Math.abs(sig.entry - sig.stop_loss);

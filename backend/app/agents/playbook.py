@@ -107,12 +107,17 @@ async def run(setup: PlaybookSetup, *, use_llm: bool = True) -> AgentOutput:
 
         if llm.available():
             try:
+                # La méthode est décrite par `STRATEGY_SUMMARY`, source unique : ce prompt en
+                # gardait une copie périmée (« stop sur la structure 15 min, objectif borné par le
+                # prochain niveau 1 h ») et faisait donc commenter les setups au LLM d'après une
+                # stratégie qui n'est plus appliquée.
+                from app.domain.playbook import STRATEGY_SUMMARY
+
                 prompt = (
                     expertise.prompt_prefix(NAME)
                     + "Tu es trader professionnel sur un desk. En UNE phrase complète en français, "
-                    "sans conseil en investissement, commente ce setup issu d'une stratégie "
-                    "multi-unités de temps (mensuel/journalier → 4 h → entrée 15 min, stop sur la "
-                    "structure 15 min, objectif borné par le prochain niveau 1 h) :\n"
+                    "sans conseil en investissement, commente ce setup issu de la stratégie "
+                    f"suivante ({STRATEGY_SUMMARY}) :\n"
                     f"{setup.summary()}"
                 )
                 rationale = enrich(rationale, await llm.complete(prompt, role="reasoning", max_tokens=200))

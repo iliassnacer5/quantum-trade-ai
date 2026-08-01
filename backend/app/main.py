@@ -196,6 +196,11 @@ async def lifespan(_app: FastAPI):
         from app.realtime import market_stream
 
         await market_stream.stop()
+    # Connexions HTTP partagées vers les fournisseurs de marché : elles vivent le temps du
+    # processus (c'est tout leur intérêt), on les libère explicitement à l'arrêt.
+    from app.data.http import close_all as close_http
+
+    await close_http()
     await bus.shutdown_bus()
 
 

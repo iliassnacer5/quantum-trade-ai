@@ -66,13 +66,30 @@ async def backtest_metrics(symbol: str, interval: str, limit: int = 500) -> dict
                              start_time=candles[0].timestamp, end_time=candles[-1].timestamp, initial_capital=10000)
         m = (await run_backtest(cfg, candles, tenant_id="bt")).metrics
         return {
-            "trades": m.total_trades, "win_rate": round(m.win_rate * 100, 1),
+            "trades": m.total_trades,
+            # `None` (pas de trade / pas de perte) est propagé tel quel : les consommateurs
+            # distinguent « indisponible » de « zéro », ce qui est tout l'enjeu ici.
+            "win_rate": round(m.win_rate * 100, 1) if m.win_rate is not None else None,
             "profit_factor": m.profit_factor, "total_pnl_pct": m.total_pnl_pct,
             "max_drawdown_pct": m.max_drawdown_pct, "sharpe": m.sharpe_ratio,
         }
     except Exception as exc:  # noqa: BLE001
         logger.warning("Backtest %s échoué (%s)", symbol, exc)
         return None
+
+
+def pf_at_least(bt: dict | None, threshold: float) -> bool:
+    """Le profit factor du backtest atteint-il `threshold` ?
+
+    `profit_factor is None` avec au moins un trade signifie « aucune perte », donc un profit factor
+    INFINI : il franchit tous les seuils (c'est ce que faisait l'ancien `float("inf") > 1.3`). Sans
+    trade, il n'y a rien à comparer et la réponse est non — un seuil ne peut pas être « atteint »
+    par une mesure qui n'existe pas.
+    """
+    if not bt or not bt.get("trades"):
+        return False
+    pf = bt.get("profit_factor")
+    return True if pf is None else pf > threshold
 
 
 def learning_multipliers(store: AppStore | None, tenant_id: str | None, market: str | None) -> dict[str, float]:
@@ -147,7 +164,9 @@ async def daily_picks(
         """Backtest d'UN candidat + mise en forme. Sous sémaphore : le coût réseau reste borné."""
         async with sem:
             bt = await backtest_metrics(cand["symbol"], timeframe)
-        reliable = bool(bt and bt["trades"] >= 5 and bt["win_rate"] > 55 and bt["profit_factor"] > 1.3)
+        reliable = bool(
+            bt and bt["trades"] >= 5 and (bt["win_rate"] or 0) > 55 and pf_at_least(bt, 1.3)
+        )
         return {
             "symbol": cand["symbol"], "asset_class": cls, "direction": cand["direction"],
             "price": cand["price"], "rsi": cand["rsi"],
@@ -205,8 +224,13 @@ async def verify_signal(
 
     checks: list[dict] = []
     if bt and bt["trades"] >= 5:
-        checks.append({"label": "Backtest : taux de réussite > 55 %", "pass": bt["win_rate"] > 55, "value": f"{bt['win_rate']}%"})
-        checks.append({"label": "Backtest : profit factor > 1,3", "pass": bt["profit_factor"] > 1.3, "value": bt["profit_factor"]})
+        checks.append({"label": "Backtest : taux de réussite > 55 %",
+                       "pass": (bt["win_rate"] or 0) > 55, "value": f"{bt['win_rate']}%"})
+        # « ∞ » et non « 0 » quand le backtest n'a essuyé aucune perte : afficher zéro inverserait
+        # complètement la lecture du meilleur résultat possible.
+        checks.append({"label": "Backtest : profit factor > 1,3",
+                       "pass": pf_at_least(bt, 1.3),
+                       "value": bt["profit_factor"] if bt["profit_factor"] is not None else "∞"})
     checks.append({"label": "Confiance ≥ 70 %", "pass": confidence >= 70, "value": f"{confidence}%"})
     checks.append({"label": "Consensus ≥ 70 %", "pass": consensus_pct >= 70, "value": f"{consensus_pct}%"})
     if mtf_total:
@@ -270,9 +294,13 @@ def finalize_decision(card, mtf_res: dict, blackout: tuple[bool, str] | None = N
             card.metrics["blocked_sl"] = card.stop_loss
             card.metrics["blocked_tp"] = card.take_profit_1
         card.direction = Direction.HOLD
-        card.stop_loss = card.take_profit_1 = card.entry
+        # Les niveaux d'origine viennent d'être archivés dans `blocked_*` ci-dessus : c'est là
+        # qu'ils doivent vivre, pas sur une carte qui annonce « pas de trade ». On les EFFACE au
+        # lieu de les aplatir sur le prix d'entrée — sinon la carte affiche
+        # « Entrée = Stop = TP » avec un R/R de 0, soit une absence de plan déguisée en plan.
+        card.entry = card.stop_loss = card.take_profit_1 = None
         card.take_profit_2 = card.take_profit_3 = None
-        card.risk_reward = 0.0
+        card.risk_reward = None
         card.position_size = card.position_value = card.risk_amount = None
         card.confidence = min(card.confidence, 45)
         card.rationale = reason + "\n" + card.rationale
@@ -412,11 +440,29 @@ def _apply_playbook_verdicts(rows: list[dict]) -> None:
 
     verdicts = live_snapshot.verdicts()
     if not verdicts:
+        # ABSENCE DE VERDICT N'EST PAS UNE AUTORISATION.
+        #
+        # Cette fonction sortait ici en laissant chaque ligne avec sa direction TECHNIQUE brute et
+        # son ★ : tant que la boucle de fond n'était pas passée (démarrage, boucle tombée), le
+        # scanner affirmait donc « BUY » sur des paires que la stratégie n'a jamais validées —
+        # exactement ce que cette 3e passe existe pour empêcher. Le veto du playbook ne peut pas
+        # être suspendu simplement parce que son calcul n'est pas encore disponible.
+        #
+        # On neutralise donc l'affirmation, sans rien inventer : la page dit « en attente », ce qui
+        # est la vérité, et reprend son verdict au prochain instantané.
+        for row in rows:
+            row["playbook_tier"] = "en attente"
+            row["direction"] = "HOLD"
+            row["high_conviction"] = False
         return
     for row in rows:
         v = verdicts.get(row["symbol"])
         if not v:
             row["playbook_tier"] = "non balayé"
+            # Balayé par la 1re passe mais absent de l'instantané : la stratégie ne s'est pas
+            # prononcée sur ce symbole, le scanner ne se prononce donc pas non plus.
+            row["direction"] = "HOLD"
+            row["high_conviction"] = False
             continue
         row["playbook_tier"] = v["tier"]
         row["playbook_direction"] = v["direction"]

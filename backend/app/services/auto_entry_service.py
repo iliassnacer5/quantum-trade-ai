@@ -71,6 +71,30 @@ def _paper_tenants(store) -> list[str]:  # noqa: ANN001
     ]
 
 
+def _open_market_only(ready: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Sépare les setups dont le MARCHÉ EST OUVERT de ceux dont la place est fermée.
+
+    Réglé par `playbook_trade_only_when_open`. Quand il est actif, un symbole dont le marché est
+    fermé n'est jamais ouvert — même si son déclencheur 15 min « se forme », puisqu'il se forme en
+    réalité sur la dernière bougie d'avant la fermeture. La crypto est exemptée : elle cote en
+    continu (cf. `sessions.can_trade_symbol`).
+
+    Aucun refus n'est silencieux : chaque symbole écarté rend son motif, journalisé et affiché.
+    """
+    if not get_settings().playbook_trade_only_when_open:
+        return ready, []
+    ouverts, fermes = [], []
+    for pick in ready:
+        allowed, why = sessions_mod.can_trade_symbol(pick.get("symbol", ""))
+        if allowed:
+            ouverts.append(pick)
+        else:
+            fermes.append({"symbol": pick.get("symbol"), "reason": f"marché fermé — {why}"})
+    if fermes:
+        logger.info("Auto-entrée : %d setup(s) écarté(s), marché fermé", len(fermes))
+    return ouverts, fermes
+
+
 async def _fresh_ready(candidates: list[dict]) -> tuple[list[dict], list[dict]]:
     """Recalcule la stratégie pour chaque candidat et sépare « déclencheur actif » du reste.
 
@@ -99,35 +123,83 @@ async def _fresh_ready(candidates: list[dict]) -> tuple[list[dict], list[dict]]:
     return ready, still_armed
 
 
+def _finish(store, result: dict) -> dict:  # noqa: ANN001
+    """Horodate le passage et le PERSISTE — quelle qu'en soit l'issue.
+
+    « Au dernier passage » doit désigner le dernier passage, point. L'enregistrement n'était écrit
+    qu'au bout de la fonction, donc uniquement quand des setups étaient prêts : dès qu'un passage
+    ne trouvait rien (le cas le plus fréquent), le rapport PRÉCÉDENT restait affiché indéfiniment.
+    Concrètement, un refus « déjà 2 positions ouvertes exposées à USDT » survivait à la remise à
+    zéro du portefeuille et s'affichait encore alors que le compte n'avait plus aucune position —
+    la page contredisait Paper Trading, sans que rien ne soit réellement en cause.
+
+    Un rapport horodaté et systématiquement réécrit ne peut plus mentir sur l'état du moment.
+    """
+    result.setdefault("at", datetime.now(UTC).isoformat())
+    try:
+        store.records.put(LAST_RUN, "latest", result)
+    except Exception as exc:  # noqa: BLE001 — la persistance ne doit jamais casser la veille
+        logger.warning("Auto-entrée : dernier passage non persisté (%s)", exc)
+    return result
+
+
 async def run_auto_entry(store, *, candidates: list[dict] | None = None) -> dict:  # noqa: ANN001
     """Un passage de veille : ouvre en démo tous les setups dont le déclencheur 15 min vient d'apparaître."""
     from app.services import live_snapshot
 
     if not enabled():
-        return {"enabled": False, "opened": [], "armed": 0, "note": "auto-entrée désactivée"}
+        return _finish(store, {"enabled": False, "opened": [], "armed": 0,
+                               "skipped": [], "note": "auto-entrée désactivée"})
 
     # Heures de marché : on continue d'ANALYSER en permanence, mais on n'ouvre rien quand Londres
     # et New York sont fermées (ou le week-end). C'est le garde-fou le plus simple contre les
     # entrées dans un carnet vide.
-    if get_settings().playbook_trade_only_when_open:
-        tradable, why = sessions_mod.can_trade()
-        if not tradable:
-            return {"enabled": True, "opened": [], "armed": len(candidates or []),
-                    "market_open": False, "note": f"aucune ouverture — {why}"}
+    # Le filtrage par symbole a lieu PLUS BAS, juste avant l'exécution : la crypto cote en continu
+    # et reste tradable quand les places boursières sont fermées, alors qu'ouvrir une action ou un
+    # indice le week-end reviendrait à trader la bougie de vendredi. Cf. `_open_market_only`.
 
-    pool = candidates if candidates is not None else live_snapshot.armed_and_ready()
+    if candidates is not None:
+        pool = candidates
+    else:
+        # LE VIVIER NE DOIT JAMAIS ÊTRE DÉCIDÉ PAR UN CACHE PÉRIMÉ.
+        #
+        # `armed_and_ready()` lit l'instantané sans contrôle de fraîcheur. Quand la boucle de fond
+        # est tombée, n'est pas encore passée, ou vient d'être remise à zéro, il rend une liste vide
+        # — et la veille concluait « aucun setup armé » à chaque passage, indéfiniment, sans rien
+        # signaler. Le robot cessait donc de trader alors que le marché offrait des setups : c'est
+        # le symptôme « les agents ouvrent beaucoup moins de positions ».
+        #
+        # On recalcule donc l'instantané quand il est absent ou périmé, au lieu de conclure. Ce
+        # recalcul est borné par le verrou de `live_snapshot.refresh` (jamais deux en parallèle) et
+        # ne change AUCUNE décision : chaque candidat est de toute façon revalidé sur données
+        # fraîches par `_fresh_ready`, puis par le verdict de paire et les garde-fous de
+        # portefeuille. Élargir le vivier ne peut que rattraper un trade manqué, jamais en inventer.
+        if not live_snapshot.pool_is_usable():
+            logger.info("Auto-entrée : vivier absent ou périmé — recalcul de l'instantané")
+            try:
+                await live_snapshot.refresh(
+                    store, skip_if_newer_than=get_settings().playbook_auto_entry_interval)
+            except Exception as exc:  # noqa: BLE001 — un recalcul KO ne doit pas casser la veille
+                logger.warning("Auto-entrée : recalcul de l'instantané échoué (%s)", exc)
+        pool = live_snapshot.armed_and_ready()
     if not pool:
-        return {"enabled": True, "opened": [], "armed": 0,
-                "note": "aucun setup armé à surveiller pour l'instant"}
+        return _finish(store, {
+            "enabled": True, "opened": [], "armed": 0, "skipped": [],
+            "checked": 0, "snapshot_fresh": live_snapshot.pool_is_usable(),
+            "note": ("aucun setup armé à surveiller pour l'instant — l'instantané est à jour "
+                     "et ne contient aucun contexte validé"
+                     if live_snapshot.pool_is_usable() else
+                     "vivier indisponible : l'instantané n'a pas pu être recalculé (données de "
+                     "marché injoignables ?) — aucune entrée n'est tentée à l'aveugle")})
 
     ready, still_armed = await _fresh_ready(pool)
     if not ready:
-        return {
+        return _finish(store, {
             "enabled": True, "opened": [], "armed": len(still_armed),
-            "checked": len(pool),
+            "checked": len(pool), "skipped": [],
             "note": (f"{len(still_armed)} setup(s) toujours armé(s) — aucun déclencheur 15 min "
                      "formé sur ce passage"),
-        }
+        })
 
     # GATING PAR VERDICT (plan, tâche 2.2) : quand `playbook_pair_gating` est actif, l'auto-entrée
     # ne trade QUE les paires notées 🟢 par le backtest hebdomadaire.
@@ -139,16 +211,36 @@ async def run_auto_entry(store, *, candidates: list[dict] | None = None) -> dict
     # position — il ne décide plus s'il y a trade.
     from app.services import verdict_service
 
+    # MARCHÉ FERMÉ = PAS D'OUVERTURE, symbole par symbole.
+    #
+    # Quand une place est fermée, les fournisseurs continuent de servir la DERNIÈRE bougie connue
+    # (celle de vendredi soir un samedi). Elle est réelle, mais plus d'actualité : le moteur
+    # poserait entrée, stop et objectif sur un marché à l'arrêt, et l'anti-doublon de 45 min
+    # laisserait le même setup figé se reprendre indéfiniment. Le filtre est PAR SYMBOLE parce que
+    # la crypto, elle, cote réellement 24 h/24 : lui appliquer les horaires de Londres reviendrait
+    # à refuser un marché ouvert avec des données fraîches.
+    ready, closed_refused = _open_market_only(ready)
+
     ready, gate_refused = verdict_service.filter_auto_ready(store, ready)
     if not ready:
-        return {
+        # `market_closed` est un champ à part : ces refus ne dépendent pas du COMPTE (contrairement
+        # aux garde-fous de portefeuille) mais de l'état du marché. Les noyer dans `skipped`, filtré
+        # par tenant, les rendrait invisibles — et « pourquoi rien ne s'est ouvert ? » resterait
+        # sans réponse un week-end.
+        return _finish(store, {
             "enabled": True, "opened": [], "armed": len(still_armed),
-            "checked": len(pool), "gate_refused": gate_refused,
+            "checked": len(pool), "gate_refused": gate_refused, "skipped": [],
+            "market_closed": closed_refused,
             "note": (
+                f"{len(closed_refused)} setup(s) écarté(s) — marché fermé. "
+                if closed_refused else ""
+            ) + (
                 f"{len(gate_refused)} déclencheur(s) formé(s) mais refusé(s) par le verdict de "
                 "paire (seules les paires 🟢 sont auto-tradées) — refus journalisés."
+                if gate_refused else
+                "aucun déclencheur exploitable sur ce passage."
             ),
-        }
+        })
 
     cooldown = get_settings().playbook_auto_entry_cooldown_min
     opened_all: list[dict] = []
@@ -183,7 +275,11 @@ async def run_auto_entry(store, *, candidates: list[dict] | None = None) -> dict
     # trouve rien à ouvrir laissait auparavant AUCUNE trace, ce qui rendait « pourquoi rien ne
     # s'est ouvert » impossible à répondre après coup.
     logger.info("Auto-entrée : %s", note)
-    result = {
+    # Persisté (par `_finish`, comme TOUTES les autres issues) pour que la page « Trades du jour »
+    # puisse expliquer, PAR UTILISATEUR, pourquoi un setup marqué « exécutable » à l'écran ne s'est
+    # pas ouvert (garde-fou de portefeuille, de corrélation, anti-doublon…) — sans ça, le refus
+    # reste invisible jusqu'à ce qu'on aille chercher dans les logs serveur.
+    return _finish(store, {
         "enabled": True,
         "checked": len(pool),
         "triggered": [p["symbol"] for p in ready],
@@ -191,19 +287,32 @@ async def run_auto_entry(store, *, candidates: list[dict] | None = None) -> dict
         "skipped": skipped_all,
         "armed": len(still_armed),
         "gate_refused": gate_refused,
+        "market_closed": closed_refused,
         "cooldown_min": cooldown,
         "at": datetime.now(UTC).isoformat(),
         "note": note,
-    }
-    # Persisté pour que la page « Trades du jour » puisse expliquer, PAR UTILISATEUR, pourquoi un
-    # setup marqué « exécutable » à l'écran ne s'est pas ouvert (garde-fou de portefeuille, de
-    # corrélation, anti-doublon…) — sans ça, le refus reste invisible jusqu'à ce qu'on aille
-    # chercher dans les logs serveur.
-    try:
-        store.records.put(LAST_RUN, "latest", result)
-    except Exception as exc:  # noqa: BLE001 — la persistance ne doit jamais casser la veille
-        logger.warning("Auto-entrée : dernier passage non persisté (%s)", exc)
-    return result
+    })
+
+
+def last_run_at(store) -> str | None:  # noqa: ANN001
+    """Horodatage du dernier passage de veille (None s'il n'y en a pas encore eu).
+
+    Permet à l'interface de dater les refus qu'elle affiche. Un refus non daté est invérifiable :
+    c'est ce qui a laissé « déjà 2 positions ouvertes » à l'écran après une remise à zéro du
+    portefeuille, en contradiction avec Paper Trading qui n'affichait plus aucune position.
+    """
+    return ((store.records.get(LAST_RUN, "latest") or {}).get("at")) or None
+
+
+def market_closed_now(store) -> list[dict]:  # noqa: ANN001
+    """Setups écartés au dernier passage parce que LEUR marché est fermé (motif inclus).
+
+    Distinct de `blocked_for` : ce refus ne dépend pas du compte mais de l'état du marché, il vaut
+    donc pour tout le monde. Sans ce champ, un week-end sans aucune ouverture ressemble à une panne
+    du robot alors qu'il applique exactement la règle demandée.
+    """
+    last = store.records.get(LAST_RUN, "latest") or {}
+    return list(last.get("market_closed") or [])
 
 
 def blocked_for(store, tenant_id: str) -> list[dict]:  # noqa: ANN001
@@ -297,6 +406,15 @@ def reset(store, tenant_id: str, *, close_positions: bool = True) -> dict:  # no
     for event in store.records.list(EVENTS, tenant_id):
         if store.records.delete(EVENTS, event["id"]):
             cleared += 1
+
+    # Le rapport du dernier passage devient FAUX à l'instant même : ses refus invoquent des
+    # positions qu'on vient de neutraliser (« déjà 2 positions ouvertes exposées à USDT » alors que
+    # le compte n'en a plus aucune). On l'efface plutôt que de laisser la page contredire
+    # Paper Trading ; le prochain passage en réécrira un, exact.
+    try:
+        store.records.delete(LAST_RUN, "latest")
+    except Exception as exc:  # noqa: BLE001 — un rapport non effacé ne doit pas casser le reset
+        logger.warning("Auto-entrée : dernier passage non effacé (%s)", exc)
 
     live_snapshot.reset()
     logger.info("Auto-entrée remise à zéro (%s) : %d position(s) neutralisée(s), %d trace(s) effacée(s)",

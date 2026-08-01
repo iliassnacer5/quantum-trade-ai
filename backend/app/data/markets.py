@@ -10,6 +10,7 @@ Tous les connecteurs dégradent gracieusement vers des données synthétiques ho
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time as _time
 
@@ -93,11 +94,34 @@ async def _alpaca_candles(symbol: str, interval: str, limit: int) -> list[Candle
     _secs = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400,
              "1w": 604800, "1M": 2592000}.get(interval, 3600)
     start = (datetime.now(UTC) - timedelta(seconds=_secs * limit * 5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    params = {"timeframe": tf, "limit": min(limit * 2, 1000), "start": start, "feed": "iex"}
-    async with httpx.AsyncClient(timeout=_timeout(limit)) as client:
-        resp = await client.get(url, params=params, headers=headers)
-        resp.raise_for_status()
-        bars = resp.json().get("bars", [])
+    # `sort=desc` — LE PLUS RÉCENT D'ABORD. Sans ce tri, Alpaca renvoie les barres en avançant
+    # depuis `start` et les tronque à `limit` : on recevait donc la fenêtre la plus ANCIENNE de
+    # l'intervalle demandé, jamais la plus récente. Mesuré sur JPM le 01/08/2026, avec `start` à
+    # 5 × la profondeur demandée :
+    #   1 j  -> dernière bougie 2025-06-11 (13 MOIS de retard), close 268.16
+    #   4 h  -> dernière bougie 2026-03-25 (4 mois de retard),  close 295.50
+    #   1 h  -> dernière bougie 2026-07-29 (3 jours de retard), close 349.64
+    # alors que Yahoo servait 351.79 sur TOUS les intervalles le même jour.
+    #
+    # Conséquence directe sur la stratégie : les étapes 1 à 3 (tendance mensuelle et journalière,
+    # confirmation 4 h) étaient calculées sur des données vieilles de plusieurs mois, tandis que le
+    # déclencheur 15 min voyait le prix du jour. Le stop et l'objectif étaient donc posés sur des
+    # niveaux périmés, à un prix courant — c'est ce qui produisait des analyses où le « niveau
+    # majeur » annoncé se situait 30 % sous le prix d'entrée.
+    #
+    # Le tri décroissant borne la fenêtre sur MAINTENANT quelle que soit la profondeur demandée ;
+    # on la remet ensuite en ordre chronologique, seul ordre que les indicateurs sachent lire.
+    params = {"timeframe": tf, "limit": min(limit * 2, 1000), "start": start,
+              "feed": "iex", "sort": "desc"}
+    # Client partagé : connexion réutilisée entre les 150 chargements d'actions d'un cycle
+    # (cf. `data/http.py` — mesuré, divise par 2,5 les échecs de connexion).
+    from app.data.http import client as shared_client
+
+    client = await shared_client("alpaca", timeout=_timeout(limit), headers=headers)
+    resp = await client.get(url, params=params)
+    resp.raise_for_status()
+    bars = resp.json().get("bars", [])
+    bars.reverse()  # desc -> chronologique
     return [Candle(b["o"], b["h"], b["l"], b["c"], b["v"]) for b in bars][-limit:]
 
 
@@ -112,10 +136,12 @@ async def _oanda_candles(symbol: str, interval: str, limit: int) -> list[Candle]
     instr = symbol.replace("/", "_")
     url = f"https://api-fxtrade.oanda.com/v3/instruments/{instr}/candles"
     headers = {"Authorization": f"Bearer {s.oanda_api_key}"}
-    async with httpx.AsyncClient(timeout=_timeout(limit)) as client:
-        resp = await client.get(url, params={"granularity": gran, "count": limit, "price": "M"}, headers=headers)
-        resp.raise_for_status()
-        candles = resp.json().get("candles", [])
+    from app.data.http import client as shared_client   # connexion réutilisée (cf. data/http.py)
+
+    client = await shared_client("oanda", timeout=_timeout(limit), headers=headers)
+    resp = await client.get(url, params={"granularity": gran, "count": limit, "price": "M"})
+    resp.raise_for_status()
+    candles = resp.json().get("candles", [])
     out = []
     for c in candles:
         m = c["mid"]
@@ -123,10 +149,62 @@ async def _oanda_candles(symbol: str, interval: str, limit: int) -> list[Candle]
     return out
 
 
-async def _yahoo_candles(symbol: str, interval: str, limit: int) -> list[Candle]:
-    """Bougies réelles via Yahoo Finance (actions & forex, sans clé)."""
+# RÉGULATEUR DE DÉBIT YAHOO — on s'auto-limite au lieu de se faire refuser.
+#
+# Mesuré le 01/08/2026 : en rafale, 0/12 requêtes aboutissent (HTTP 429 systématique) ; espacées de
+# 1,5 s, 17/17 aboutissent, toutes classes d'actifs confondues. Le fournisseur n'est pas bloqué,
+# c'est le BALAYAGE qui dépasse son quota (84 symboles × 5 unités = 420 requêtes / 240 s).
+#
+# Un espacement minimal vaut mieux qu'un flot refusé : la même requête passe, simplement décalée.
+_yahoo_lock = asyncio.Lock()
+_yahoo_next_at = 0.0
+
+
+async def _yahoo_slot() -> None:
+    """Attend son tour avant d'interroger Yahoo (espacement minimal entre deux requêtes)."""
+    global _yahoo_next_at
+
+    rps = get_settings().yahoo_max_rps
+    if rps <= 0:
+        return
+    gap = 1.0 / rps
+    async with _yahoo_lock:
+        now = _time.monotonic()
+        wait = _yahoo_next_at - now
+        _yahoo_next_at = max(now, _yahoo_next_at) + gap
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+
+async def _twelve_candles(symbol: str, interval: str, limit: int) -> list[Candle]:
+    """DERNIER RECOURS : Twelve Data, quand aucun autre fournisseur n'a rendu de bougies.
+
+    Placé en fin de cascade à cause de son quota — ~8 requêtes/minute sur le plan gratuit, contre
+    420 requêtes par cycle de balayage. Il ne peut donc pas porter le trafic courant, mais il évite
+    la page vide quand Yahoo limite le débit ou qu'un connecteur tombe. Il refuse proprement quand
+    son quota est atteint (cf. `twelvedata._slot`) : la cascade rend alors une série vide, et le
+    projet affiche « données indisponibles » — jamais une donnée inventée.
+    """
+    from app.data import twelvedata
+
+    rows = await twelvedata.fetch_ohlcv(symbol, interval, limit)
+    return [Candle(r["open"], r["high"], r["low"], r["close"], r["volume"]) for r in rows]
+
+
+async def _yahoo_candles(symbol: str, interval: str, limit: int, *, fresh: bool = False) -> list[Candle]:
+    """Bougies réelles via Yahoo Finance (actions & forex, sans clé).
+
+    `fresh=True` COURT-CIRCUITE le régulateur. C'est le garde-fou essentiel : les lectures fraîches
+    sont celles qui engagent de l'argent (remplissage d'un ordre, déplacement d'un stop, clôture) ou
+    qui décident d'une entrée. Les faire patienter derrière un balayage de fond de 420 requêtes
+    reviendrait à rater un déclencheur 15 min pour économiser du quota — exactement le compromis
+    qu'il ne faut pas faire. Elles sont rares (quelques-unes par minute) face au balayage, donc les
+    laisser passer ne remet pas la régulation en cause.
+    """
     from app.data import yahoo
 
+    if not fresh:
+        await _yahoo_slot()
     rows = await yahoo.fetch_ohlcv(symbol, interval, limit)
     return [Candle(r["open"], r["high"], r["low"], r["close"], r["volume"]) for r in rows]
 
@@ -151,7 +229,9 @@ async def _cascade(loaders: list, min_needed: int) -> list[Candle]:  # noqa: ANN
         try:
             candles = await loader()
         except Exception as exc:  # noqa: BLE001 — un fournisseur KO n'invalide pas le suivant
-            logger.debug("Fournisseur indisponible (%s)", exc)
+            # Type inclus : une erreur réseau au message vide rendait cette trace inexploitable.
+            logger.debug("Fournisseur indisponible (%s: %s)",
+                         type(exc).__name__, exc or "sans message")
             continue
         if len(candles) >= min_needed:
             return candles
@@ -181,6 +261,34 @@ _LAST_SOURCE: dict[str, str] = {}
 _CACHE: dict[tuple[str, str, int], tuple[float, list[Candle], str]] = {}
 
 
+# Durée d'une bougie, par unité de temps. Sert à dimensionner le cache : on ne garde jamais une
+# série assez longtemps pour masquer l'apparition d'une NOUVELLE bougie.
+_BAR_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400,
+                "1d": 86400, "1w": 604800, "1M": 2592000}
+
+
+def _ttl_for(interval: str) -> float:
+    """Durée de cache pour cette unité de temps — proportionnelle à la durée de la bougie.
+
+    Un TTL unique de 20 s pour toutes les unités traitait une bougie MENSUELLE comme une bougie de
+    15 minutes : on la redemandait 4 320 fois par jour pour une valeur qui change une fois par
+    mois. C'est ce gaspillage qui saturait le quota du fournisseur.
+
+    Le TTL vaut une petite fraction de la durée de la bougie (`market_cache_ttl_ratio`, 1/60e par
+    défaut), borné en bas par `market_cache_ttl` — aucune unité n'est donc cachée MOINS longtemps
+    qu'avant — et en haut par `market_cache_ttl_max`. Concrètement : 15 min → 20 s (inchangé),
+    1 h → 60 s, 4 h → 240 s, 1 j → 24 min, 1 mois → 30 min (plafond).
+
+    Pourquoi c'est sûr pour la stratégie : à 1/60e, le cache expire toujours BIEN avant la fermeture
+    de la bougie suivante, donc aucune nouvelle bougie ne peut être manquée. Et surtout, les
+    chemins qui ENGAGENT de l'argent (remplissage d'ordre, déplacement de stop, clôture) lisent
+    avec `fresh=True` et ne consultent jamais ce cache.
+    """
+    s = get_settings()
+    bar = _BAR_SECONDS.get(interval, 3600)
+    return max(s.market_cache_ttl, min(bar * s.market_cache_ttl_ratio, s.market_cache_ttl_max))
+
+
 def clear_cache() -> None:
     """Vide le cache de bougies (tests, et rafraîchissement forcé)."""
     _CACHE.clear()
@@ -196,7 +304,8 @@ def is_real(symbol: str) -> bool:
     return data_source(symbol) in {"live", "real"}
 
 
-async def load_candles(symbol: str, interval: str = "1h", limit: int = 200) -> list[Candle]:
+async def load_candles(symbol: str, interval: str = "1h", limit: int = 200,
+                       *, fresh: bool = False) -> list[Candle]:
     """Charge les bougies réelles selon la classe d'actif, avec repli synthétique.
 
     crypto -> Binance ; actions -> Alpaca **et** Yahoo en parallèle ; forex -> OANDA **et** Yahoo en
@@ -211,6 +320,11 @@ async def load_candles(symbol: str, interval: str = "1h", limit: int = 200) -> l
     2. **Fournisseurs en PARALLÈLE** au lieu d'une cascade : la cascade payait le délai de connexion
        du premier PUIS du second quand le premier ne servait pas le symbole (10 s + 12 s = les 22 s
        mesurées sur `/api/execution/positions`). Cf. `_race`.
+
+    `fresh=True` IGNORE le cache court en lecture (il continue de l'alimenter). Réservé aux chemins
+    qui ENGAGENT de l'argent — prix de remplissage d'un ordre, déplacement d'un stop — où une donnée
+    vieille de 20 s n'est pas un détail d'affichage mais un prix faux inscrit dans le portefeuille.
+    L'affichage, lui, garde le cache : c'est exactement la frontière moteur / cache.
     """
     cls = asset_class(symbol)
     key = symbol.upper()
@@ -234,38 +348,55 @@ async def load_candles(symbol: str, interval: str = "1h", limit: int = 200) -> l
     cache_key = (key, interval, limit)
     now = _time.monotonic()
     hit = _CACHE.get(cache_key)
-    if hit and hit[0] > now:
+    if hit and hit[0] > now and not fresh:
         _LAST_SOURCE[key] = hit[2]
         return hit[1]
 
     candles: list[Candle] = []
     try:
         if cls == "crypto":
-            candles = await binance.fetch_klines(symbol, interval=interval, limit=limit)
+            # Binance d'abord (gratuit, sans quota, très fiable) ; Twelve Data en secours quand il
+            # tombe — c'est ce qui évite qu'un hoquet réseau vide toute la page crypto.
+            candles = await _cascade([
+                lambda: binance.fetch_klines(symbol, interval=interval, limit=limit),
+                lambda: _twelve_candles(symbol, interval, limit),
+            ], min_needed)
         elif cls == "stock":
             # Alpaca puis Yahoo. Mesurés COMPLÉMENTAIRES (chacun sert des symboles que l'autre
             # rate : Alpaca WMT/MSFT/AAPL, Yahoo V/PEP/GOOGL), donc les deux restent nécessaires —
             # mais en séquence, pas en parallèle (cf. `_cascade`).
             candles = await _cascade([
                 lambda: _alpaca_candles(symbol, interval, limit),
-                lambda: _yahoo_candles(symbol, interval, limit),
+                lambda: _yahoo_candles(symbol, interval, limit, fresh=fresh),
+                lambda: _twelve_candles(symbol, interval, limit),
             ], min_needed)
         elif cls == "forex":
             candles = await _cascade([
                 lambda: _oanda_candles(symbol, interval, limit),
-                lambda: _yahoo_candles(symbol, interval, limit),
+                lambda: _yahoo_candles(symbol, interval, limit, fresh=fresh),
+                lambda: _twelve_candles(symbol, interval, limit),
             ], min_needed)
         elif cls in ("commodity", "index"):
             # Métaux : futures COMEX via Yahoo (GC=F/SI=F). Indices : leur cotation Yahoo (^GSPC,
             # ^GDAXI…). Dans les deux cas des données réelles, avec volume, et sans clé d'API.
-            candles = await _yahoo_candles(symbol, interval, limit)
+            # Twelve Data ne sert en secours que l'or : l'argent, le platine, le palladium et les
+            # indices exigent chez lui un plan payant (il rend `None` et n'est même pas interrogé).
+            candles = await _cascade([
+                lambda: _yahoo_candles(symbol, interval, limit, fresh=fresh),
+                lambda: _twelve_candles(symbol, interval, limit),
+            ], min_needed)
         if len(candles) >= min_needed:
             _LAST_SOURCE[key] = "real"
-            _CACHE[cache_key] = (now + get_settings().market_cache_ttl, candles, "real")
+            _CACHE[cache_key] = (now + _ttl_for(interval), candles, "real")
             return candles
         logger.warning("Backfill %s (%s) insuffisant", symbol, cls)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Connecteur %s indisponible pour %s (%s)", cls, symbol, exc)
+        # Le TYPE d'exception est journalisé en plus du message : beaucoup d'erreurs réseau
+        # (`httpx.ReadError`, `ConnectError`…) ont un message VIDE, et la ligne se lisait alors
+        # « Connecteur crypto indisponible pour ETH/USDT () » — un diagnostic impossible, qui m'a
+        # fait conclure à tort à un blocage Binance alors qu'il s'agissait d'une saturation passagère.
+        logger.warning("Connecteur %s indisponible pour %s (%s: %s)",
+                       cls, symbol, type(exc).__name__, exc or "sans message")
     # Par défaut on ne FABRIQUE pas de bougies : une série vide est honnête, une série inventée ne
     # l'est pas. Les appelants (playbook, entraînement, backtest) refusent déjà d'agir sans données.
     if not get_settings().data_allow_synthetic:
@@ -273,6 +404,12 @@ async def load_candles(symbol: str, interval: str = "1h", limit: int = 200) -> l
         # L'ÉCHEC est mémorisé aussi, et c'est délibéré : sans ça, un symbole que personne ne sert
         # est réinterrogé à chaque appel (donc à chaque rafraîchissement de page), et l'on repaie le
         # délai de connexion en boucle. 20 s d'attente avant de réessayer est le bon compromis.
+        #
+        # ATTENTION — un échec garde TOUJOURS le TTL COURT (`market_cache_ttl`), jamais celui de
+        # l'unité de temps. Mémoriser 24 minutes l'indisponibilité d'une bougie journalière
+        # rendrait le symbole aveugle tout ce temps après un simple hoquet réseau, et l'auto-entrée
+        # cesserait de le surveiller : on retomberait exactement dans le « les agents ouvrent moins
+        # de positions ». Une donnée réussie se garde longtemps ; un échec se réessaie vite.
         _CACHE[cache_key] = (now + get_settings().market_cache_ttl, [], "unavailable")
         return []
     # Repli déterministe (graine basée sur le symbole pour la cohérence par actif)

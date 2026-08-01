@@ -61,7 +61,7 @@ def market(monkeypatch):
         "15m": _m15_with_pullback_entry(True, end_close=_END),
     }
 
-    async def _load(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _load(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return series.get(interval, series["4h"])
 
     monkeypatch.setattr(markets, "load_candles", _load)
@@ -120,7 +120,7 @@ async def test_auto_entry_does_nothing_without_a_trigger(market, monkeypatch):
     series = dict(market)
     series["15m"] = _no_trigger_15m(price=_END)
 
-    async def _load(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _load(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return series.get(interval, series["4h"])
 
     monkeypatch.setattr(markets, "load_candles", _load)
@@ -131,6 +131,235 @@ async def test_auto_entry_does_nothing_without_a_trigger(market, monkeypatch):
     assert report["opened"] == []
     assert report["armed"] == 1
     assert "aucun déclencheur" in report["note"]
+
+
+async def test_auto_entry_refreshes_an_empty_pool_instead_of_concluding(market, monkeypatch):
+    """Un vivier VIDE ne prouve pas qu'il n'y a pas de trade — il faut le recalculer, pas conclure.
+
+    `armed_and_ready()` lit l'instantané sans contrôle de fraîcheur. Boucle de fond tombée, jamais
+    passée, ou remise à zéro -> vivier vide, et la veille répondait « aucun setup armé » à chaque
+    passage, indéfiniment. Le cache décidait donc qu'il n'y avait pas de trade : c'est le symptôme
+    « les agents ouvrent beaucoup moins de positions ».
+    """
+    store = get_store()
+    _user(store, "auto-pool@test.com")
+    live_snapshot.reset()          # simule une boucle de fond tombée / un redémarrage
+
+    refreshes = {"n": 0}
+    real_refresh = live_snapshot.refresh
+
+    async def _counted(*args, **kwargs):
+        refreshes["n"] += 1
+        return await real_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(live_snapshot, "refresh", _counted)
+
+    await auto_entry_service.run_auto_entry(store)
+    assert refreshes["n"] == 1, "un vivier absent doit déclencher un recalcul, pas une conclusion"
+
+
+async def test_auto_entry_does_not_refresh_a_fresh_pool(market, monkeypatch):
+    """Le recalcul de secours ne doit PAS se déclencher quand l'instantané est à jour.
+
+    Sinon la veille (toutes les 60 s) relancerait le balayage complet de l'univers en boucle, ce que
+    l'architecture d'instantané existe précisément pour éviter.
+    """
+    from datetime import UTC
+
+    store = get_store()
+    _user(store, "auto-pool2@test.com")
+    live_snapshot.reset()
+    live_snapshot._snapshot = {                       # noqa: SLF001 — instantané frais déjà publié
+        "picks": [{"symbol": "EUR/USD", "asset_class": "forex", "tier": "armed"}],
+        "ready": 0, "armed": 1, "scanned": 1, "conform": 1,
+        "session": {}, "strategy": "s", "verdicts": {}, "requested": "tous",
+        "computed_at": datetime.now(UTC).isoformat(),
+    }
+
+    refreshes = {"n": 0}
+    real_refresh = live_snapshot.refresh
+
+    async def _counted(*args, **kwargs):
+        refreshes["n"] += 1
+        return await real_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(live_snapshot, "refresh", _counted)
+
+    await auto_entry_service.run_auto_entry(store)
+    assert refreshes["n"] == 0, "un instantané frais ne doit jamais être recalculé par la veille"
+    live_snapshot.reset()
+
+
+async def test_a_pass_with_nothing_to_do_still_refreshes_its_report(market, monkeypatch):
+    """« Au dernier passage » doit désigner LE dernier passage — pas le dernier qui avait à dire.
+
+    Le rapport n'était persisté qu'au bout de la fonction, donc uniquement quand des setups étaient
+    prêts. Dès qu'un passage ne trouvait rien (le cas le plus fréquent), le rapport PRÉCÉDENT
+    restait affiché indéfiniment : un refus « déjà 2 positions ouvertes exposées à USDT » survivait
+    à la remise à zéro du portefeuille et contredisait Paper Trading, qui affichait zéro position.
+    """
+    store = get_store()
+    user = _user(store, "stale-report@test.com")
+
+    # Un passage précédent a refusé un setup, pour une raison désormais périmée.
+    store.records.put(auto_entry_service.LAST_RUN, "latest", {
+        "enabled": True, "opened": [], "armed": 1,
+        "skipped": [{"symbol": "AAVE/USDT", "reason": "déjà 2 position(s) ouverte(s)",
+                     "tenant_id": user.tenant_id}],
+        "at": "2026-07-31T10:00:00+00:00",
+    })
+    assert auto_entry_service.blocked_for(store, user.tenant_id), "état de départ du test"
+
+    # Passage suivant : plus aucun setup armé à surveiller.
+    live_snapshot.reset()
+    live_snapshot._snapshot = {                     # noqa: SLF001 — instantané frais, mais vide
+        "picks": [], "ready": 0, "armed": 0, "scanned": 0, "conform": 0,
+        "session": {}, "strategy": "s", "verdicts": {}, "requested": "tous",
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await auto_entry_service.run_auto_entry(store)
+
+    assert auto_entry_service.blocked_for(store, user.tenant_id) == [], (
+        "un passage sans rien à faire doit EFFACER les refus périmés, pas les laisser à l'écran"
+    )
+    assert auto_entry_service.last_run_at(store) != "2026-07-31T10:00:00+00:00", (
+        "le rapport doit être réhorodaté à chaque passage"
+    )
+    live_snapshot.reset()
+
+
+async def test_resetting_clears_the_stale_refusals(market):
+    """La remise à zéro efface le rapport : ses refus invoquent des positions qui n'existent plus."""
+    store = get_store()
+    user = _user(store, "reset-report@test.com")
+    store.records.put(auto_entry_service.LAST_RUN, "latest", {
+        "enabled": True, "opened": [], "armed": 0,
+        "skipped": [{"symbol": "AAVE/USDT", "reason": "déjà 2 position(s) ouverte(s)",
+                     "tenant_id": user.tenant_id}],
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    auto_entry_service.reset(store, user.tenant_id)
+
+    assert auto_entry_service.blocked_for(store, user.tenant_id) == [], (
+        "après une remise à zéro, aucun refus ne peut encore invoquer les positions supprimées"
+    )
+
+
+async def test_a_closed_market_is_never_traded(market, monkeypatch):
+    """MARCHÉ FERMÉ = AUCUNE OUVERTURE. Un samedi, GER40 se négocie sur la bougie de vendredi.
+
+    Les fournisseurs continuent de servir la dernière bougie connue quand une place est fermée :
+    elle est réelle, mais plus d'actualité. Ouvrir dessus poserait entrée, stop et objectif sur un
+    marché à l'arrêt, et l'anti-doublon de 45 min laisserait le même setup figé se reprendre en
+    boucle.
+    """
+    store = get_store()
+    _user(store, "closed-market@test.com")
+    playbook_service.clear_cache()          # le setup doit être RECALCULÉ, donc réellement évalué
+    s = get_settings()
+    precedent = s.playbook_trade_only_when_open
+    s.playbook_trade_only_when_open = True
+    monkeypatch.setattr(sessions_mod, "can_trade",
+                        lambda now=None: (False, "week-end : marché des changes fermé"))
+    try:
+        report = await auto_entry_service.run_auto_entry(
+            store, candidates=[{"symbol": "EUR/USD", "asset_class": "forex", "tier": "armed"}],
+        )
+        # LE RÉSULTAT QUI COMPTE : rien ne s'ouvre sur un marché fermé.
+        assert report["opened"] == [], "aucune position ne doit s'ouvrir marché fermé"
+        # Et le refus est motivé, à l'une ou l'autre des deux couches : le playbook refuse déjà de
+        # déclarer le setup exécutable (`can_trade` par symbole), et `_open_market_only` reste un
+        # second verrou si un déclencheur arrivait malgré tout jusqu'à l'exécution.
+        motif = " ".join([report.get("note") or ""]
+                         + [m["reason"] for m in (report.get("market_closed") or [])])
+        assert "marché fermé" in motif or "déclencheur" in motif, motif
+    finally:
+        s.playbook_trade_only_when_open = precedent
+
+
+async def test_crypto_still_trades_when_the_exchanges_are_closed(market, monkeypatch):
+    """La CRYPTO cote 24 h/24 : lui appliquer les horaires de Londres refuserait un marché ouvert.
+
+    C'est la nuance qui distingue « ne trade pas sur des données figées » de « ne trade pas le
+    week-end » : les bougies crypto du samedi sont réelles ET fraîches.
+    """
+    from app.data import markets
+
+    store = get_store()
+    _user(store, "crypto-weekend@test.com")
+    s = get_settings()
+    precedent = s.playbook_trade_only_when_open
+    s.playbook_trade_only_when_open = True
+    monkeypatch.setattr(sessions_mod, "can_trade",
+                        lambda now=None: (False, "week-end : marché des changes fermé"))
+    try:
+        ouverts, fermes = auto_entry_service._open_market_only([   # noqa: SLF001
+            {"symbol": "BTC/USDT"}, {"symbol": "EUR/USD"}, {"symbol": "GER40"}, {"symbol": "AAPL"},
+        ])
+        assert [p["symbol"] for p in ouverts] == ["BTC/USDT"], "seule la crypto reste tradable"
+        assert {f["symbol"] for f in fermes} == {"EUR/USD", "GER40", "AAPL"}
+        assert markets.asset_class("BTC/USDT") == "crypto"
+    finally:
+        s.playbook_trade_only_when_open = precedent
+
+
+def test_no_session_is_open_during_the_weekend():
+    """Le week-end, AUCUNE place n'est ouverte — pas même à l'heure du chevauchement.
+
+    `current_sessions` ne regardait que l'HEURE : un samedi à 13 h, elle annonçait Londres et
+    New York ouvertes et le chevauchement actif. La bannière affichait donc des places ouvertes un
+    jour de fermeture, les ordres étaient horodatés `session_window = overlap`, et l'étape 7 de la
+    stratégie accordait un bonus de conviction pour une fenêtre inexistante.
+    """
+    samedi_13h = datetime(2026, 8, 1, 13, tzinfo=timezone.utc)      # samedi, plein « overlap »
+    assert sessions_mod.is_weekend(samedi_13h)
+    assert sessions_mod.current_sessions(samedi_13h) == []
+    assert sessions_mod.active_kill_zones(samedi_13h) == []
+    assert sessions_mod.is_overlap(samedi_13h) is False
+    ctx = sessions_mod.session_context(samedi_13h)
+    assert ctx.get("weekend") is True
+    assert not ctx.get("prime"), "aucune fenêtre à forte valeur quand tout est fermé"
+
+    # ...et la semaine, à la même heure, le chevauchement est bien détecté.
+    mercredi_13h = datetime(2026, 7, 29, 13, tzinfo=timezone.utc)
+    assert sessions_mod.current_sessions(mercredi_13h), "la semaine reste inchangée"
+    assert sessions_mod.is_overlap(mercredi_13h) is True
+
+
+async def test_a_closed_market_setup_is_flagged_analysis_only(market, monkeypatch):
+    """ANALYSER TOUJOURS, N'OUVRIR QUE SI LA PLACE EST OUVERTE — et le DIRE.
+
+    Un setup armé sur une action affichait « la position s'ouvrira toute seule dès que le
+    déclencheur se formera ». Un samedi, c'est faux : le garde-fou d'heures de marché l'en
+    empêchera. La carte promettait une exécution impossible. On expose donc l'état réel du marché
+    de CHAQUE symbole, pour que l'interface distingue « je surveille et j'ouvrirai » de
+    « j'analyse seulement ».
+    """
+    s = get_settings()
+    precedent = s.playbook_trade_only_when_open
+    s.playbook_trade_only_when_open = True
+    monkeypatch.setattr(sessions_mod, "can_trade",
+                        lambda now=None: (False, "week-end : marché des changes fermé"))
+    playbook_service.clear_cache()
+    try:
+        univers = [{"symbol": "EUR/USD", "asset_class": "forex"},
+                   {"symbol": "BTC/USDT", "asset_class": "crypto"}]
+        payload = await playbook_service.top_trades(5, universe=univers, now=_at(13))
+        par_symbole = {p["symbol"]: p for p in payload["picks"]}
+
+        if "EUR/USD" in par_symbole:
+            fx = par_symbole["EUR/USD"]
+            assert fx["tradable_now"] is False, "le forex est fermé le week-end"
+            assert "fermé" in fx["market_status"]
+        if "BTC/USDT" in par_symbole:
+            assert par_symbole["BTC/USDT"]["tradable_now"] is True, "la crypto cote 24 h/24"
+
+        # Le compteur d'en-tête doit distinguer les armés réellement exécutables.
+        assert "armed_market_closed" in payload
+    finally:
+        s.playbook_trade_only_when_open = precedent
+        playbook_service.clear_cache()
 
 
 async def test_auto_entry_never_doubles_an_open_position(market):
@@ -181,10 +410,15 @@ async def test_auto_entry_refuses_when_london_and_new_york_are_closed(market):
     finally:
         s.playbook_trade_only_when_open = False
     # Le test tourne n'importe quel jour : on n'affirme quelque chose que si le marché est fermé.
+    # Le refus est désormais PAR SYMBOLE (`market_closed`) et non plus un blocage global : la
+    # crypto continue de coter quand les places boursières sont fermées.
     tradable, _ = sessions_mod.can_trade()
     if not tradable:
-        assert report["opened"] == [] and report["market_open"] is False
-        assert "aucune ouverture" in report["note"]
+        assert report["opened"] == [], "aucune ouverture forex marché fermé"
+        refuses = {m["symbol"] for m in (report.get("market_closed") or [])}
+        # EUR/USD est soit écarté pour marché fermé, soit jamais arrivé jusque-là (pas de
+        # déclencheur formé sur ce passage) — les deux sont des refus légitimes.
+        assert "EUR/USD" in refuses or not report.get("triggered")
 
 
 # ---------------------------------------------------------------------------------------
@@ -219,31 +453,88 @@ def test_session_context_exposes_the_trading_window():
 # ---------------------------------------------------------------------------------------
 # 2 ter. Sécurisation du profit : le stop remonte sur +2R
 # ---------------------------------------------------------------------------------------
+def _paper_order(store, tenant_id, *, entry=1.1000, risk=0.0050, rr=3.0, side="buy", oid="sec-1"):
+    """Position papier ouverte, dont on maîtrise exactement le R/R (donc la place de l'objectif)."""
+    sign = 1 if side == "buy" else -1
+    return store.records.put(execution_service.ORDER, oid, {
+        "id": oid, "mode": "paper", "symbol": "EUR/USD", "side": side, "qty": 1000.0,
+        "entry": entry, "filled_price": entry,
+        "stop_loss": entry - sign * risk,
+        "take_profit": entry + sign * rr * risk,
+        "initial_risk": risk, "outcome": None, "tenant_id": tenant_id,
+    }, tenant_id=tenant_id)
+
+
 async def test_profit_is_secured_at_two_r(market, monkeypatch):
-    """+2R atteint -> le stop est remonté SUR +2R : la position ne peut plus être perdante."""
+    """+2R atteint ET objectif au-delà -> le stop est remonté SUR +2R : le gain est verrouillé.
+
+    R/R 1:3 : l'objectif est à +3R, donc au-delà du niveau sécurisé. C'est exactement le cas où la
+    règle du desk a un sens — verrouiller +2R puis laisser courir vers le R/R maximum.
+    """
     store = get_store()
     user = _user(store, "secure@test.com")
-    await auto_entry_service.run_auto_entry(
-        store, candidates=[{"symbol": "EUR/USD", "asset_class": "forex", "tier": "armed"}],
-    )
-    order = execution_service.list_orders(store, user.tenant_id)[0]
-    entry, sl = order["entry"], order["stop_loss"]
-    risk = abs(entry - sl)
-    assert order["initial_risk"] == risk
+    entry, risk = 1.1000, 0.0050
+    order = _paper_order(store, user.tenant_id, entry=entry, risk=risk, rr=3.0)
+    sl = order["stop_loss"]
 
-    # Le prix a parcouru +2,4 R : la sécurisation doit se déclencher.
     monkeypatch.setattr(execution_service, "_reference_price",
                         _fixed_price(entry + 2.4 * risk))
-    assert await execution_service.secure_open_profits(store) == 1
+    await execution_service.secure_open_profits(store)
 
-    secured = execution_service.list_orders(store, user.tenant_id)[0]
+    secured = store.records.get(execution_service.ORDER, order["id"])
     assert secured["profit_secured"] is True
     assert abs(secured["stop_loss"] - (entry + 2.0 * risk)) < 1e-6
     assert secured["original_stop_loss"] == sl
     # Le stop est passé AU-DESSUS de l'entrée : le trade est désormais gagnant quoi qu'il arrive.
     assert secured["stop_loss"] > entry
+    # ...et il reste SOUS l'objectif : la position peut encore aller le chercher.
+    assert secured["stop_loss"] < secured["take_profit"]
     # Deuxième passage : rien à faire (on ne déplace pas deux fois).
-    assert await execution_service.secure_open_profits(store) == 0
+    before = dict(secured)
+    await execution_service.secure_open_profits(store)
+    assert store.records.get(execution_service.ORDER, order["id"])["stop_loss"] == before["stop_loss"]
+
+
+async def test_the_secured_stop_never_reaches_the_objective(market, monkeypatch):
+    """R/R 1:2 -> +2R EST l'objectif : il n'y a rien à protéger, le stop ne bouge pas.
+
+    Mesuré sur CVX le 30/07/2026 : le stop était déplacé sur 193.45714798 pour un objectif à
+    193.45714797. Trois conséquences — le rejeu clôturait sur le STOP au lieu de l'objectif et la
+    carte annonçait « stop de sécurisation touché » sur un trade qui avait atteint sa cible ; stop
+    et objectif s'affichaient au même nombre de pips ; et pour un achat le stop passait AU-DESSUS
+    de l'objectif, un panier d'ordres qu'un vrai broker refuserait.
+
+    Aucun gain n'est perdu : l'objectif clôture au même prix, ou mieux.
+    """
+    store = get_store()
+    user = _user(store, "secure-rr2@test.com")
+    entry, risk = 1.1000, 0.0050
+    order = _paper_order(store, user.tenant_id, entry=entry, risk=risk, rr=2.0)
+
+    monkeypatch.setattr(execution_service, "_reference_price",
+                        _fixed_price(entry + 2.4 * risk))
+    # On juge CET ordre, pas le compteur global : `secure_open_profits` balaie tous les tenants.
+    await execution_service.secure_open_profits(store)
+
+    unchanged = store.records.get(execution_service.ORDER, order["id"])
+    assert unchanged["stop_loss"] == order["stop_loss"], "le stop ne doit pas atteindre l'objectif"
+    assert not unchanged.get("profit_secured")
+
+
+async def test_the_secured_stop_never_reaches_the_objective_on_sell(market, monkeypatch):
+    """Le même garde-fou, côté vente (les niveaux sont inversés)."""
+    store = get_store()
+    user = _user(store, "secure-sell@test.com")
+    entry, risk = 1.1000, 0.0050
+    order = _paper_order(store, user.tenant_id, entry=entry, risk=risk, rr=2.0,
+                         side="sell", oid="sec-sell")
+
+    monkeypatch.setattr(execution_service, "_reference_price",
+                        _fixed_price(entry - 2.4 * risk))
+    await execution_service.secure_open_profits(store)
+    unchanged = store.records.get(execution_service.ORDER, order["id"])
+    assert unchanged["stop_loss"] == order["stop_loss"], "le stop ne doit pas atteindre l'objectif"
+    assert not unchanged.get("profit_secured")
 
 
 async def test_profit_is_not_secured_before_two_r(market, monkeypatch):
@@ -262,7 +553,7 @@ async def test_profit_is_not_secured_before_two_r(market, monkeypatch):
 
 
 def _fixed_price(price: float):
-    async def _price(_symbol):
+    async def _price(_symbol, *, fresh: bool = False):  # `fresh` : cf. _reference_price
         return price
     return _price
 

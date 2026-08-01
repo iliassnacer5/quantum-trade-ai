@@ -86,7 +86,11 @@ export function Chart({ asset, timeframe, signal }: { asset: string; timeframe: 
     const series = seriesRef.current;
     if (!series) return;
     const lines: IPriceLine[] = [];
-    if (signal && signal.asset === asset && signal.direction !== 'HOLD') {
+    // Un HOLD n'a pas de niveaux (`null`) : rien à tracer. Le test explicite sur `null` protège
+    // aussi le cas anormal d'un BUY/SELL sans niveaux — mieux vaut un graphique sans lignes qu'une
+    // ligne tracée sur une valeur absente.
+    if (signal && signal.asset === asset && signal.direction !== 'HOLD'
+        && signal.entry != null && signal.stop_loss != null) {
       lines.push(series.createPriceLine({ price: signal.entry, color: '#FFFFFF', lineWidth: 1, lineStyle: LineStyle.Dashed, title: 'Entrée' }));
       lines.push(series.createPriceLine({ price: signal.stop_loss, color: '#E24B4A', lineWidth: 1, lineStyle: LineStyle.Dotted, title: 'SL' }));
       [signal.take_profit_1, signal.take_profit_2, signal.take_profit_3].forEach((tp, i) => {

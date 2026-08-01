@@ -100,7 +100,14 @@ async def build_setup(symbol: str, *, now: datetime | None = None) -> PlaybookSe
         h1=data.get("h1") or None,
         session=session,
         # Marchés fermés -> on analyse quand même, mais aucun setup n'est déclaré exécutable.
-        can_trade=(not s.playbook_trade_only_when_open) or bool(session.get("can_trade")),
+        #
+        # La disponibilité est évaluée PAR SYMBOLE (`can_trade_symbol`) et non plus à partir du
+        # seul contexte de session, qui décrit Londres et New York. La crypto cote en continu :
+        # lui appliquer la grille des places boursières refuserait un marché réellement ouvert,
+        # avec des bougies réellement fraîches. À l'inverse, une action ou un indice le week-end se
+        # négocierait sur la dernière bougie de vendredi — réelle, mais plus d'actualité.
+        can_trade=(not s.playbook_trade_only_when_open)
+        or sessions_mod.can_trade_symbol(symbol)[0],
         # TOUS les autres réglages viennent d'un point de vérité unique, partagé avec le backtest et
         # l'entraînement : c'est ce qui garantit que le backtest mesure bien ce qui trade.
         **playbook.settings_kwargs(s),
@@ -338,15 +345,26 @@ async def top_trades(
     picks = found[:count] if count and count > 0 else found
     for rank, p in enumerate(picks, 1):
         p["rank"] = rank
+        # LE MARCHÉ DE CE SYMBOLE EST-IL OUVERT MAINTENANT ?
+        #
+        # L'ANALYSE tourne sur tous les marchés en permanence — c'est ainsi qu'on arrive préparé à
+        # l'ouverture, et c'est voulu. Mais un setup armé sur une action ou un indice affichait
+        # « la position s'ouvrira toute seule dès que le déclencheur se formera », ce qui est FAUX
+        # quand la place est fermée : le garde-fou d'heures de marché l'en empêchera. La carte
+        # promettait donc une exécution qui ne pouvait pas avoir lieu.
+        #
+        # On expose l'état réel, par symbole (la crypto cote 24 h/24, les autres non), pour que
+        # l'interface distingue « je surveille et j'ouvrirai » de « j'analyse seulement ».
+        tradable, motif = sessions_mod.can_trade_symbol(p.get("symbol", ""), now)
+        p["tradable_now"] = bool(tradable) or not get_settings().playbook_trade_only_when_open
+        p["market_status"] = motif
 
     return {
         "generated_at": (now or datetime.now(UTC)).isoformat(),
         "session": session,
-        "strategy": (
-            "Playbook — tendance multi-indicateurs (D1/4h/1h/15min, figée) → entrée par confluence "
-            "pondérée (≥ 3 confirmations) → stop sur le niveau qui invalide le scénario, objectifs "
-            "devant le premier obstacle réel · R/R 1:2 à 1:3"
-        ),
+        # Source unique (`domain.playbook.STRATEGY_SUMMARY`) : cette phrase existait en trois
+        # exemplaires, et l'un d'eux décrivait encore la méthode d'avant.
+        "strategy": f"Playbook — {playbook.STRATEGY_SUMMARY}",
         "scanned": len(universe),
         "ready": sum(1 for p in picks if p["tier"] == "ready"),
         "armed": sum(1 for p in picks if p["tier"] == "armed"),
@@ -356,6 +374,11 @@ async def top_trades(
         # est un filtre qu'on ne peut pas contester.
         "conform": len(conform),
         "below_reliability": below,
+        # Setups dont le MARCHÉ EST FERMÉ : analysés, classés, affichés — mais non exécutables tant
+        # que leur place n'a pas ouvert. Les compter à part évite l'ambiguïté d'un « 1 armé » qui
+        # laisserait croire qu'une position va s'ouvrir alors qu'aucune ne le peut.
+        "armed_market_closed": sum(1 for p in picks
+                                   if p["tier"] == "armed" and not p.get("tradable_now", True)),
         "picks": picks,
         # Verdict de la stratégie pour CHAQUE symbole balayé, pas seulement pour les 5 retenus.
         # C'est ce qui permet au scanner et aux pages d'analyse de parler exactement le même

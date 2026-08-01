@@ -38,12 +38,16 @@ class SignalCard(BaseModel):
     id: str | None = Field(default=None, description="Id de la prédiction persistée (consultable)")
     asset: str = Field(..., examples=["BTC/USDT"])
     direction: Direction
-    entry: float
-    stop_loss: float
-    take_profit_1: float
+    # `None` = PAS DE TRADE, donc pas de niveaux — jamais « zéro » ni le prix courant recopié.
+    # Une décision HOLD (aucun setup, ou setup refusé par les filtres de fiabilité) ne propose ni
+    # entrée, ni stop, ni objectif : les quatre champs valent `None` et l'interface affiche « — ».
+    # Quand `direction` vaut BUY ou SELL, ils sont toujours renseignés.
+    entry: float | None = None
+    stop_loss: float | None = None
+    take_profit_1: float | None = None
     take_profit_2: float | None = None
     take_profit_3: float | None = None
-    risk_reward: float = Field(..., description="Ratio risque/rendement, ex. 3.2")
+    risk_reward: float | None = Field(default=None, description="Ratio risque/rendement, ex. 3.2")
     confidence: int = Field(..., ge=0, le=100, description="Score de confiance 0-100%")
     timeframe: Timeframe
     rationale: str = Field(..., description="Justification IA en langage naturel")

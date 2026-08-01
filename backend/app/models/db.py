@@ -178,8 +178,11 @@ class SignalORM(Base):
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
     symbol: Mapped[str] = mapped_column(String, index=True)
     direction: Mapped[str] = mapped_column(String)
-    entry: Mapped[float] = mapped_column(Float)
-    stop_loss: Mapped[float] = mapped_column(Float)
+    # NULLABLES depuis la migration 0007 : une décision « pas de trade » (HOLD, ou trade bloqué par
+    # les filtres) n'a pas de niveaux. On y écrivait auparavant le prix courant faute de mieux, ce
+    # qui affichait « Entrée = Stop = TP » et un R/R de 0 — une absence déguisée en plan de trade.
+    entry: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
     take_profit_1: Mapped[float | None] = mapped_column(Float, nullable=True)
     take_profit_2: Mapped[float | None] = mapped_column(Float, nullable=True)
     take_profit_3: Mapped[float | None] = mapped_column(Float, nullable=True)

@@ -39,15 +39,70 @@ def _age_of(payload: dict) -> float:
         return float("inf")
 
 
-def _decorate(payload: dict) -> dict:
-    """Ajoute l'âge de l'instantané — la fraîcheur fait partie de la donnée, pas du décor."""
+def _decorate(payload: dict, *, count: int | None = None) -> dict:
+    """Ajoute l'âge de l'instantané — la fraîcheur fait partie de la donnée, pas du décor.
+
+    `count` applique le PLAFOND DEMANDÉ par l'appelant au classement déjà calculé. Sans lui, la
+    route servait l'instantané tel quel : `?count=5` rendait en réalité tous les setups (ou le
+    plafond qu'avait utilisé la boucle de fond), et la réponse pouvait même ne pas porter la clé
+    `requested` quand l'instantané venait de la base. Le paramètre documenté était donc sans effet
+    dès qu'un instantané existait — c'est-à-dire presque toujours.
+
+    Tronquer ici est correct et sans recalcul : `picks` est déjà trié par fiabilité décroissante,
+    prendre les N premiers est exactement ce que « les N meilleurs » veut dire. Les compteurs
+    (`ready`, `armed`, `conform`, `scanned`) décrivent le BALAYAGE complet et ne sont pas retouchés
+    — ce sont deux questions différentes, et les confondre masquerait ce que le plafond a écarté.
+    """
     s = get_settings()
     age = _age_of(payload)
     out = dict(payload)
+    # LA SESSION EST RECALCULÉE À CHAQUE LECTURE, jamais servie depuis l'instantané.
+    #
+    # « Quelles places sont ouvertes ? » est une question sur l'INSTANT PRÉSENT. Figée dans
+    # l'instantané, la réponse pouvait avoir jusqu'à `playbook_snapshot_max_age` (15 min) de retard,
+    # et surtout survivre à un redémarrage : après correction du bug de week-end, l'instantané
+    # persisté par l'ancien code continuait d'afficher « 🔥 Chevauchement Londres / New York » un
+    # samedi, alors que `/api/market/sessions` répondait correctement « hors sessions majeures ».
+    #
+    # Le calcul est purement horaire (aucun accès réseau ni base) : le refaire à chaque lecture ne
+    # coûte rien. Les `picks`, eux, restent bien ceux de l'instantané — leur date de calcul est
+    # portée par `computed_at` et `age_seconds`.
+    try:
+        from app.data import sessions as sessions_mod
+
+        out["session"] = sessions_mod.session_context()
+    except Exception as exc:  # noqa: BLE001 — un contexte manquant ne doit pas casser la page
+        logger.warning("Contexte de session non recalculé (%s)", exc)
+    if count:
+        picks = out.get("picks") or []
+        if len(picks) > count:
+            out["picks"] = picks[:count]
+        out["requested"] = count
     out["age_seconds"] = round(age, 1) if age != float("inf") else None
     out["stale"] = age > s.playbook_snapshot_max_age
     out["refresh_interval"] = s.playbook_snapshot_interval
     return out
+
+
+# Clés STRUCTURELLES d'un instantané complet, telles que `playbook_service.top_trades` les produit.
+# Servent à refuser un enregistrement partiel relu depuis la base (cf. `_is_complete`).
+_REQUIRED_KEYS = ("picks", "session", "strategy", "verdicts", "scanned")
+
+
+def _is_complete(payload: dict | None) -> bool:
+    """L'enregistrement relu a-t-il la forme d'un instantané complet ?
+
+    Le contenu de `top_trades` en base survit aux redémarrages — donc aussi aux DÉPLOIEMENTS. Un
+    enregistrement écrit par une version antérieure (ou une écriture partielle) n'a pas forcément
+    les clés que l'interface lit aujourd'hui : servi tel quel, il produit une page cassée ou, pire,
+    un `verdicts` vide qui fait taire le scanner et les pages d'analyse sans le dire.
+
+    On préfère donc REcalculer que servir une structure incomplète : c'est plus lent une fois, et
+    correct. Le coût ne se paie qu'au premier appel suivant un déploiement.
+    """
+    if not payload or payload.get("picks") is None:
+        return False
+    return all(k in payload for k in _REQUIRED_KEYS)
 
 
 def current() -> dict | None:
@@ -73,7 +128,7 @@ async def refresh(store=None, *, count: int | None = None, skip_if_newer_than: f
     async with _lock:
         if (skip_if_newer_than is not None and _snapshot is not None
                 and _age_of(_snapshot) <= skip_if_newer_than):
-            return _decorate(_snapshot)
+            return _decorate(_snapshot, count=count)
         # `count=None` -> le réglage (0 = tous les setups conformes). On ne remplace pas un 0
         # explicite par le défaut : « aucun plafond » est une valeur, pas une absence de valeur.
         payload = await signal_service.daily_top_trades(
@@ -111,9 +166,15 @@ async def get(store=None, *, count: int | None = None, force: bool = False) -> d
         except Exception as exc:  # noqa: BLE001 — la relecture n'est qu'un raccourci
             logger.warning("Instantané persisté illisible (%s)", exc)
             stored = None
-        if stored and stored.get("picks") is not None:
+        if _is_complete(stored):
             _snapshot = stored
-            return _decorate(stored)
+            return _decorate(stored, count=count)
+        if stored:
+            logger.warning(
+                "Instantané persisté incomplet (clés manquantes : %s) — recalcul plutôt que "
+                "de servir une structure partielle",
+                ", ".join(k for k in _REQUIRED_KEYS if k not in stored) or "picks",
+            )
     if _snapshot is None:
         # Plusieurs pages peuvent arriver ensemble avant le premier calcul : la première déclenche,
         # les autres récupèrent son résultat au lieu de relancer le même balayage.
@@ -123,7 +184,7 @@ async def get(store=None, *, count: int | None = None, force: bool = False) -> d
     if _age_of(_snapshot) > max(s.playbook_snapshot_max_age, s.playbook_snapshot_interval * 4):
         logger.warning("Instantané périmé (boucle de fond arrêtée ?) — recalcul synchrone")
         return await refresh(store, count=count)
-    return _decorate(_snapshot)
+    return _decorate(_snapshot, count=count)
 
 
 def verdict_for(symbol: str) -> dict | None:
@@ -147,6 +208,24 @@ def armed_and_ready() -> list[dict]:
     if not _snapshot:
         return []
     return [p for p in (_snapshot.get("picks") or []) if p.get("tier") in ("ready", "armed")]
+
+
+def pool_is_usable() -> bool:
+    """Le vivier de surveillance de l'auto-entrée est-il exploitable, ou périmé/absent ?
+
+    `armed_and_ready()` lit l'instantané SANS aucun contrôle de fraîcheur. C'est acceptable pour
+    afficher une page, ça ne l'est pas pour décider de trader : si la boucle de fond s'arrête (ou
+    n'est jamais passée, ou vient d'être remise à zéro), le vivier reste vide ou figé et l'auto-
+    entrée conclut « aucun setup armé » en boucle. Un cache devient alors, en pratique, l'autorité
+    qui décide qu'il n'y a pas de trade — exactement ce que l'architecture interdit.
+
+    Cette fonction dit seulement si le vivier mérite confiance ; c'est à l'appelant de le
+    rafraîchir. Le seuil est celui du filet de sécurité déjà utilisé par `get()`.
+    """
+    if _snapshot is None:
+        return False
+    s = get_settings()
+    return _age_of(_snapshot) <= max(s.playbook_snapshot_max_age, s.playbook_snapshot_interval * 4)
 
 
 def reset() -> None:

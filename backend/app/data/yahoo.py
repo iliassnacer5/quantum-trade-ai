@@ -71,12 +71,21 @@ async def fetch_ohlcv(symbol: str, interval: str = "1h", limit: int = 200) -> li
 
     ysym = to_yahoo_symbol(symbol)
     params = {"interval": _INTERVAL.get(interval, "1h"), "range": _range_for(interval, limit)}
-    # Délai de CONNEXION court (cf. `markets._timeout`) : mesuré, tous les échecs Yahoo observés
-    # étaient des `ConnectTimeout` à 12 s — du temps mort pur, jamais une réponse lente.
-    async with httpx.AsyncClient(timeout=_timeout(limit), headers=_HEADERS) as client:
-        resp = await client.get(_CHART_URL.format(symbol=ysym), params=params)
-        resp.raise_for_status()
-        data = resp.json()
+    # CLIENT PARTAGÉ : la connexion est réutilisée d'un appel à l'autre au lieu d'ouvrir un TCP +
+    # TLS neuf à chaque bougie. Mesuré le 01/08/2026 sur 15 requêtes identiques depuis le
+    # conteneur : 5 échecs et 1,08 s/requête avec un client jetable, contre 2 échecs et 0,52 s avec
+    # un client partagé. Yahoo est de loin le plus sollicité (290 des 440 chargements d'un cycle),
+    # c'est donc ici que la réutilisation rapporte le plus.
+    #
+    # Le délai de CONNEXION court (cf. `markets._timeout`) est conservé : mesuré, tous les échecs
+    # Yahoo observés étaient des `ConnectTimeout` à 12 s — du temps mort pur, jamais une réponse
+    # lente.
+    from app.data.http import client as shared_client
+
+    client = await shared_client("yahoo", timeout=_timeout(limit), headers=_HEADERS)
+    resp = await client.get(_CHART_URL.format(symbol=ysym), params=params)
+    resp.raise_for_status()
+    data = resp.json()
 
     result = (data.get("chart", {}).get("result") or [None])[0]
     if not result:

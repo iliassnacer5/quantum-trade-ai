@@ -652,6 +652,36 @@ async def test_symbol_run_state_is_released_even_when_the_backtest_raises(monkey
     assert pbt.symbol_run_state("EUR/USD", "1h")["running"] is False
 
 
+async def test_progress_advances_symbol_by_symbol(monkeypatch):
+    """L'avancement doit AVANCER — un compteur figé à 0 est indiscernable d'un plantage.
+
+    `_set_phase` n'était appelé qu'une fois par passe, avec `done=0`, et jamais réactualisé : la
+    page affichait « 0/88 » du début à la fin d'une passe de plusieurs minutes.
+    """
+    vus: list[int] = []
+
+    async def _un_symbole(symbol, **kw):  # noqa: ANN001
+        vus.append(pbt.run_state()["done"])
+        return {"symbol": symbol, "trades": [], "coverage": "", "years": 0.0}
+
+    monkeypatch.setattr(pbt, "backtest_symbol", _un_symbole)
+    await pbt.run_pass(["EUR/USD", "GBP/USD", "USD/JPY"], entry_tf="1h", step=4, parallel=1)
+
+    assert pbt.run_state()["done"] == 3, "chaque symbole terminé doit faire avancer le compteur"
+    assert vus == [0, 1, 2], "l'avancement doit progresser pendant la passe, pas à la fin"
+
+
+async def test_progress_advances_even_when_a_symbol_fails(monkeypatch):
+    """Un fournisseur KO ne doit pas bloquer la barre de progression au premier symbole."""
+    async def _plante(symbol, **kw):  # noqa: ANN001
+        raise RuntimeError("connecteur indisponible")
+
+    monkeypatch.setattr(pbt, "backtest_symbol", _plante)
+    await pbt.run_pass(["EUR/USD", "GBP/USD"], entry_tf="1h", step=4, parallel=1)
+
+    assert pbt.run_state()["done"] == 2, "un symbole en échec compte aussi dans l'avancement"
+
+
 def test_api_exposes_the_backtestable_markets():
     from fastapi.testclient import TestClient
 

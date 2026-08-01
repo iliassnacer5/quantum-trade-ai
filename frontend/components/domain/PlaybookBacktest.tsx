@@ -23,6 +23,28 @@ import {
 import { Button } from '@/components/ui';
 
 /**
+ * Profit factor lisible — « ∞ » et « — » ne veulent PAS dire la même chose.
+ *
+ * L'API rend `profit_factor: null` dans deux situations opposées, que seul `trades` sépare :
+ * - `trades > 0` : la paire n'a AUCUN trade perdant, le profit factor est infini (le meilleur
+ *   résultat possible) ;
+ * - `trades === 0` : rien n'a été mesuré, il n'y a pas de profit factor du tout.
+ *
+ * Un `?? '∞'` nu affichait donc « ∞ » — le meilleur score qui soit — sur les lignes non classées
+ * qui n'ont produit aucun trade. On distingue les deux : « — » pour l'absence de mesure.
+ */
+function formatPF(pf: number | null | undefined, trades: number): string {
+  if (!trades) return '—';
+  return pf == null ? '∞' : `${pf}`;
+}
+
+/** Taux de réussite lisible : « — » quand aucun trade n'a été mesuré (jamais « 0 % »). */
+function formatWinRate(winRate: number | null | undefined, trades: number): string {
+  if (!trades || winRate == null) return '—';
+  return `${winRate} %`;
+}
+
+/**
  * FRÉQUENCE D'OPPORTUNITÉ — « combien de trades par jour », répondu par la mesure.
  *
  * Deux familles de leviers, et elles ne se valent pas du tout : élargir l'univers balayé ajoute des
@@ -193,11 +215,11 @@ function MarketTops({ tops }: { tops: Record<string, PlaybookMarketTop> }) {
                       <td className="py-1 pr-2 text-muted">{r.market_rank}</td>
                       <td className="py-1 pr-2 font-mono text-white/90">{r.symbol}</td>
                       <td className="py-1 pr-2 text-right text-muted">{r.trades}</td>
-                      <td className="py-1 pr-2 text-right text-white/80">{r.win_rate}%</td>
+                      <td className="py-1 pr-2 text-right text-white/80">{formatWinRate(r.win_rate, r.trades)}</td>
                       <td className={`py-1 pr-2 text-right ${r.expectancy_r > 0 ? 'text-buy' : 'text-sell'}`}>
                         {r.expectancy_r > 0 ? '+' : ''}{r.expectancy_r} R
                       </td>
-                      <td className="py-1 text-right text-muted">{r.profit_factor ?? '∞'}</td>
+                      <td className="py-1 text-right text-muted">{formatPF(r.profit_factor, r.trades)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -237,12 +259,12 @@ function RankingTable({ rows }: { rows: PlaybookPairRank[] }) {
               <td className="py-1.5 pr-2 text-right text-muted">{r.trades}</td>
               <td className="py-1.5 pr-2 text-right text-buy">{r.wins}</td>
               <td className="py-1.5 pr-2 text-right text-sell">{r.losses}</td>
-              <td className="py-1.5 pr-2 text-right text-white/80">{r.win_rate}%</td>
+              <td className="py-1.5 pr-2 text-right text-white/80">{formatWinRate(r.win_rate, r.trades)}</td>
               <td className="py-1.5 pr-2 text-right text-muted">1:{r.avg_planned_rr}</td>
               <td className={`py-1.5 pr-2 text-right ${r.expectancy_r > 0 ? 'text-buy' : 'text-sell'}`}>
                 {r.expectancy_r > 0 ? '+' : ''}{r.expectancy_r} R
               </td>
-              <td className="py-1.5 pr-2 text-right text-muted">{r.profit_factor ?? '∞'}</td>
+              <td className="py-1.5 pr-2 text-right text-muted">{formatPF(r.profit_factor, r.trades)}</td>
               <td className="py-1.5 text-[11px] text-white/70">{r.verdict}</td>
             </tr>
           ))}

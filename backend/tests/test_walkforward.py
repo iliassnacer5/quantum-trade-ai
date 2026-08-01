@@ -33,7 +33,7 @@ def _fake_rows(n: int) -> list[dict]:
 
 
 async def test_walk_forward_real_data_produces_verdict(monkeypatch):
-    async def _rows(symbol, interval="1h", limit=1000):  # noqa: ANN001
+    async def _rows(symbol, interval="1h", limit=1000, **kw):  # noqa: ANN001
         return _fake_rows(1000)
 
     monkeypatch.setattr(walkforward, "get_ohlcv", _rows)
@@ -45,7 +45,7 @@ async def test_walk_forward_real_data_produces_verdict(monkeypatch):
 
 
 async def test_walk_forward_synthetic_is_unproven(monkeypatch):
-    async def _empty(symbol, interval="1h", limit=1000):  # noqa: ANN001
+    async def _empty(symbol, interval="1h", limit=1000, **kw):  # noqa: ANN001
         return []  # données indisponibles -> repli synthétique
 
     monkeypatch.setattr(walkforward, "get_ohlcv", _empty)

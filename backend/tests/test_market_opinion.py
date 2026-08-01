@@ -28,7 +28,7 @@ def market(monkeypatch):
 
     series = _tf("h4")
 
-    async def _load(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _load(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return series
 
     async def _news(symbol, limit=20):  # noqa: ANN001
@@ -102,7 +102,7 @@ async def test_no_opinion_on_synthetic_data(monkeypatch):
     from app.data import markets
     from tests.test_playbook import _tf
 
-    async def _load(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _load(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return _tf("h4")
 
     monkeypatch.setattr(markets, "load_candles", _load)
@@ -117,7 +117,7 @@ async def test_no_opinion_on_thin_history(monkeypatch):
     from app.data import markets
     from app.domain.indicators import Candle
 
-    async def _load(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _load(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return [Candle(1.0, 1.0, 1.0, 1.0, 10.0)] * 5
 
     monkeypatch.setattr(markets, "load_candles", _load)

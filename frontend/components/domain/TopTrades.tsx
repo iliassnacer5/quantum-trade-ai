@@ -49,6 +49,26 @@ const LAYER_TITLES: Record<string, string> = {
 };
 
 /** Score de fiabilité -5..+5 sous forme de pastille lisible. */
+/**
+ * « (il y a 12 s) » à côté des refus de l'auto-entrée.
+ *
+ * Un refus sans date est invérifiable. C'est ce qui a permis à « déjà 2 positions ouvertes
+ * exposées à USDT » de rester affiché après une remise à zéro du portefeuille, en contradiction
+ * avec Paper Trading qui n'affichait plus aucune position : le rapport n'était réécrit que
+ * lorsqu'un passage avait des setups prêts, donc il pouvait dater de plusieurs heures.
+ * Le backend le réécrit désormais à chaque passage ; l'afficher rend la fraîcheur vérifiable.
+ */
+function ageLabel(iso?: string | null): string {
+  if (!iso) return '';
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return '';
+  const s = Math.max(0, Math.round((Date.now() - at.getTime()) / 1000));
+  if (s < 60) return ` (il y a ${s} s)`;
+  if (s < 3600) return ` (il y a ${Math.floor(s / 60)} min)`;
+  if (s < 86400) return ` (il y a ${Math.floor(s / 3600)} h)`;
+  return ` (il y a ${Math.floor(s / 86400)} j)`;
+}
+
 function ScoreBadge({ score, label }: { score: number; label?: string }) {
   const tone =
     score > 0 ? 'bg-buy/15 text-buy' : score < 0 ? 'bg-sell/15 text-sell' : 'bg-border text-muted';
@@ -227,10 +247,21 @@ function TradeCard({ trade, rank, autoEntry }: { trade: PlaybookTrade; rank: num
             ✅ EXÉCUTABLE — déclencheur 15 min actif
           </span>
         ) : (
-          <span className="rounded bg-yellow-500/15 px-2 py-0.5 text-[10px] font-bold text-yellow-300">
-            {autoEntry
-              ? '🟡 ARMÉ — entrée AUTOMATIQUE dès le déclencheur 15 min'
-              : '🟡 ARMÉ — contexte validé, en attente du déclencheur 15 min'}
+          /*
+            MARCHÉ FERMÉ : on n'annonce PAS une entrée automatique. L'analyse tourne bien sur tous
+            les marchés en permanence — c'est voulu, on arrive préparé à l'ouverture — mais
+            promettre « la position s'ouvrira toute seule » sur une action un samedi est faux : le
+            garde-fou d'heures de marché l'en empêchera. Seule la crypto cote 24 h/24.
+          */
+          <span className={`rounded px-2 py-0.5 text-[10px] font-bold ${
+            trade.tradable_now === false
+              ? 'bg-border text-muted'
+              : 'bg-yellow-500/15 text-yellow-300'}`}>
+            {trade.tradable_now === false
+              ? '🕒 ANALYSE SEULE — marché fermé, aucune ouverture'
+              : autoEntry
+                ? '🟡 ARMÉ — entrée AUTOMATIQUE dès le déclencheur 15 min'
+                : '🟡 ARMÉ — contexte validé, en attente du déclencheur 15 min'}
           </span>
         )}
         {trade.edge && trade.edge.trades > 0 && (
@@ -270,12 +301,19 @@ function TradeCard({ trade, rank, autoEntry }: { trade: PlaybookTrade; rank: num
         <p className="mt-3 text-xs text-muted">
           Les étapes 1 à 3 sont validées (mensuel + journalier, puis 4 h). L&apos;entrée ne se prend
           qu&apos;en 15 min : {trade.reasons[0] ?? 'déclencheur non formé'}.
-          {autoEntry && (
+          {trade.tradable_now === false ? (
+            <> <span className="text-muted">
+              Ce marché est fermé ({trade.market_status}) : la stratégie continue de l&apos;analyser
+              — c&apos;est ainsi qu&apos;on arrive préparé à l&apos;ouverture — mais <b>aucune
+              position ne sera ouverte</b> avant la réouverture, même si le déclencheur se forme.
+              Les bougies servies hors séance sont celles de la dernière cotation.
+            </span></>
+          ) : autoEntry ? (
             <> <span className="text-yellow-300">
               Tu n&apos;as rien à faire : la position s&apos;ouvrira toute seule en démo à la seconde
               où le déclencheur se formera.
             </span></>
-          )}
+          ) : null}
         </p>
       )}
 
@@ -415,7 +453,9 @@ function AutoEntryBanner({ status, onReset }: { status: AutoEntryStatus; onReset
       </div>
       <p className="mt-0.5 text-[11px] text-muted">
         Tu n&apos;as rien à cliquer : dès qu&apos;un setup armé voit son déclencheur 15 min se former,
-        la position est ouverte automatiquement avec son stop et son objectif. Aucun argent réel
+        la position est ouverte automatiquement avec son stop et son objectif — <b>à condition que
+        son marché soit ouvert</b>. La crypto cote 24 h/24 ; les actions, indices, forex et métaux
+        sont analysés en permanence mais ne s&apos;ouvrent qu&apos;en séance. Aucun argent réel
         n&apos;est engagé.
       </p>
       <p className="mt-0.5 text-[11px] text-muted">
@@ -426,10 +466,30 @@ function AutoEntryBanner({ status, onReset }: { status: AutoEntryStatus; onReset
           ? ` Un même symbole/sens ne se reprend pas avant ${status.cooldown_min} min (anti-doublon).`
           : ''}
       </p>
+      {/*
+        « Sous surveillance » ne veut pas dire la même chose selon l'état du marché. Sur une place
+        ouverte, le robot ouvrira dès le déclencheur ; sur une place fermée, il ne fait qu'analyser
+        — le garde-fou d'heures de marché l'en empêchera. Les mélanger dans une même liste laissait
+        croire qu'une position allait partir sur MSFT un samedi.
+      */}
       {status.watching.length > 0 && (
-        <p className="mt-1 text-[11px] text-muted">
-          Sous surveillance : {status.watching.map((w) => `${w.symbol} ${w.direction}`).join(' · ')}
-        </p>
+        <>
+          {status.watching.some((w) => w.tradable_now !== false) && (
+            <p className="mt-1 text-[11px] text-muted">
+              Sous surveillance : {status.watching.filter((w) => w.tradable_now !== false)
+                .map((w) => `${w.symbol} ${w.direction}`).join(' · ')}
+            </p>
+          )}
+          {status.watching.some((w) => w.tradable_now === false) && (
+            <p className="mt-1 text-[11px] text-muted">
+              🕒 Analysés seulement, marché fermé — aucune ouverture avant la réouverture :{' '}
+              <span className="text-white/70">
+                {status.watching.filter((w) => w.tradable_now === false)
+                  .map((w) => `${w.symbol} ${w.direction}`).join(' · ')}
+              </span>
+            </p>
+          )}
+        </>
       )}
       {/* Exécutable à l'écran mais refusé au dernier passage : sans cette ligne, ça ressemble à
           une panne du robot alors qu'un garde-fou (portefeuille, corrélation, anti-doublon) a
@@ -437,7 +497,7 @@ function AutoEntryBanner({ status, onReset }: { status: AutoEntryStatus; onReset
       {(status.blocked?.length ?? 0) > 0 && (
         <div className="mt-1.5 rounded border border-warn/30 bg-warn-soft/20 px-2 py-1.5">
           <p className="text-[11px] font-medium text-white/85">
-            Prêt(s) mais non ouvert(s) au dernier passage :
+            Prêt(s) mais non ouvert(s) au dernier passage{ageLabel(status.last_run_at)} :
           </p>
           <ul className="mt-0.5 space-y-0.5 text-[11px] text-muted">
             {status.blocked!.map((b, i) => (
@@ -569,6 +629,13 @@ export function TopTrades() {
           <p className="text-xs text-muted">
             {data.scanned} symbole(s) passés à la stratégie · {data.ready} exécutable(s) maintenant
             {data.armed != null && <> · {data.armed} armé(s)</>}
+            {/* « 1 armé » sur un marché fermé laissait croire qu'une position allait s'ouvrir.
+                On dit combien attendent en réalité la réouverture de leur place. */}
+            {(data.armed_market_closed ?? 0) > 0 && (
+              <> · <span className="text-white/70">
+                {data.armed_market_closed} en analyse seule (marché fermé)
+              </span></>
+            )}
           </p>
           {data.picks.length === 0 ? (
             <div className="rounded-xl border border-border bg-surface p-6 text-muted">{data.note}</div>

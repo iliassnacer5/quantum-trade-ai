@@ -219,15 +219,33 @@ export default function BacktestPage() {
               tone={m.total_pnl >= 0 ? 'buy' : 'sell'}
             />
             <Kpi label="Trades" value={`${m.total_trades}`} />
+            {/*
+              « — » et non « 0 » quand la mesure n'existe pas : sans aucun trade, il n'y a ni taux
+              de réussite, ni profit factor, ni Sharpe. Afficher zéro laissait croire à une
+              stratégie mesurée et catastrophique là où rien n'avait été mesuré.
+              Un profit factor nul AVEC des trades signifie l'inverse : aucune perte, donc ∞.
+            */}
             <Kpi
               label="Taux de réussite"
-              value={`${(m.win_rate * 100).toFixed(1)} %`}
+              value={m.win_rate == null ? '—' : `${(m.win_rate * 100).toFixed(1)} %`}
               help="Seul, ce chiffre ne dit rien : il doit se lire avec le profit factor."
             />
             <Kpi
               label="Profit factor"
-              value={m.profit_factor.toFixed(2)}
-              tone={m.profit_factor >= 1.5 ? 'buy' : m.profit_factor < 1 ? 'sell' : undefined}
+              value={
+                m.total_trades === 0 ? '—' : m.profit_factor == null ? '∞' : m.profit_factor.toFixed(2)
+              }
+              tone={
+                m.profit_factor == null
+                  ? m.total_trades === 0
+                    ? undefined
+                    : 'buy'
+                  : m.profit_factor >= 1.5
+                    ? 'buy'
+                    : m.profit_factor < 1
+                      ? 'sell'
+                      : undefined
+              }
               help="Somme des gains ÷ somme des pertes. Sous 1, la stratégie perd de l'argent."
             />
             <Kpi
@@ -236,7 +254,7 @@ export default function BacktestPage() {
               tone="sell"
               help="Pire perte cumulée depuis un sommet — ce qu'il faut pouvoir encaisser."
             />
-            <Kpi label="Sharpe" value={m.sharpe_ratio.toFixed(2)} />
+            <Kpi label="Sharpe" value={m.sharpe_ratio == null ? '—' : m.sharpe_ratio.toFixed(2)} />
           </div>
 
           <Card className="p-6">

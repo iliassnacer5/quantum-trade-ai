@@ -196,6 +196,10 @@ async def close_order(
     """Clôture manuelle d'une position papier au prix du marché (P&L réalisé immédiat)."""
     try:
         result = await execution_service.close_order_manual(store, user.tenant_id, order_id)
+    except execution_service.MarketDataUnavailable as exc:
+        # 503 et non 404 : la position EXISTE, c'est la cotation qui manque. L'opération est
+        # reportée, pas refusée — et l'interface doit pouvoir le dire dans ces termes.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except execution_service.ExecutionError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     audit.record("execution.order_closed_manual", actor=user.email, tenant_id=user.tenant_id,

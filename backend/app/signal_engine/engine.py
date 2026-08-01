@@ -163,13 +163,20 @@ async def generate_signal(
         metrics["session"] = playbook_setup.session
 
     if decision.direction == Direction.HOLD:
+        # PAS DE TRADE = PAS DE NIVEAUX.
+        #
+        # On recopiait ici le prix courant dans l'entrée, le stop ET l'objectif, avec un R/R de 0 :
+        # la carte annonçait « Entrée 357.4 · Stop 357.4 · TP 357.4 · R/R 1:0 », c'est-à-dire trois
+        # niveaux d'apparence exploitable qui ne veulent rien dire. Le prix du moment reste
+        # disponible dans `metrics["price"]` pour l'affichage — c'est sa place : un prix n'est pas
+        # un plan de trade.
         return SignalCard(
             asset=asset,
             direction=Direction.HOLD,
-            entry=round(entry, 8),
-            stop_loss=round(entry, 8),
-            take_profit_1=round(entry, 8),
-            risk_reward=0.0,
+            entry=None,
+            stop_loss=None,
+            take_profit_1=None,
+            risk_reward=None,
             confidence=decision.confidence,
             timeframe=timeframe,
             rationale=decision.rationale,
@@ -178,7 +185,7 @@ async def generate_signal(
             consensus_pct=decision.consensus,
         )
 
-    # Niveaux : ceux du PLAYBOOK en priorité (stop derrière la structure 15 min, objectif
+    # Niveaux : ceux du PLAYBOOK en priorité (stop sur le niveau qui invalide le scénario, objectif
     # max(2×risque, 100 pips)) — ils ont un sens de marché, contrairement à un multiple d'ATR seul.
     use_pb = (
         playbook_setup is not None

@@ -56,10 +56,13 @@ export function SignalCard({ s }: { s: Signal }) {
   }
 
   // Calculateur de position (math pure, instantané).
-  const riskPerUnit = Math.abs(s.entry - s.stop_loss);
+  // Un signal HOLD n'a plus de niveaux (`null`) : il n'y a alors rien à dimensionner, et `tradable`
+  // reste faux — ce qu'il était déjà, puisqu'il exclut HOLD.
+  const hasLevels = s.entry != null && s.stop_loss != null;
+  const riskPerUnit = hasLevels ? Math.abs(s.entry! - s.stop_loss!) : 0;
   const riskAmount = (capital * riskPct) / 100;
   const size = riskPerUnit > 0 ? riskAmount / riskPerUnit : 0;
-  const positionValue = size * s.entry;
+  const positionValue = s.entry != null ? size * s.entry : 0;
   const tradable = s.direction !== 'HOLD' && riskPerUnit > 0;
 
   // Lance un trade PAPIER à partir de ce signal (symbole + direction + SL/TP + taille calculée).
@@ -112,6 +115,15 @@ export function SignalCard({ s }: { s: Signal }) {
           <span className={`rounded-md px-3 py-1 text-sm font-bold ${badge}`}>{s.direction}</span>
         </div>
       </div>
+      {/*
+        QUAND cette analyse a été produite. Les prédictions sont conservées et réaffichées telles
+        quelles, narration comprise — or celle-ci parle au présent (« Fenêtre actuelle : session
+        asiatique (23:02 UTC) »). Sans date, une analyse de la veille se lit comme celle de
+        l'instant, et la fenêtre de session qu'elle décrit n'est plus celle du marché.
+        Au-delà d'une heure, l'avertissement passe en évidence : le prix a eu le temps de bouger.
+      */}
+      <SignalAge createdAt={s.created_at} />
+
       {/* HOLD utile : montre le biais sous-jacent bloqué + ce qui manque pour valider */}
       {s.direction === 'HOLD' && m.blocked_direction && (
         <div className="mt-2 rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-200">
@@ -132,14 +144,26 @@ export function SignalCard({ s }: { s: Signal }) {
         </div>
       )}
 
-      <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
-        <Field label="Entrée" value={s.entry} />
-        <Field label="Stop-Loss" value={s.stop_loss} className="text-sell" />
-        {tps[0] != null && <Field label="TP 1" value={tps[0]} className="text-buy" />}
-        {tps[1] != null && <Field label="TP 2" value={tps[1]} className="text-buy" />}
-        {tps[2] != null && <Field label="TP 3" value={tps[2]} className="text-buy" />}
-        <Field label="R/R" value={`1 : ${s.risk_reward}`} />
-      </div>
+      {/*
+        Sans niveaux, on ne montre PAS une grille de tirets : on dit pourquoi il n'y en a pas.
+        Auparavant les trois champs affichaient le prix courant et le R/R valait « 1 : 0 » — de
+        quoi prendre une absence de trade pour un trade à risque nul.
+      */}
+      {s.entry == null ? (
+        <p className="mt-4 rounded bg-background/60 p-3 text-xs text-muted">
+          Pas de trade : la méthode ne propose ni entrée, ni stop, ni objectif ici. S&apos;abstenir
+          est une décision à part entière.
+        </p>
+      ) : (
+        <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+          <Field label="Entrée" value={s.entry} />
+          <Field label="Stop-Loss" value={s.stop_loss} className="text-sell" />
+          {tps[0] != null && <Field label="TP 1" value={tps[0]} className="text-buy" />}
+          {tps[1] != null && <Field label="TP 2" value={tps[1]} className="text-buy" />}
+          {tps[2] != null && <Field label="TP 3" value={tps[2]} className="text-buy" />}
+          <Field label="R/R" value={s.risk_reward == null ? null : `1 : ${s.risk_reward}`} />
+        </div>
+      )}
 
       {/* Fiabilité : une SEULE note lisible, de -5 à +5. Aucun score technique brut. */}
       <div className="mt-4 rounded-lg border border-border bg-background/40 px-3 py-2">
@@ -300,11 +324,54 @@ export function SignalCard({ s }: { s: Signal }) {
   );
 }
 
-function Field({ label, value, className = '' }: { label: string; value: string | number; className?: string }) {
+/**
+ * Âge d'une prédiction — « quand cette analyse a-t-elle été faite ? ».
+ *
+ * Les cartes sont persistées et rejouées à l'identique : leur narration décrit la session, les
+ * niveaux et le momentum du MOMENT OÙ ELLE A ÉTÉ CALCULÉE, mais au présent. Une analyse de la
+ * veille annonce donc « Fenêtre actuelle : session asiatique » en pleine séance de Londres.
+ * Afficher l'horodatage lève l'ambiguïté ; au-delà d'une heure on le signale franchement, parce
+ * qu'à cette échelle les niveaux 15 min qui la fondent ne valent plus.
+ */
+function SignalAge({ createdAt }: { createdAt?: string | null }) {
+  if (!createdAt) return null;
+  const at = new Date(createdAt);
+  if (Number.isNaN(at.getTime())) return null;
+
+  const minutes = Math.max(0, Math.round((Date.now() - at.getTime()) / 60000));
+  const stale = minutes >= 60;
+  const ago =
+    minutes < 1 ? "à l'instant"
+      : minutes < 60 ? `il y a ${minutes} min`
+        : minutes < 1440 ? `il y a ${Math.floor(minutes / 60)} h`
+          : `il y a ${Math.floor(minutes / 1440)} j`;
+
+  const stamp = at.toLocaleString('fr-FR', {
+    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+  });
+
+  return (
+    <div
+      className={`mt-2 rounded px-2 py-1 text-[11px] ${
+        stale ? 'bg-yellow-500/10 text-yellow-200' : 'text-muted'
+      }`}
+      title="Les niveaux et la fenêtre de session décrits ci-dessous sont ceux de cet instant-là."
+    >
+      {stale ? '⚠️ ' : '🕒 '}
+      Analyse calculée le {stamp} ({ago})
+      {stale && " — les niveaux et la session décrits sont ceux de ce moment-là, pas de maintenant."}
+    </div>
+  );
+}
+
+function Field({ label, value, className = '' }: { label: string; value: string | number | null; className?: string }) {
+  // « — » quand le niveau n'existe pas. Un signal HOLD ne porte ni entrée, ni stop, ni objectif :
+  // afficher le prix courant à leur place laissait croire à un plan de trade exploitable.
+  const shown = value == null ? '—' : value;
   return (
     <div>
       <div className="text-xs text-muted">{label}</div>
-      <div className={`font-mono ${className}`}>{value}</div>
+      <div className={`font-mono ${value == null ? 'text-muted' : className}`}>{shown}</div>
     </div>
   );
 }

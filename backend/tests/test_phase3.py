@@ -87,7 +87,7 @@ def test_journal_lifecycle(monkeypatch):
 
     # Tendance haussière franche -> signal directionnel garanti (seuls les BUY/SELL créent une
     # entrée journal ; les HOLD ne sont plus enregistrés car sans trade il n'y a rien à apprendre).
-    async def _uptrend(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _uptrend(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         out, p = [], 100.0
         for _ in range(max(limit, 210)):
             p *= 1.004
@@ -139,7 +139,7 @@ def test_journal_shows_playbook_trades_not_just_signals(monkeypatch):
     from app.repositories.store import get_store
     from app.services import journal_service
 
-    async def _flat(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _flat(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return [Candle(100.0, 100.0, 100.0, 100.0, 1000.0)] * 60
 
     monkeypatch.setattr(markets, "load_candles", _flat)
@@ -173,7 +173,7 @@ def test_playbook_entries_exclude_neutral_outcomes(monkeypatch):
     from app.repositories.store import get_store
     from app.services import execution_service, journal_service
 
-    async def _flat(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _flat(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return [Candle(100.0, 100.0, 100.0, 100.0, 1000.0)] * 60
 
     monkeypatch.setattr(markets, "load_candles", _flat)
@@ -199,7 +199,7 @@ def test_reliability_falls_back_to_training_when_only_playbook_trades_exist(monk
     from app.repositories.store import get_store
     from app.services import training_service
 
-    async def _flat(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _flat(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return [Candle(100.0, 100.0, 100.0, 100.0, 1000.0)] * 60
 
     monkeypatch.setattr(markets, "load_candles", _flat)

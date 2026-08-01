@@ -25,9 +25,16 @@ _WINDOW = 60  # bougies minimales requises par l'engine pour calculer les indica
 _MIN_FOLD = _WINDOW + 60  # taille de segment minimale pour produire des trades exploitables
 
 
-def _cap_pf(pf: float) -> float:
-    """Borne le profit factor (peut être infini si aucune perte) pour l'agrégation."""
-    return min(pf, 10.0) if pf != float("inf") else 10.0
+def _cap_pf(pf: float | None) -> float:
+    """Borne le profit factor pour l'agrégation.
+
+    `None` = aucune perte sur le segment (profit factor infini) : on le borne à 10, comme l'ancien
+    `float("inf")`. Cette fonction n'est appelée que sur des segments ayant au moins un trade, donc
+    `None` ne peut pas y signifier « pas de mesure ».
+    """
+    if pf is None or pf == float("inf"):
+        return 10.0
+    return min(pf, 10.0)
 
 
 async def walk_forward(
@@ -87,7 +94,9 @@ async def walk_forward(
             "from": seg[0].timestamp.date().isoformat(),
             "to": seg[-1].timestamp.date().isoformat(),
             "trades": m.total_trades,
-            "win_rate": round(m.win_rate * 100, 1),
+            # Sans trade, le segment n'a pas de taux de réussite : `None` (et `_summarize` l'exclut
+            # déjà de ses moyennes via `trades > 0`).
+            "win_rate": round(m.win_rate * 100, 1) if m.win_rate is not None else None,
             "profit_factor": m.profit_factor,
             "pnl_pct": m.total_pnl_pct,
             "benchmark_pct": report.benchmark_pnl_pct,

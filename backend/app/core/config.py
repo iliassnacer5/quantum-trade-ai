@@ -169,7 +169,12 @@ class Settings(BaseSettings):
     # Aucun clic, jamais d'argent réel : l'auto-entrée ne touche QUE les connexions `paper`.
     playbook_auto_paper_execute: bool = True
     playbook_auto_entry_enabled: bool = True
-    playbook_auto_entry_interval: int = 60      # secondes entre deux vérifications des armés
+    # 30 s (abaissé de 60 le 01/08/2026, à la demande). Chaque passage RECALCULE la stratégie sur
+    # données fraîches pour les seuls setups ARMÉS — jamais tout l'univers : le coût est
+    # proportionnel au nombre de contextes déjà validés, en général un ou deux. Doubler la cadence
+    # divise donc par deux le retard maximal entre la formation d'un déclencheur 15 min et
+    # l'ouverture de la position, pour un surcoût négligeable.
+    playbook_auto_entry_interval: int = 30      # secondes entre deux vérifications des armés
     # Provisionne tout seul le compte démo du tenant (sinon il faut connecter un broker papier à la
     # main). Sûr : un compte papier n'engage aucun argent.
     playbook_auto_entry_autoprovision: bool = True
@@ -322,7 +327,17 @@ class Settings(BaseSettings):
     # elles, relisent l'instantané toutes les 10 s : leur fraîcheur ne dépend pas de ce réglage.
     # Relevé à 240 s depuis que l'univers couvre tout le catalogue : un cycle complet dure plus
     # longtemps, et repartir avant qu'il ne finisse saturerait la machine sans rien rafraîchir.
-    playbook_snapshot_interval: int = 240   # secondes entre deux recalculs complets
+    # 300 s (relevé de 240 le 01/08/2026, sur mesure). Un cycle complet a été chronométré à
+    # 236 s — 88 symboles × 5 unités de temps, dont 290 chargements soumis au régulateur Yahoo.
+    # Annoncer 240 s alors que le calcul en demande 236 ne laissait aucune marge : le moindre
+    # ralentissement faisait déborder le cycle sur le suivant, et l'âge affiché grimpait sans
+    # qu'aucune anomalie ne soit visible. Mieux vaut une cadence honnête qu'une cadence tenue de
+    # justesse.
+    #
+    # Cela ne retarde AUCUNE entrée : l'auto-entrée revérifie les setups armés toutes les 60 s en
+    # recalculant la stratégie sur données fraîches. Seule la DÉCOUVERTE d'un contexte nouvellement
+    # validé attend le cycle suivant — or ce contexte s'établit sur des unités de 4 h et 1 j.
+    playbook_snapshot_interval: int = 300   # secondes entre deux recalculs complets
     playbook_snapshot_max_age: int = 900    # au-delà, le snapshot est signalé comme périmé
 
     # --- ANALYSE QUOTIDIENNE DES MARCHÉS, HORS STRATÉGIE ----------------------------------------
@@ -482,6 +497,52 @@ class Settings(BaseSettings):
     # Cache court des bougies (`data.markets.load_candles`), en secondes. Même valeur que le cache de
     # `data.ohlcv` : un seul chiffre à régler pour toute la fraîcheur des données de marché.
     market_cache_ttl: float = 20.0
+    # CACHE PROPORTIONNEL À L'UNITÉ DE TEMPS (`data.markets._ttl_for`).
+    #
+    # `market_cache_ttl` s'appliquait à TOUTES les unités de temps : une bougie JOURNALIÈRE était
+    # redemandée toutes les 20 s alors qu'elle ne se referme qu'une fois par jour. C'est ce
+    # gaspillage qui portait le balayage (84 symboles × 5 UT = 420 requêtes / 240 s) au-delà de ce
+    # que le point d'accès Yahoo public tolère — d'où les HTTP 429 et les « données indisponibles ».
+    #
+    # Multiplicateur appliqué à la DURÉE DE LA BOUGIE, borné par `market_cache_ttl_max`. À 1/60e,
+    # une bougie 1 j est gardée 24 min et une 1 h 60 s : dans les deux cas très en dessous de la
+    # durée de la bougie, donc l'apparition d'une NOUVELLE bougie ne peut pas passer inaperçue.
+    # `market_cache_ttl` reste le plancher — aucune unité n'est cachée moins longtemps qu'avant.
+    # 1/20e (relevé de 1/60e le 01/08/2026, sur mesure). À 1/60e, la bougie 4 h était cachée
+    # exactement 240 s — la durée d'un cycle d'instantané — donc rechargée à CHAQUE passage pour
+    # une valeur qui ne change que toutes les quatre heures. Avec 290 des 440 chargements d'un
+    # cycle passant par le régulateur Yahoo (1 req/s), cela portait le cycle à ~236 s pour un
+    # intervalle de 240 s : le balayage n'arrivait plus à suivre sa propre cadence.
+    #
+    # À 1/20e : 15 min -> 45 s · 1 h -> 180 s · 4 h -> 720 s · 1 j -> 30 min (plafond).
+    # Chaque durée reste très inférieure à la bougie elle-même (5 %), donc aucune nouvelle bougie
+    # ne peut être masquée — la propriété vérifiée par
+    # `test_cache_duration_never_hides_a_new_candle`. Et aucune DÉCISION ne lit ce cache : les
+    # chemins qui engagent de l'argent passent par `fresh=True`.
+    market_cache_ttl_ratio: float = 1 / 20
+    market_cache_ttl_max: float = 1800.0
+    # Débit maximal vers Yahoo, en requêtes par seconde (0 = pas de régulation). Mesuré le
+    # 01/08/2026 : en rafale, 0/12 requêtes aboutissent (429 systématique) ; espacées de 1,5 s,
+    # 17/17 aboutissent, toutes classes d'actifs confondues. On s'auto-limite donc au lieu de se
+    # faire refuser. Ne s'applique JAMAIS aux lectures `fresh=True` (cf. `data.markets`).
+    yahoo_max_rps: float = 1.0
+
+    # ---- Sources complémentaires (01/08/2026) ----
+    # TWELVE DATA — FILET DE SÉCURITÉ pour les bougies, jamais une source primaire.
+    #
+    # Mesuré sur le plan gratuit : forex, crypto, actions et XAU/USD sont servis correctement en
+    # 15min / 1h / 1day, mais le quota est de ~8 REQUÊTES PAR MINUTE (« You have run out of API
+    # credits for the current minute »). Le balayage en demande 420 par cycle : en faire une source
+    # primaire l'épuiserait en quelques secondes et priverait de données les chemins qui en ont
+    # vraiment besoin. Il n'est donc interrogé que lorsque TOUS les autres fournisseurs ont échoué.
+    # XAG/USD et les indices exigent un plan payant — inutile de les lui demander.
+    twelve_data_api_key: str = ""
+    twelve_data_max_rpm: float = 8.0
+    # FINNHUB — la clé vit plus bas avec les autres sources de news (`finnhub_api_key`), le
+    # connecteur `data/news.py` l'utilise déjà. Seul le secret manquait.
+    # NEWS UNIQUEMENT : `/stock/candle` répond 403 sur le plan gratuit (bougies réservées au plan
+    # payant), alors que les actualités sont riches et fiables (247 articles mesurés sur AAPL).
+    finnhub_api_secret: str = ""
 
     # JWT
     jwt_algorithm: str = "HS256"

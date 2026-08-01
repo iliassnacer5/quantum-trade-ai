@@ -32,7 +32,7 @@ def _rows(start_ts: int, prices: list[tuple[float, float]], step: int = 900) -> 
 
 
 def _patch_source(monkeypatch, rows: list[dict], real: bool = True) -> None:
-    async def _fake(symbol, interval="15m", limit=500):  # noqa: ANN001
+    async def _fake(symbol, interval="15m", limit=500, **kw):  # noqa: ANN001
         return {"candles": rows, "source": "real" if real else "unavailable", "real": real,
                 "note": ""}
     monkeypatch.setattr(replay._ohlcv, "get_ohlcv_with_source", _fake)

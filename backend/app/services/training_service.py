@@ -489,6 +489,20 @@ async def run_training(store, *, symbols: list[dict] | None = None, write_expert
     """
     global _STATE
 
+    # JAMAIS EN MÊME TEMPS QU'UN BACKTEST.
+    #
+    # Les deux rejouent l'historique de tout l'univers et puisent au même quota de fournisseurs.
+    # Mesuré le 01/08/2026 en les lançant ensemble : 741 échecs de chargement en quinze minutes,
+    # 18 symboles écartés en trois. Chacun pris isolément fonctionne ; ensemble, ils s'affament.
+    # Sur une exploitation continue, mieux vaut différer d'une nuit que produire une mesure fausse.
+    from app.backtest import playbook_backtest as _pbt
+
+    if _pbt.run_state().get("running"):
+        logger.warning("Entraînement différé : un backtest est en cours (quota partagé)")
+        return {"trained": False, "deferred": True,
+                "note": ("Entraînement différé : un backtest complet est en cours et les deux "
+                         "puisent au même quota de fournisseurs. Relance après sa fin.")}
+
     s = get_settings()
     started = datetime.now(UTC)
     universe = symbols or training_universe(s.playbook_training_symbols)
@@ -530,6 +544,34 @@ async def run_training(store, *, symbols: list[dict] | None = None, write_expert
     }
     if write_expertise:
         payload["expertise"] = await build_expertise(payload)
+
+    # UN ENTRAÎNEMENT DÉGRADÉ N'ÉCRASE PAS UN BON.
+    #
+    # L'entraînement écarte les symboles dont les données ne sont pas réelles — c'est la bonne
+    # règle, elle empêche d'apprendre sur du bruit. Mais un passage qui n'en garde que deux sur
+    # vingt (fournisseur limité en débit, panne réseau, backtest concurrent qui consomme le même
+    # quota) produisait quand même un instantané, et il REMPLAÇAIT le précédent. Mesuré le
+    # 01/08/2026 : lancé pendant un backtest, un passage écartait 18 symboles en trois minutes.
+    #
+    # Sur une exploitation de plusieurs semaines sans surveillance, une seule mauvaise nuit
+    # effacerait ainsi des semaines d'apprentissage. On conserve donc le meilleur des deux : le
+    # nouveau n'est publié que s'il couvre au moins la moitié des symboles du précédent. Le
+    # résultat dégradé reste rendu à l'appelant et journalisé — il est visible, simplement pas
+    # promu en référence.
+    precedent = _STATE or (store.records.get(COLLECTION, LATEST) or {})
+    couverture_avant = int(precedent.get("symbols_trained") or 0)
+    couverture = payload["symbols_trained"]
+    if couverture_avant and couverture * 2 < couverture_avant:
+        payload["superseded"] = False
+        payload["note"] = (
+            f"Entraînement NON publié : {couverture} symbole(s) mesuré(s) contre "
+            f"{couverture_avant} au passage précédent. Un passage dégradé (fournisseur limité, "
+            f"panne réseau) ne remplace pas un entraînement plus complet — l'apprentissage des "
+            f"agents est conservé."
+        )
+        logger.warning("Entraînement dégradé non publié : %d symboles contre %d précédemment",
+                       couverture, couverture_avant)
+        return payload
 
     _STATE = payload
     try:

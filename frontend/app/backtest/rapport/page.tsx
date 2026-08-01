@@ -357,15 +357,42 @@ export default function BacktestReportPage() {
           <p className="text-sm font-semibold text-accent">
             ⏳ Backtest en cours — {report.run_state.phase ?? 'préparation'}
           </p>
-          <p className="mt-0.5 text-[11px] text-muted">
+          {/*
+            AVANCEMENT RÉEL. Le compteur restait figé à « 0/88 » du début à la fin d'une passe
+            (`_set_phase` n'était appelé qu'une fois, avec done=0) : sur un calcul de plusieurs
+            minutes, c'est indiscernable d'un plantage. Le backend l'incrémente désormais à chaque
+            symbole terminé — autant le montrer.
+          */}
+          {(report.run_state.total ?? 0) > 0 && (
+            <div className="mt-2">
+              <div className="flex items-center justify-between text-[11px] text-muted">
+                <span>
+                  {report.run_state.done ?? 0} / {report.run_state.total} symboles évalués
+                </span>
+                <span>
+                  {Math.round(((report.run_state.done ?? 0) / report.run_state.total) * 100)} %
+                </span>
+              </div>
+              <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-border">
+                <div
+                  className="h-full rounded bg-accent transition-all"
+                  style={{
+                    width: `${Math.min(100, Math.round(((report.run_state.done ?? 0) / report.run_state.total) * 100))}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          <p className="mt-2 text-[11px] text-muted">
             Démarré il y a {Math.round(report.run_state.elapsed_s ?? 0)} s. Le calcul tourne côté
             serveur, en arrière-plan : tu peux quitter cette page, il continuera. Elle se met à jour
             toute seule toutes les 5 secondes.
           </p>
           <p className="mt-1 text-[11px] text-muted">
-            Un backtest complet (14 paires × 2 passes × 2 ans d&apos;historique) prend une dizaine
-            de minutes. Les chiffres affichés ci-dessous restent ceux du passage précédent tant
-            qu&apos;il n&apos;est pas terminé.
+            Un backtest complet (tout le catalogue × 3 passes — longue, portée 1 h, fidélité 15 min)
+            prend une dizaine de minutes, davantage quand les fournisseurs limitent leur débit. Les
+            chiffres affichés ci-dessous restent ceux du passage précédent tant qu&apos;il n&apos;est
+            pas terminé.
           </p>
         </Card>
       )}

@@ -64,14 +64,30 @@ def _in_window(start: float, end: float, h: float) -> bool:
 
 
 def current_sessions(now: datetime | None = None) -> list[str]:
-    """Sessions actuellement ouvertes (elles se chevauchent)."""
-    h = (now or datetime.now(timezone.utc)).hour
-    return [name for name, s in SESSIONS.items() if _is_open(s["start"], s["end"], h)]
+    """Sessions actuellement ouvertes (elles se chevauchent).
+
+    LE WEEK-END, AUCUNE PLACE N'EST OUVERTE. Cette fonction ne regardait que l'HEURE : un samedi à
+    13 h, elle annonçait Londres et New York ouvertes, et le chevauchement — la meilleure fenêtre
+    de la semaine — actif. Conséquences concrètes : la bannière affichait des places ouvertes un
+    jour de fermeture, les ordres étaient enregistrés avec `session_window = overlap`, et l'étape 7
+    de la stratégie (« le moment de la journée ») accordait un bonus de conviction pour une fenêtre
+    qui n'existait pas.
+    """
+    now = now or datetime.now(timezone.utc)
+    if is_weekend(now):
+        return []
+    return [name for name, s in SESSIONS.items() if _is_open(s["start"], s["end"], now.hour)]
 
 
 def active_kill_zones(now: datetime | None = None) -> list[dict]:
-    """Fenêtres à forte valeur actuellement actives (ouverture Londres/NY, chevauchement)."""
+    """Fenêtres à forte valeur actuellement actives (ouverture Londres/NY, chevauchement).
+
+    Vide le week-end, pour la même raison que `current_sessions` : une fenêtre à forte valeur
+    tire sa valeur du volume institutionnel, qui est absent quand les places sont fermées.
+    """
     now = now or datetime.now(timezone.utc)
+    if is_weekend(now):
+        return []
     h = now.hour + now.minute / 60
     return [z for z in KILL_ZONES if _in_window(z["start"], z["end"], h)]
 
@@ -113,6 +129,30 @@ def can_trade(now: datetime | None = None) -> tuple[bool, str]:
         return False, "Londres et New York fermées — analyse seule, aucune ouverture de position"
     labels = " + ".join(SESSIONS[d]["label"] for d in open_desks)
     return True, f"{labels} ouverte(s)"
+
+
+def can_trade_symbol(symbol: str, now: datetime | None = None) -> tuple[bool, str]:
+    """Peut-on ouvrir une position SUR CE SYMBOLE maintenant ?
+
+    `can_trade()` répond pour le desk entier : Londres ou New York doit être ouverte. C'est la
+    bonne règle pour le forex, les actions, les indices et les métaux — mais pas pour la CRYPTO,
+    qui cote 24 h/24 et 7 j/7. Appliquer la grille des places boursières à BTC/USDT reviendrait à
+    refuser un marché réellement ouvert, avec des bougies réellement fraîches.
+
+    À l'inverse, ouvrir GER40 ou AAPL un samedi est exactement le piège à éviter : les
+    fournisseurs continuent de servir la DERNIÈRE bougie disponible — celle de vendredi. Elle a
+    toutes les apparences d'une donnée réelle, parce qu'elle l'est ; elle n'est simplement plus
+    d'actualité. Le moteur poserait un stop et un objectif sur un marché à l'arrêt.
+
+    Retourne (autorisé, motif). Le motif est journalisé et affiché : un refus doit toujours pouvoir
+    s'expliquer.
+    """
+    from app.data import markets  # importé ici : `markets` dépend déjà de ce module
+
+    if markets.asset_class(symbol) == "crypto":
+        return True, "crypto — marché ouvert en continu (24 h/24, 7 j/7)"
+    ok, why = can_trade(now)
+    return ok, why
 
 
 def session_context(now: datetime | None = None) -> dict:

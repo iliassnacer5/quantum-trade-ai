@@ -231,7 +231,7 @@ async def test_backtest_symbol_accepts_overriding_a_base_kwarg(monkeypatch):
 
     lengths = {"1h": 900, "15m": 900, "4h": 400, "1d": 300, "1M": 60}
 
-    async def _fake_series(symbol, interval, limit):  # noqa: ANN001
+    async def _fake_series(symbol, interval, limit, **kw):  # noqa: ANN001
         step = pbt._INTERVAL_SECONDS.get(interval, 3600)
         end = datetime.now(UTC)
         out = series(lengths.get(interval, 300))
@@ -301,7 +301,7 @@ def flat_market(monkeypatch):
 
     candles = [Candle(1.1, 1.1, 1.1, 1.1, 10.0) for _ in range(60)]
 
-    async def _load(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _load(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return candles
 
     monkeypatch.setattr(markets, "load_candles", _load)
@@ -388,6 +388,42 @@ async def test_correlation_guard_blocks_a_third_euro_position(flat_market):
         assert len(ok["opened"]) == 1
     finally:
         s.correlation_guard_enabled = False
+
+
+async def test_correlation_guard_does_not_apply_to_crypto(flat_market):
+    """La garde ne vaut QUE pour le change : USDT est une unité de compte, pas un pari.
+
+    Elle découpait tout symbole contenant un « / », donc aussi les paires crypto : BTC/USDT et
+    ETH/USDT comptaient comme « deux positions exposées à USDT » et la troisième paire crypto —
+    quelle qu'elle soit — était refusée. Le portefeuille crypto se trouvait ainsi plafonné à deux
+    positions, tous actifs confondus, pour une corrélation qui n'existe pas par la devise de
+    cotation.
+    """
+    store = get_store()
+    s = get_settings()
+    s.correlation_guard_enabled = True
+    try:
+        user = _user(store, "corr-crypto@test.com")
+        for i, sym in enumerate(("BTC/USDT", "ETH/USDT")):
+            store.records.put("order", f"crypto-{i}", {
+                "mode": "paper", "symbol": sym, "side": "buy", "outcome": "open",
+            }, tenant_id=user.tenant_id)
+        report = await execution_service.execute_playbook_trades(
+            store, user.tenant_id, count=1, picks=[_pick("SUI/USDT")],
+        )
+        assert len(report["opened"]) == 1, (
+            "une 3e paire crypto ne doit pas être refusée pour « exposition à USDT »"
+        )
+    finally:
+        s.correlation_guard_enabled = False
+
+
+def test_currencies_are_read_only_for_forex_pairs():
+    """`_currencies` ne découpe que les paires de CHANGE — c'est ce qui borne la garde."""
+    assert execution_service._currencies("EUR/USD") == {"EUR", "USD"}   # noqa: SLF001
+    assert execution_service._currencies("BTC/USDT") == set()           # noqa: SLF001
+    assert execution_service._currencies("SUI/USDT") == set()           # noqa: SLF001
+    assert execution_service._currencies("AAPL") == set()               # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------------------

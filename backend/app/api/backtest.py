@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.backtest.engine import run_backtest
 from app.backtest.schemas import BacktestConfig, BacktestReport
+from app.core.config import get_settings
 from app.core.deps import current_user, store_dep
 from app.core.plans import require_feature
 from app.data.ohlcv import get_ohlcv
@@ -292,7 +293,19 @@ async def playbook_volume_ab_run(
 
 
 async def _load_history(symbol: str, timeframe: str, limit: int = 500) -> list[Candle]:
-    """Charge l'historique OHLCV horodaté ; repli synthétique si indisponible."""
+    """Charge l'historique OHLCV horodaté — RÉEL, ou rien.
+
+    Le repli synthétique qui vivait ici a été retiré : quand le fournisseur ne répondait pas, cette
+    fonction fabriquait `limit` bougies déterministes et le backtest rendait ensuite un rapport
+    complet (taux de réussite, profit factor, courbe d'équité) calculé sur des prix que le marché
+    n'a jamais cotés — sans que rien, dans la réponse, ne le signale. C'est exactement ce que le
+    projet interdit partout ailleurs (`data_allow_synthetic`, `false` par défaut) : une mesure
+    inventée est pire qu'une absence de mesure, parce qu'elle a l'apparence d'une mesure.
+
+    Une série vide remonte donc telle quelle, et l'appelant refuse le backtest (HTTP 503) au lieu
+    d'en inventer un. `data_allow_synthetic=true` reste honoré pour les environnements de
+    démonstration hors-ligne, et le rapport porte alors sa source.
+    """
     try:
         rows = await get_ohlcv(symbol, interval=timeframe, limit=limit)
         if len(rows) >= 100:
@@ -304,8 +317,12 @@ async def _load_history(symbol: str, timeframe: str, limit: int = 500) -> list[C
                 )
                 for r in rows
             ]
+        logger.warning("Historique %s (%s) trop court : %d bougies", symbol, timeframe, len(rows))
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Historique %s indisponible (%s), repli synthétique", symbol, exc)
+        logger.warning("Historique %s indisponible (%s)", symbol, exc)
+
+    if not get_settings().data_allow_synthetic:
+        return []
 
     step = _STEP.get(timeframe, 3600)
     base = datetime.now(UTC) - timedelta(seconds=step * limit)
@@ -322,6 +339,15 @@ async def run(
     store: AppStore = Depends(store_dep),
 ) -> BacktestReport:
     candles = await _load_history(config.symbol, config.timeframe)
+    if not candles:
+        # Donnée ABSENTE, pas donnée nulle : 503 « réessayer plus tard » et non 400 « ta requête est
+        # mauvaise ». La distinction compte pour l'interface, qui doit afficher « indisponible » et
+        # non « 0 % de réussite ».
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Données de marché indisponibles pour {config.symbol} en {config.timeframe} — "
+            "backtest impossible. Aucun résultat n'est inventé : réessaie quand la source répond.",
+        )
     if len(candles) < 100:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Historique insuffisant pour le backtest")
     try:

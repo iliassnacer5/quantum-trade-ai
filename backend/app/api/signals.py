@@ -135,7 +135,13 @@ async def auto_entry_status(
     snap = live_snapshot.current() or {}
     watching = [
         {"symbol": p["symbol"], "direction": p.get("direction"), "tier": p.get("tier"),
-         "reason": (p.get("reasons") or [""])[0]}
+         "reason": (p.get("reasons") or [""])[0],
+         # État du marché de CE symbole : « sous surveillance » ne veut pas dire la même chose
+         # selon que la place est ouverte (le robot ouvrira) ou fermée (il analyse seulement).
+         # Sans cette distinction, la liste laisse croire qu'une position va partir alors que le
+         # garde-fou d'heures de marché l'en empêchera.
+         "tradable_now": p.get("tradable_now", True),
+         "market_status": p.get("market_status")}
         for p in (snap.get("picks") or []) if p.get("tier") in ("ready", "armed")
     ]
     return {
@@ -153,6 +159,13 @@ async def auto_entry_status(
         # compte (garde-fou de portefeuille, corrélation, anti-doublon…) — sans ce champ, un refus
         # légitime est indiscernable d'une panne du robot.
         "blocked": auto_entry_service.blocked_for(store, user.tenant_id),
+        # QUAND ce passage a eu lieu. Un refus sans date est invérifiable : c'est ce qui a permis à
+        # un « déjà 2 positions ouvertes » de rester affiché après la remise à zéro du portefeuille,
+        # en contradiction avec Paper Trading qui montrait zéro position.
+        "last_run_at": auto_entry_service.last_run_at(store),
+        # Setups écartés parce que LEUR MARCHÉ EST FERMÉ (week-end, hors Londres/New York). Champ
+        # distinct de `blocked` : ce refus ne dépend pas du compte mais de l'état du marché.
+        "market_closed": auto_entry_service.market_closed_now(store),
         "note": (
             "Les setups armés sont ouverts automatiquement en COMPTE DÉMO dès que le déclencheur "
             "15 min se forme. Aucun clic, aucun argent réel."

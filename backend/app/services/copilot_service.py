@@ -217,16 +217,25 @@ async def _ctx_should_i_trade(user: User, store: AppStore, symbol: str) -> tuple
         f"  - {'✅' if c['pass'] else '❌'} {c['label']} : {c['value']}" for c in verify["checks"]
     )
     bt = verify.get("backtest")
+    # `None` = non mesuré (aucun trade) ou infini (aucune perte) — jamais « 0 ». Écrire « 0 % de
+    # réussite » là où rien n'a été mesuré donnerait au copilote un argument faux à répéter.
     bt_txt = (
-        f"Backtest : {bt['win_rate']}% de réussite, profit factor {bt['profit_factor']}, "
+        f"Backtest : {'non mesurable' if bt['win_rate'] is None else str(bt['win_rate']) + '%'} "
+        f"de réussite, profit factor "
+        f"{'∞ (aucun perdant)' if bt['profit_factor'] is None else bt['profit_factor']}, "
         f"{bt['trades']} trades."
         if bt else "Backtest indisponible (données insuffisantes)."
     )
 
+    # « — » quand il n'y a pas de trade : la carte HOLD ne porte plus de niveaux (cf. SignalCard).
+    def _lvl(value: float | None) -> str:
+        return "—" if value is None else str(value)
+
     context_text = (
         f"Décision demandée sur {symbol}.\n"
-        f"Signal : {s['direction']} (confiance {s['confidence']}%) — entrée {s['entry']}, "
-        f"stop {s['stop_loss']}, TP1 {s['take_profit_1']}, R/R {card.risk_reward}.\n"
+        f"Signal : {s['direction']} (confiance {s['confidence']}%) — entrée {_lvl(s['entry'])}, "
+        f"stop {_lvl(s['stop_loss'])}, TP1 {_lvl(s['take_profit_1'])}, "
+        f"R/R {_lvl(card.risk_reward)}.\n"
         f"Verdict checklist : {verdict_label} ({verify['passed']}/{verify['total']} critères).\n"
         f"{bt_txt}\nCritères :\n{checks_txt}\n"
         f"Moteurs principaux : {drivers}."
@@ -236,8 +245,12 @@ async def _ctx_should_i_trade(user: User, store: AppStore, symbol: str) -> tuple
         f"Dois-je trader {symbol} ? (unité de temps : {tf}) → {verdict_label}\n"
         f"Direction du signal : {s['direction']} (confiance {s['confidence']}%).\n"
         f"Critères validés : {verify['passed']}/{verify['total']}.\n{bt_txt}\n"
-        f"Si tu prends le trade : entrée {s['entry']}, stop {s['stop_loss']}, objectif {s['take_profit_1']} "
-        f"(R/R {card.risk_reward}).\nMoteurs : {drivers}.\n{_DISCLAIMER}"
+        + (f"Si tu prends le trade : entrée {_lvl(s['entry'])}, stop {_lvl(s['stop_loss'])}, "
+           f"objectif {_lvl(s['take_profit_1'])} (R/R {_lvl(card.risk_reward)}).\n"
+           if s["entry"] is not None else
+           "Aucun niveau : la méthode ne propose pas de trade ici, il n'y a donc ni entrée, ni "
+           "stop, ni objectif.\n")
+        + f"Moteurs : {drivers}.\n{_DISCLAIMER}"
     )
     return f"DÉCISION — {symbol} ({tf})", context_text, deterministic
 

@@ -7,12 +7,16 @@ export type Signal = {
   id?: string;
   asset: string;
   direction: 'BUY' | 'SELL' | 'HOLD';
-  entry: number;
-  stop_loss: number;
-  take_profit_1: number;
-  take_profit_2?: number;
-  take_profit_3?: number;
-  risk_reward: number;
+  // `null` = PAS DE TRADE, donc pas de niveaux (direction HOLD : aucun setup, ou setup refusé par
+  // les filtres). On y recopiait le prix courant avec un R/R de 0, ce qui affichait
+  // « Entrée = Stop = TP · R/R 1:0 » — une absence de plan déguisée en plan. Quand `direction` vaut
+  // BUY ou SELL, les quatre champs sont toujours renseignés.
+  entry: number | null;
+  stop_loss: number | null;
+  take_profit_1: number | null;
+  take_profit_2?: number | null;
+  take_profit_3?: number | null;
+  risk_reward: number | null;
   confidence: number;
   timeframe: string;
   rationale: string;
@@ -168,14 +172,20 @@ export type BacktestConfig = {
   use_llm?: boolean;
 };
 
+/**
+ * `null` = INDISPONIBLE, jamais « zéro » (cf. backend `BacktestMetrics`) :
+ * - `total_trades === 0` : sans trade, un taux de réussite ou une espérance n'existent pas ;
+ * - `profit_factor === null` avec `total_trades > 0` : aucune perte, donc profit factor infini.
+ * Les montants restent des nombres : sans trade, ils valent réellement zéro.
+ */
 export type BacktestMetrics = {
   total_trades: number;
-  win_rate: number;
-  profit_factor: number;
+  win_rate: number | null;
+  profit_factor: number | null;
   total_pnl: number;
   total_pnl_pct: number;
   max_drawdown_pct: number;
-  sharpe_ratio: number;
+  sharpe_ratio: number | null;
 };
 
 export type BacktestReport = {
@@ -252,7 +262,10 @@ export type WalkForward = {
   symbol: string; timeframe: string; strategy_id?: string | null; total_trades: number; folds_evaluated: number;
   profitable_folds: number; beats_hold_folds?: number; consistency: number; avg_win_rate: number; avg_profit_factor: number;
   avg_pnl_pct: number; avg_alpha_pct?: number; data_real: boolean; verdict: string; label: string;
-  folds: { fold: number; from: string; to: string; trades: number; win_rate: number; profit_factor: number; pnl_pct: number; alpha_pct?: number; max_drawdown_pct: number; profitable: boolean; beats_hold?: boolean }[];
+  // `win_rate`/`profit_factor` valent `null` sur un segment sans trade (rien à mesurer) ou sans
+  // perte (profit factor infini) — `trades` distingue les deux. Les moyennes `avg_*` n'agrègent
+  // que les segments ayant produit des trades et restent donc des nombres.
+  folds: { fold: number; from: string; to: string; trades: number; win_rate: number | null; profit_factor: number | null; pnl_pct: number; alpha_pct?: number; max_drawdown_pct: number; profitable: boolean; beats_hold?: boolean }[];
 };
 
 export type TrackRecord = {
@@ -418,6 +431,12 @@ export type PlaybookTrade = {
   symbol: string;
   asset_class: string;
   tier: 'ready' | 'armed';
+  /** Le marché de CE symbole est-il ouvert maintenant ? La crypto cote 24 h/24 ; les actions,
+   *  indices, forex et métaux non. Faux ⇒ la stratégie continue de l'analyser, mais aucune
+   *  position ne sera ouverte — annoncer une entrée automatique serait alors mensonger. */
+  tradable_now?: boolean;
+  /** Motif lisible de l'état du marché (« week-end : marché des changes fermé… »). */
+  market_status?: string;
   direction: 'BUY' | 'SELL' | 'NO_TRADE';
   entry: number | null;
   stop_loss: number | null;
@@ -483,6 +502,16 @@ export type PaperPosition = Order & {
   target_pips?: number | null;
   stop_pips?: number | null;
   close_reason?: string | null; // ce qui a fermé la position (quel stop, quel objectif)
+  // POURQUOI ce trade a été pris — enregistré à l'ouverture, jamais recalculé après coup.
+  // Sans ces champs, une position ouverte automatiquement n'a aucune justification consultable :
+  // on voit le résultat, jamais le raisonnement.
+  trigger?: string | null;        // le déclencheur 15 min, rédigé (« repli sur zone d'or… »)
+  trigger_type?: string | null;   // sa famille : repli · cassure · confluence · divergence
+  session_window?: string | null; // fenêtre de session au moment de l'entrée
+  atr_pct?: number | null;        // volatilité journalière retenue pour dimensionner le stop
+  pair_verdict?: string | null;   // verdict mesuré de la paire au backtest hebdomadaire
+  conviction_mult?: number | null;// multiplicateur de taille issu de ce verdict
+  risk_pct?: number | null;       // % du capital réellement risqué sur ce trade
 };
 
 export type PositionsSnapshot = {
@@ -530,6 +559,10 @@ export type TopTrades = {
   scanned: number;
   ready: number;
   armed?: number;
+  /** Parmi les armés, ceux dont le MARCHÉ EST FERMÉ : analysés et classés, mais non exécutables
+   *  tant que leur place n'a pas ouvert. Les compter à part évite qu'un « 1 armé » laisse croire
+   *  qu'une position va s'ouvrir alors qu'aucune ne le peut. */
+  armed_market_closed?: number;
   /** Plafond demandé, ou la chaîne « tous » quand la sélection n'en a aucun (le cas par défaut). */
   requested: number | string;
   /** Setups conformes à la stratégie, avant le plancher de fiabilité. */
@@ -576,7 +609,16 @@ export type AutoEntryStatus = {
   /** Exécutables à l'écran mais refusés au dernier passage (garde-fou de portefeuille, corrélation,
    *  anti-doublon…) — sans ce champ, un refus légitime ressemble à une panne. */
   blocked?: { symbol: string; reason: string }[];
-  watching: { symbol: string; direction: string; tier: string; reason: string }[];
+  /** Horodatage du dernier passage de veille. Un refus non daté est invérifiable : c'est ce qui a
+   *  laissé « déjà 2 positions ouvertes » à l'écran après une remise à zéro du portefeuille. */
+  last_run_at?: string | null;
+  /** `tradable_now` distingue « le robot ouvrira dès le déclencheur » (marché ouvert) de
+   *  « il analyse seulement » (place fermée). Les confondre laissait croire qu'une position
+   *  allait partir sur une action un samedi. */
+  watching: {
+    symbol: string; direction: string; tier: string; reason: string;
+    tradable_now?: boolean; market_status?: string | null;
+  }[];
   recent: {
     id: string; symbol: string; side: string; entry: number | null;
     stop_loss: number | null; take_profit: number | null; trigger: string | null;

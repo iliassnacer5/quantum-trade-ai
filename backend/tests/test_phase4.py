@@ -121,7 +121,7 @@ def _fake_candles(high: float, low: float):
     On mocke la fonction qui porte la PROVENANCE, pas seulement les bougies : le rejeu refuse de
     conclure sans données réelles, il faut donc lui dire explicitement qu'elles le sont.
     """
-    async def _fake(symbol, interval="15m", limit=500):  # noqa: ANN001
+    async def _fake(symbol, interval="15m", limit=500, **kw):  # noqa: ANN001
         return {
             "candles": [{"time": 2_000_000_000, "open": high, "high": high, "low": low,
                          "close": (high + low) / 2, "volume": 1.0}],

@@ -83,6 +83,15 @@ class ExecutionError(RuntimeError):
     """Erreur métier d'exécution (garde-fou non satisfait, connexion absente…)."""
 
 
+class MarketDataUnavailable(ExecutionError):
+    """Le marché n'est pas cotable en ce moment — l'opération est REPORTÉE, pas refusée.
+
+    Distinguée d'`ExecutionError` parce que l'API doit répondre 503 « réessaie plus tard » et non
+    404 « ordre introuvable ». Une position qu'on ne peut pas clôturer faute de prix n'est pas une
+    position qui n'existe pas : confondre les deux rendait le refus incompréhensible à l'écran.
+    """
+
+
 # ---------------- KYC ----------------
 def kyc_status(store: AppStore, tenant_id: str) -> dict:
     return store.records.get(KYC, tenant_id) or {"status": "none"}
@@ -516,20 +525,36 @@ async def close_order_manual(store: AppStore, tenant_id: str, order_id: str) -> 
     side = rec.get("side")
     from app.core.config import get_settings
 
-    candles = await markets.load_candles(rec["symbol"], interval="15m", limit=5)
+    # ON CLÔTURE AU MÊME PRIX QUE CELUI QUI A REMPLI L'ORDRE ET QUI AFFICHE LE P&L.
+    #
+    # Cette fonction chargeait des bougies 15 MIN, alors que tout le reste du moteur — le
+    # remplissage à l'ouverture, le P&L latent de la page, la sécurisation du stop — passe par
+    # `_reference_price` (1 h). Conséquence observée : quand le fournisseur limitait le débit sur le
+    # 15 min mais servait le 1 h, la position restait parfaitement valorisée à l'écran (« Prix
+    # actuel » à jour, P&L qui bouge) tout en devenant IMPOSSIBLE à clôturer — le bouton renvoyait
+    # une erreur, et rien ne se fermait. Une position qu'on sait valoriser doit pouvoir être fermée.
+    #
+    # `fresh=True` : la clôture inscrit un P&L réalisé, c'est une décision qui engage de l'argent,
+    # pas un affichage — elle ne doit pas lire un prix en cache (cf. `_reference_price`).
+    price = await _reference_price(rec["symbol"], fresh=True)
     # Sans prix de marché RÉEL, on ne clôture pas : retomber sur le prix d'entrée produirait un P&L
     # nul étiqueté « gagnant », c'est-à-dire un résultat inventé. On s'appuie sur le MÊME réglage
     # que l'ouverture (`block_synthetic_orders`) : ce qui interdit d'ouvrir sur des données
     # factices doit interdire d'en tirer un résultat.
-    real_price = bool(candles) and markets.is_real(rec["symbol"])
+    #
+    # La lecture de `is_real` suit IMMÉDIATEMENT l'attente, sans await intercalé : `_LAST_SOURCE`
+    # décrit donc bien le chargement qu'on vient de faire, et non celui d'une autre boucle.
+    real_price = price is not None and markets.is_real(rec["symbol"])
     if not real_price and get_settings().block_synthetic_orders:
-        raise ExecutionError(
-            f"Clôture impossible : aucun prix de marché réel pour {rec['symbol']}. "
-            "La position reste ouverte plutôt que d'être fermée sur un prix supposé."
+        raise MarketDataUnavailable(
+            f"Clôture impossible pour l'instant : aucun prix de marché réel pour "
+            f"{rec['symbol']} (source « {markets.data_source(rec['symbol'])} »). La position reste "
+            "ouverte plutôt que d'être fermée sur un prix supposé — réessaie dans un instant."
         )
-    if not candles:
-        raise ExecutionError(f"Aucune bougie disponible pour {rec['symbol']} — clôture impossible.")
-    price = candles[-1].close
+    if price is None:
+        raise MarketDataUnavailable(
+            f"Aucun prix disponible pour {rec['symbol']} — clôture impossible pour l'instant."
+        )
     pnl = ((price - entry) if side == "buy" else (entry - price)) * qty
     outcome = _outcome_from_pnl(pnl)
     updated = {
@@ -570,18 +595,34 @@ _PRICE_CACHE_TTL = 15.0
 _price_cache: dict[str, tuple[float, float]] = {}
 
 
-async def _reference_price(symbol: str) -> float | None:
-    """Dernier prix connu, à la MÊME source que celle du broker papier (cohérence du fill)."""
+async def _reference_price(symbol: str, *, fresh: bool = False) -> float | None:
+    """Dernier prix connu, à la MÊME source que celle du broker papier (cohérence du fill).
+
+    `fresh=True` court-circuite LES DEUX niveaux de cache (celui d'ici, 15 s, et celui de
+    `markets.load_candles`, 20 s — soit jusqu'à 35 s cumulées) et va rechercher le prix.
+
+    C'est la frontière MOTEUR / CACHE demandée par l'architecture, appliquée au prix :
+
+    - AFFICHER une position (P&L latent, progression) tolère parfaitement un prix de quelques
+      secondes : c'est la route la plus sollicitée du site, la mettre en cache est ce qui la rend
+      instantanée, et rien n'est engagé ;
+    - REMPLIR un ordre ou DÉPLACER un stop engage de l'argent. Un prix périmé y est inscrit dans le
+      portefeuille comme s'il avait été traité : l'entrée enregistrée devient fausse, et avec elle
+      le P&L, le multiple de R et toutes les statistiques qui en découlent.
+
+    Le cache reste ALIMENTÉ dans les deux cas : un chemin frais rafraîchit aussi l'affichage.
+    """
     import time
 
     from app.data import markets
 
     now = time.monotonic()
-    cached = _price_cache.get(symbol)
-    if cached and cached[0] > now:
-        return cached[1]
+    if not fresh:
+        cached = _price_cache.get(symbol)
+        if cached and cached[0] > now:
+            return cached[1]
     try:
-        candles = await markets.load_candles(symbol, interval="1h", limit=60)
+        candles = await markets.load_candles(symbol, interval="1h", limit=60, fresh=fresh)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Prix de référence %s indisponible (%s)", symbol, exc)
         return None
@@ -642,19 +683,43 @@ def _recent_entry(store: AppStore, tenant_id: str, symbol: str, side: str,
 
 
 def _currencies(symbol: str) -> set[str]:
-    """Les deux devises d'une paire (« EUR/USD » -> {EUR, USD}) ; vide hors forex/métaux."""
+    """Les deux devises d'une paire de CHANGE (« EUR/USD » -> {EUR, USD}). Vide partout ailleurs.
+
+    RESTREINT AU FOREX (01/08/2026). Cette fonction découpait n'importe quel symbole contenant un
+    « / », donc aussi les paires crypto : BTC/USDT et SUI/USDT étaient comptées comme « deux
+    positions exposées à USDT » et la seconde était refusée.
+
+    Le raisonnement de la garde ne s'y applique pas. En change, EUR/USD + EUR/JPY + EUR/GBP est
+    trois fois le pari « euro fort » : un retournement de l'euro touche les trois stops ensemble.
+    En crypto, USDT est un stablecoin — c'est l'unité de compte, pas une position. Deux paires en
+    USDT ne sont pas deux paris sur USDT, et les plafonner revenait à interdire d'avoir plus de
+    deux positions crypto, tous actifs confondus.
+
+    (La corrélation crypto existe bel et bien — BTC entraîne les alts — mais elle ne passe pas par
+    la devise de cotation. La mesurer demanderait une garde dédiée, adossée à des corrélations
+    observées, pas à un découpage de symbole.)
+    """
+    from app.data import markets
+
     if "/" not in (symbol or ""):
+        return set()
+    if markets.asset_class(symbol) != "forex":
         return set()
     base, _, quote = symbol.partition("/")
     return {base.strip().upper(), quote.strip().upper()} - {""}
 
 
 def _correlation_conflict(store: AppStore, tenant_id: str, symbol: str) -> str | None:
-    """GARDE DE CORRÉLATION (plan, Phase 3.2) : max N positions partageant une même devise.
+    """GARDE DE CORRÉLATION : max N positions de CHANGE partageant une même devise.
 
     EUR/USD + EUR/JPY + EUR/GBP n'est pas trois paris : c'est trois fois le pari « euro fort » —
-    un seul retournement de l'euro toucherait les trois stops en même temps. Retourne le motif du
-    refus, ou None si l'ouverture est acceptable.
+    un seul retournement de l'euro toucherait les trois stops en même temps.
+
+    NE S'APPLIQUE QU'AU FOREX (cf. `_currencies`). Elle mordait auparavant sur la crypto, où la
+    devise de cotation est un stablecoin : deux paires en USDT étaient comptées comme deux paris
+    sur USDT, ce qui plafonnait de fait l'ensemble du portefeuille crypto à deux positions.
+
+    Retourne le motif du refus, ou None si l'ouverture est acceptable.
     """
     from app.core.config import get_settings
 
@@ -756,7 +821,10 @@ async def execute_playbook_trades(
         risk_amount = capital * risk_pct / 100
         # Prix de référence = celui auquel le broker papier remplira réellement. On dimensionne
         # dessus pour que le montant risqué au stop vaille EXACTEMENT le % voulu du capital.
-        fill = await _reference_price(symbol) or entry
+        # `fresh=True` : c'est le prix qui sera INSCRIT comme entrée de la position. Le lire dans un
+        # cache (jusqu'à 35 s) fausse à la fois le contrôle « le prix est-il déjà sorti de la zone »
+        # juste en dessous, la taille de position, et tout le P&L qui en découlera.
+        fill = await _reference_price(symbol, fresh=True) or entry
         # Le prix a-t-il déjà invalidé le plan pendant le calcul ? (stop franchi ou objectif atteint)
         if (side == "buy" and (fill <= sl or fill >= tp)) or (side == "sell" and (fill >= sl or fill <= tp)):
             skipped.append({
@@ -1013,7 +1081,9 @@ async def secure_open_profits(store: AppStore) -> int:
             continue
         symbol = rec.get("symbol", "")
         if symbol not in prices:
-            prices[symbol] = await _reference_price(symbol)
+            # DÉCISION, pas affichage : ce prix décide si le stop est remonté sur +2R. Une seule
+            # lecture fraîche par symbole et par passage (le dictionnaire dédoublonne).
+            prices[symbol] = await _reference_price(symbol, fresh=True)
         price = prices[symbol]
         if not price:
             continue
@@ -1027,6 +1097,36 @@ async def secure_open_profits(store: AppStore) -> int:
         if (buy and new_stop <= sl) or (not buy and new_stop >= sl):
             continue
         if (buy and new_stop >= price) or (not buy and new_stop <= price):
+            continue
+        # LE STOP NE PEUT PAS ATTEINDRE NI DÉPASSER L'OBJECTIF.
+        #
+        # La règle « à +2R, on verrouille +2R et on laisse courir vers le R/R maximum » suppose que
+        # l'objectif soit AU-DELÀ de +2R. Or la stratégie autorise la bande 1:2 à 1:3, et à R/R 1:2
+        # l'objectif EST +2R : le niveau sécurisé tombait alors exactement dessus (mesuré sur CVX le
+        # 30/07/2026 — stop 193.45714798 pour un objectif 193.45714797). Il n'y a rien à protéger
+        # dans ce cas, et trois conséquences fâcheuses en découlaient :
+        #   1. le rejeu clôturait sur le STOP au lieu de l'objectif, et la carte affichait
+        #      « stop de sécurisation touché » sur un trade qui avait atteint sa cible ;
+        #   2. le stop et l'objectif s'affichaient au même nombre de pips, illisible ;
+        #   3. pour un achat, le stop passait AU-DESSUS de l'objectif — un panier d'ordres qu'un
+        #      vrai broker refuserait.
+        #
+        # On ne touche à AUCUN seuil de la stratégie : `playbook_secure_at_r` et
+        # `playbook_secure_stop_at_r` restent à 2R. On refuse seulement un déplacement qui ne
+        # protège rien. Aucun gain n'est perdu : l'objectif clôture au même prix ou mieux, puisque
+        # le niveau sécurisé se situait sur lui ou au-delà. Les trades à R/R > 2 (1:2,5, 1:3) sont
+        # strictement inchangés — c'est là que la sécurisation a un sens, et elle s'applique.
+        #
+        # La comparaison porte une TOLÉRANCE, et ce n'est pas une précaution de style : le niveau
+        # sécurisé est reconstruit via un aller-retour `entry ± initial_risk`, qui perd quelques
+        # décimales. Sur CVX, cela donnait un stop à 193.45714798 pour un objectif à 193.45714797 —
+        # 10⁻⁸ d'écart, invisible à l'œil, largement suffisant pour qu'une égalité stricte laisse
+        # passer le déplacement. On raisonne donc en fraction du risque, seule échelle qui ait un
+        # sens ici : à un millionième de R près, stop et objectif sont le même prix.
+        tp = rec.get("take_profit")
+        epsilon = initial_risk * 1e-6
+        if tp is not None and ((buy and new_stop >= tp - epsilon)
+                               or (not buy and new_stop <= tp + epsilon)):
             continue
         store.records.put(ORDER, rec["id"], {
             **rec, "stop_loss": round(new_stop, 8), "initial_risk": initial_risk,
@@ -1076,7 +1176,8 @@ async def manage_tp_progression(store: AppStore) -> int:
             continue
         symbol = rec.get("symbol", "")
         if symbol not in prices:
-            prices[symbol] = await _reference_price(symbol)
+            # DÉCISION : ce prix déclenche le passage TP1 -> TP2 et le verrouillage du stop.
+            prices[symbol] = await _reference_price(symbol, fresh=True)
         price = prices[symbol]
         if not price:
             continue

@@ -18,10 +18,15 @@ def format_signal(card: SignalCard) -> str:
     tps = " / ".join(
         str(t) for t in [card.take_profit_1, card.take_profit_2, card.take_profit_3] if t is not None
     )
+    # « — » plutôt que « None » : une décision « pas de trade » n'a pas de niveaux (cf. SignalCard).
+    # Une alerte qui annonce « Entrée: None » est au mieux illisible, au pire prise pour un bug.
+    def _lvl(value: float | None) -> str:
+        return "—" if value is None else str(value)
+
     return (
         f"[{card.direction.value}] {card.asset}\n"
-        f"Entrée: {card.entry} | SL: {card.stop_loss} | TP: {tps}\n"
-        f"R/R: {card.risk_reward} | Confiance: {card.confidence}% | {card.timeframe.value}\n"
+        f"Entrée: {_lvl(card.entry)} | SL: {_lvl(card.stop_loss)} | TP: {tps or '—'}\n"
+        f"R/R: {_lvl(card.risk_reward)} | Confiance: {card.confidence}% | {card.timeframe.value}\n"
         f"{card.rationale}"
     )
 

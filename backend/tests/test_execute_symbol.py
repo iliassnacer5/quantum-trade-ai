@@ -39,7 +39,7 @@ def playbook_on(monkeypatch):
     previous_gate = s.playbook_trade_only_when_open
     s.playbook_trade_only_when_open = False
 
-    async def _load(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _load(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return series.get(interval, series["4h"])
 
     monkeypatch.setattr(markets, "load_candles", _load)
@@ -82,7 +82,7 @@ async def test_execute_symbol_explains_when_not_ready(playbook_on, monkeypatch):
         "15m": _no_trigger_15m(price=_tf("h4")[-1].close),
     }
 
-    async def _load(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _load(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return series.get(interval, series["4h"])
 
     monkeypatch.setattr(markets, "load_candles", _load)
@@ -121,7 +121,7 @@ async def test_paper_broker_refuses_to_fill_without_real_candles(monkeypatch):
     from app.data import markets
     from app.execution.paper import PaperBroker
 
-    async def _empty(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _empty(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return []
     monkeypatch.setattr(markets, "load_candles", _empty)
 
@@ -136,7 +136,7 @@ async def test_place_order_reports_a_clean_refusal_not_a_phantom_position(monkey
     from app.repositories.store import get_store
     from app.services import execution_service
 
-    async def _empty(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _empty(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         return []
     monkeypatch.setattr(markets, "load_candles", _empty)
 
@@ -166,7 +166,7 @@ async def test_a_bad_symbol_does_not_abort_the_rest_of_the_batch(playbook_on, mo
     user = _tenant(store, "batch@test.com")
     real_load = markets.load_candles
 
-    async def _flaky(symbol, interval="1h", limit=200):  # noqa: ANN001
+    async def _flaky(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
         if symbol == "EUR/USD" and interval == "1h":
             return []  # ce SEUL symbole échoue au moment du remplissage
         return await real_load(symbol, interval=interval, limit=limit)
@@ -216,7 +216,7 @@ async def test_reference_price_is_cached_for_a_short_time(monkeypatch):
 
     calls = {"n": 0}
 
-    async def fake_load(symbol, interval="1h", limit=60):  # noqa: ANN001
+    async def fake_load(symbol, interval="1h", limit=60, **kw):  # noqa: ANN001
         calls["n"] += 1
         return [Candle(1.10, 1.101, 1.099, 1.10 + calls["n"] * 0.001, 1000.0)]
 
@@ -239,7 +239,7 @@ async def test_reference_price_cache_expires(monkeypatch):
     execution_service._price_cache.clear()
     execution_service._price_cache["EUR/USD"] = (time_mod.monotonic() - 1, 1.2345)  # déjà expiré
 
-    async def fake_load(symbol, interval="1h", limit=60):  # noqa: ANN001
+    async def fake_load(symbol, interval="1h", limit=60, **kw):  # noqa: ANN001
         return [Candle(9.0, 9.0, 9.0, 9.999, 1000.0)]
 
     monkeypatch.setattr(markets, "load_candles", fake_load)
@@ -255,7 +255,7 @@ async def test_reference_price_cache_is_per_symbol(monkeypatch):
     execution_service._price_cache.clear()
     prices = {"EUR/USD": 1.10, "GBP/USD": 1.27}
 
-    async def fake_load(symbol, interval="1h", limit=60):  # noqa: ANN001
+    async def fake_load(symbol, interval="1h", limit=60, **kw):  # noqa: ANN001
         return [Candle(1.0, 1.0, 1.0, prices[symbol], 1000.0)]
 
     monkeypatch.setattr(markets, "load_candles", fake_load)
@@ -277,7 +277,7 @@ def _fix_price(monkeypatch, value: float) -> None:
     from app.domain.indicators import Candle
     from app.services import execution_service
 
-    async def fake_load(symbol, interval="1h", limit=60):  # noqa: ANN001
+    async def fake_load(symbol, interval="1h", limit=60, **kw):  # noqa: ANN001
         return [Candle(value, value, value, value, 1000.0)]
 
     monkeypatch.setattr(markets, "load_candles", fake_load)
@@ -361,6 +361,71 @@ async def test_update_order_levels_rejects_on_closed_position(monkeypatch):
     await execution_service.close_order_manual(store, user.tenant_id, order["id"])
     with pytest.raises(execution_service.ExecutionError, match="déjà clôturée"):
         await execution_service.update_order_levels(store, user.tenant_id, order["id"], stop_loss=90.0)
+
+
+async def test_a_position_that_can_be_priced_can_always_be_closed(monkeypatch):
+    """Ce qu'on sait VALORISER, on doit pouvoir le FERMER — même source de prix des deux côtés.
+
+    La clôture manuelle chargeait des bougies 15 MIN, alors que le remplissage à l'ouverture, le
+    P&L latent affiché et la sécurisation du stop passent tous par `_reference_price` (1 h). Quand
+    le fournisseur limitait le débit sur le 15 min mais servait le 1 h, la position restait
+    parfaitement valorisée à l'écran et devenait pourtant IMPOSSIBLE à clôturer : le bouton
+    « Clôturer maintenant » échouait sans rien fermer.
+
+    On simule exactement cela : le 1 h répond, le 15 min non.
+    """
+    from app.data import markets
+    from app.domain.indicators import Candle
+    from app.services import execution_service
+    from tests.test_playbook import _tenant
+
+    store = _store_for_execution()
+    user = _tenant(store, "close-tf@test.com")
+
+    async def _only_hourly(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
+        if interval == "15m":
+            return []                      # débit limité sur cette unité de temps
+        return [Candle(100.0, 100.0, 100.0, 100.0, 1000.0) for _ in range(60)]
+
+    monkeypatch.setattr(markets, "load_candles", _only_hourly)
+    monkeypatch.setattr(markets, "is_real", lambda symbol: True)
+    execution_service._price_cache.clear()
+
+    order = await _open_googl_buy(store, user.tenant_id)
+    closed = await execution_service.close_order_manual(store, user.tenant_id, order["id"])
+
+    assert closed["outcome"] in execution_service.FINAL_OUTCOMES, "la position devait se fermer"
+    assert closed["exit_price"] == 100.0
+    assert closed.get("closed_manually") is True
+
+
+async def test_closing_without_a_real_price_is_reported_as_unavailable(monkeypatch):
+    """Sans prix réel, on refuse — mais avec une erreur qui dit « plus tard », pas « introuvable ».
+
+    L'API traduit `MarketDataUnavailable` en 503 : la position EXISTE, c'est la cotation qui manque.
+    Le 404 d'avant se lisait comme un ordre inexistant et rendait le refus incompréhensible.
+    """
+    from app.data import markets
+    from app.services import execution_service
+    from tests.test_playbook import _tenant
+
+    store = _store_for_execution()
+    user = _tenant(store, "close-nodata@test.com")
+    _fix_price(monkeypatch, 100.0)
+    order = await _open_googl_buy(store, user.tenant_id)
+
+    async def _nothing(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
+        return []
+
+    monkeypatch.setattr(markets, "load_candles", _nothing)
+    monkeypatch.setattr(markets, "is_real", lambda symbol: False)
+    execution_service._price_cache.clear()
+
+    with pytest.raises(execution_service.MarketDataUnavailable):
+        await execution_service.close_order_manual(store, user.tenant_id, order["id"])
+    # La position reste OUVERTE : on ne ferme jamais sur un prix supposé.
+    still = store.records.get(execution_service.ORDER, order["id"])
+    assert still.get("outcome") not in execution_service.FINAL_OUTCOMES
 
 
 async def test_update_order_levels_requires_at_least_one_field():
