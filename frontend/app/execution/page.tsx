@@ -50,6 +50,10 @@ export default function ExecutionPage() {
   // page : l'utilisateur qui clique « Clôturer » est scrollé sur sa position et ne la voyait jamais
   // — le bouton semblait donc ne rien faire.
   const [closeError, setCloseError] = useState<{ id: string; message: string } | null>(null);
+  // Clôture groupée : confirmation, état d'envoi, et compte rendu.
+  const [confirmCloseAll, setConfirmCloseAll] = useState(false);
+  const [closingAll, setClosingAll] = useState(false);
+  const [closeAllMsg, setCloseAllMsg] = useState<string | null>(null);
   const [dataSrc, setDataSrc] = useState<{ source: string; real: boolean; label: string } | null>(null);
 
   // Modification manuelle du stop / de l'objectif d'une position ouverte : une seule ligne
@@ -177,6 +181,23 @@ export default function ExecutionPage() {
       setCloseError({ id, message: e?.message ?? 'Clôture impossible.' });
     } finally {
       setChecking(null);
+    }
+  }
+
+  async function closeAll() {
+    setConfirmCloseAll(false);
+    setClosingAll(true);
+    setCloseAllMsg(null);
+    try {
+      const res = await api.closeAllOrders();
+      // On rapporte AUSSI ce qui n'a pas pu être fermé : une position laissée ouverte faute de
+      // prix réel doit être visible, sinon « tout clôturer » aurait menti sur son résultat.
+      setCloseAllMsg(res.note);
+      await refresh();
+    } catch (e: any) {
+      setCloseAllMsg(e?.message ?? 'Clôture groupée impossible.');
+    } finally {
+      setClosingAll(false);
     }
   }
 
@@ -613,10 +634,44 @@ export default function ExecutionPage() {
           <h2 className="text-lg font-semibold text-white">
             Positions ({snap?.open_count ?? 0} ouverte(s) · {snap?.closed_count ?? 0} clôturée(s))
           </h2>
-          <span className="text-[11px] text-muted">
-            <span className={auto.refreshing ? 'text-accent' : ''}>🔄 Suivi automatique</span> · {refreshLabel(auto)}
+          <span className="flex items-center gap-3 text-[11px] text-muted">
+            {/*
+              « Tout clôturer » : le geste de fin de séance, ou avant une annonce. Le faire position
+              par position prend du temps — et ce temps compte précisément dans ces moments-là.
+              Confirmation obligatoire : l'action est irréversible et touche toutes les positions.
+            */}
+            {(snap?.open_count ?? 0) > 0 && (
+              confirmCloseAll ? (
+                <span className="flex items-center gap-2">
+                  <span className="text-white/80">Clôturer les {snap?.open_count} positions ?</span>
+                  <button onClick={closeAll} disabled={closingAll}
+                    className="rounded border border-sell bg-sell/10 px-2 py-0.5 font-medium text-sell hover:bg-sell/20 disabled:opacity-50">
+                    {closingAll ? '…' : 'Oui, tout clôturer'}
+                  </button>
+                  <button onClick={() => setConfirmCloseAll(false)} disabled={closingAll}
+                    className="rounded border border-border px-2 py-0.5 text-muted hover:bg-[#1A1A1A]">
+                    Annuler
+                  </button>
+                </span>
+              ) : (
+                <button onClick={() => setConfirmCloseAll(true)}
+                  className="rounded border border-sell/50 px-2 py-0.5 text-sell hover:bg-sell/10">
+                  Tout clôturer
+                </button>
+              )
+            )}
+            <span>
+              <span className={auto.refreshing ? 'text-accent' : ''}>🔄 Suivi automatique</span> · {refreshLabel(auto)}
+            </span>
           </span>
         </div>
+
+        {/* Résultat de la clôture groupée : ce qui a été fermé, et ce qui est resté ouvert. */}
+        {closeAllMsg && (
+          <p className="rounded border border-border bg-surface px-3 py-2 text-xs text-white/80">
+            {closeAllMsg}
+          </p>
+        )}
 
         {/* Bandeau P&L global, mis à jour tout seul. */}
         {snap && (snap.open_count > 0 || snap.closed_count > 0) && (

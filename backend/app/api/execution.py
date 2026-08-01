@@ -207,6 +207,22 @@ async def close_order(
     return result
 
 
+@router.post("/orders/close-all")
+async def close_all_orders(
+    user: User = Depends(current_user),
+    store: AppStore = Depends(store_dep),
+) -> dict:
+    """CLÔTURE TOUTES les positions papier ouvertes du compte, au prix du marché.
+
+    Mêmes règles que la clôture unitaire : prix réel obligatoire, aucun résultat inventé. Une
+    position qu'on ne sait pas valoriser reste ouverte, et le rapport dit laquelle et pourquoi.
+    """
+    result = await execution_service.close_all_open(store, user.tenant_id)
+    audit.record("execution.orders_closed_all", actor=user.email, tenant_id=user.tenant_id,
+                 detail=f"{len(result['closed'])} fermée(s), P&L {result['realized_pnl']}")
+    return result
+
+
 @router.post("/orders/{order_id}/levels")
 async def update_levels(
     order_id: str,

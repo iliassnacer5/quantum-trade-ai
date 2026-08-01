@@ -458,16 +458,27 @@ async def update_order_levels(
     new_sl = stop_loss if stop_loss is not None else rec.get("stop_loss")
     new_tp = take_profit if take_profit is not None else rec.get("take_profit")
 
+    # LE STOP PEUT ÊTRE PLACÉ DES DEUX CÔTÉS DE L'ENTRÉE — c'est le principe même de la sécurisation.
+    #
+    # Cette fonction exigeait que le stop reste du côté PERDANT de l'entrée (sous l'entrée pour un
+    # achat, au-dessus pour une vente). Elle interdisait donc exactement ce que le moteur fait
+    # automatiquement : `secure_open_profits` remonte le stop sur +2R, DU CÔTÉ DU PROFIT, et
+    # `manage_tp_progression` le verrouille à 80 % du chemin après TP1. L'utilisateur ne pouvait pas
+    # faire à la main ce que le robot fait tout seul — et le message d'erreur affirmait une règle
+    # que le système lui-même ne respecte pas.
+    #
+    # Un stop du côté du profit n'a rien d'anormal : il transforme la position en trade
+    # nécessairement gagnant. La seule contrainte qui compte vraiment est vérifiée juste en dessous :
+    # le stop ne doit pas être DÉJÀ FRANCHI par le prix courant, sinon la position se clôturerait au
+    # passage de surveillance suivant sans explication.
+    #
+    # L'OBJECTIF, lui, garde sa contrainte : il doit rester du côté du gain. Un « objectif » placé
+    # dans la perte n'est pas un objectif, c'est un stop — et il y a déjà un champ pour ça.
     if buy:
-        if new_sl is not None and new_sl >= entry:
-            raise ExecutionError(f"Achat : le stop ({new_sl}) doit rester SOUS l'entrée ({entry}).")
         if new_tp is not None and new_tp <= entry:
             raise ExecutionError(f"Achat : l'objectif ({new_tp}) doit rester AU-DESSUS de l'entrée ({entry}).")
-    else:
-        if new_sl is not None and new_sl <= entry:
-            raise ExecutionError(f"Vente : le stop ({new_sl}) doit rester AU-DESSUS de l'entrée ({entry}).")
-        if new_tp is not None and new_tp >= entry:
-            raise ExecutionError(f"Vente : l'objectif ({new_tp}) doit rester SOUS l'entrée ({entry}).")
+    elif new_tp is not None and new_tp >= entry:
+        raise ExecutionError(f"Vente : l'objectif ({new_tp}) doit rester SOUS l'entrée ({entry}).")
 
     price = await _reference_price(rec.get("symbol", ""))
     if price:
@@ -564,6 +575,52 @@ async def close_order_manual(store: AppStore, tenant_id: str, order_id: str) -> 
     from app.core import metrics
     metrics.inc("paper_orders_closed_total", outcome=outcome)
     return store.records.put(ORDER, order_id, updated, tenant_id=tenant_id)
+
+
+async def close_all_open(store: AppStore, tenant_id: str) -> dict:
+    """CLÔTURE TOUTES les positions papier ouvertes de ce compte, au prix du marché.
+
+    Le geste « je sors de tout, maintenant » : en fin de session, avant une annonce, ou quand on
+    veut simplement repartir à zéro. Le faire position par position prend du temps — et ce temps
+    compte précisément dans les moments où l'on veut tout fermer.
+
+    Chaque position est clôturée par `close_order_manual`, donc avec EXACTEMENT les mêmes règles :
+    prix de marché réel obligatoire, P&L calculé sur ce prix, aucun résultat inventé. Une position
+    qu'on ne sait pas valoriser reste OUVERTE et son motif est rendu — on ne ferme jamais à
+    l'aveugle sous prétexte que l'ordre était groupé.
+
+    Retourne le détail : ce qui a été fermé, avec quel P&L, et ce qui ne l'a pas été et pourquoi.
+    """
+    ouvertes = [o for o in _open_orders(store, tenant_id) if o.get("mode") == "paper"]
+    fermees: list[dict] = []
+    echecs: list[dict] = []
+    for rec in ouvertes:
+        try:
+            res = await close_order_manual(store, tenant_id, rec["id"])
+        except ExecutionError as exc:
+            echecs.append({"order_id": rec.get("id"), "symbol": rec.get("symbol"),
+                           "reason": str(exc)})
+            continue
+        except Exception as exc:  # noqa: BLE001 — une position en échec n'arrête pas les autres
+            logger.warning("Clôture groupée : %s échouée (%s)", rec.get("id"), exc)
+            echecs.append({"order_id": rec.get("id"), "symbol": rec.get("symbol"),
+                           "reason": f"erreur inattendue ({type(exc).__name__})"})
+            continue
+        fermees.append({"order_id": res.get("id"), "symbol": res.get("symbol"),
+                        "side": res.get("side"), "outcome": res.get("outcome"),
+                        "realized_pnl": res.get("realized_pnl")})
+
+    pnl = round(sum(float(f.get("realized_pnl") or 0.0) for f in fermees), 2)
+    note = (
+        f"{len(fermees)} position(s) clôturée(s) au prix du marché, P&L réalisé {pnl:+.2f}."
+        if fermees else "Aucune position n'a pu être clôturée."
+    )
+    if echecs:
+        note += (f" {len(echecs)} position(s) laissée(s) OUVERTE(S) faute de prix de marché réel — "
+                 "elles ne sont jamais fermées sur un prix supposé.")
+    logger.info("Clôture groupée (%s) : %s", tenant_id, note)
+    return {"closed": fermees, "failed": echecs, "realized_pnl": pnl,
+            "open_before": len(ouvertes), "note": note}
 
 
 # ---------------- Exécution DÉMO des trades du playbook ----------------

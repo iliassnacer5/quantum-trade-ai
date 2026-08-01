@@ -1169,6 +1169,13 @@ export const api = {
     req<Wallet>(`/api/wallet/reset?starting_balance=${starting_balance}&clear_orders=${clear_orders}`, { method: 'POST' }),
   checkOrder: (id: string) => req<Order>(`/api/execution/orders/${id}/check`, { method: 'POST' }),
   closeOrder: (id: string) => req<Order>(`/api/execution/orders/${id}/close`, { method: 'POST' }),
+  /** Clôture TOUTES les positions papier ouvertes, au prix du marché. Mêmes règles que la clôture
+   *  unitaire : une position qu'on ne sait pas valoriser reste ouverte, et `failed` dit laquelle. */
+  closeAllOrders: () => req<{
+    closed: { order_id: string; symbol: string; side: string; outcome: string; realized_pnl: number }[];
+    failed: { order_id: string; symbol: string; reason: string }[];
+    realized_pnl: number; open_before: number; note: string;
+  }>('/api/execution/orders/close-all', { method: 'POST' }),
   /** Modifie MANUELLEMENT le stop et/ou l'objectif d'une position papier encore ouverte. Au moins
    *  un des deux champs doit être fourni. Refusé si le prix actuel a déjà franchi le niveau
    *  demandé (la position se clôturerait sinon dès le prochain passage de surveillance). */

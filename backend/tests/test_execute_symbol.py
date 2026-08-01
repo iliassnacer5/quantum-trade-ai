@@ -323,6 +323,12 @@ async def test_update_order_levels_changes_stop_and_target(monkeypatch):
 
 
 async def test_update_order_levels_rejects_wrong_direction(monkeypatch):
+    """L'OBJECTIF garde sa contrainte de sens : il doit rester du côté du gain.
+
+    Un « objectif » placé dans la perte n'est pas un objectif, c'est un stop — et il y a déjà un
+    champ pour ça. (Le STOP, lui, peut désormais passer des deux côtés de l'entrée : c'est le
+    principe de la sécurisation, cf. `test_the_stop_can_be_secured_on_the_profit_side`.)
+    """
     from app.services import execution_service
     from tests.test_playbook import _tenant
 
@@ -330,8 +336,9 @@ async def test_update_order_levels_rejects_wrong_direction(monkeypatch):
     user = _tenant(store, "edit2@test.com")
     _fix_price(monkeypatch, 100.0)
     order = await _open_googl_buy(store, user.tenant_id)
-    with pytest.raises(execution_service.ExecutionError, match="doit rester SOUS l'entrée"):
-        await execution_service.update_order_levels(store, user.tenant_id, order["id"], stop_loss=101.0)
+    with pytest.raises(execution_service.ExecutionError, match="doit rester AU-DESSUS de l'entrée"):
+        await execution_service.update_order_levels(
+            store, user.tenant_id, order["id"], take_profit=95.0)
 
 
 async def test_update_order_levels_rejects_a_stop_already_hit(monkeypatch):
@@ -426,6 +433,115 @@ async def test_closing_without_a_real_price_is_reported_as_unavailable(monkeypat
     # La position reste OUVERTE : on ne ferme jamais sur un prix supposé.
     still = store.records.get(execution_service.ORDER, order["id"])
     assert still.get("outcome") not in execution_service.FINAL_OUTCOMES
+
+
+async def test_the_stop_can_be_secured_on_the_profit_side(monkeypatch):
+    """Le stop doit pouvoir passer DU CÔTÉ DU PROFIT, des deux sens — c'est la sécurisation.
+
+    La validation exigeait qu'il reste du côté perdant de l'entrée. Elle interdisait donc à
+    l'utilisateur exactement ce que le moteur fait tout seul : `secure_open_profits` remonte le stop
+    sur +2R, et `manage_tp_progression` le verrouille à 80 % après TP1. Le message d'erreur
+    affirmait une règle que le système lui-même ne respecte pas.
+    """
+    from app.services import execution_service
+    from tests.test_playbook import _tenant
+
+    store = _store_for_execution()
+    user = _tenant(store, "secure-manuel@test.com")
+
+    # ACHAT : le prix est monté (sans atteindre l'objectif), on verrouille un stop AU-DESSUS
+    # de l'entrée — la position devient nécessairement gagnante.
+    _fix_price(monkeypatch, 100.0)
+    achat = await _open_googl_buy(store, user.tenant_id)
+    _fix_price(monkeypatch, 102.0)
+    maj = await execution_service.update_order_levels(
+        store, user.tenant_id, achat["id"], stop_loss=101.0)
+    assert maj["stop_loss"] == 101.0, "un achat doit pouvoir verrouiller un stop au-dessus de l'entrée"
+    assert maj["stop_loss"] > maj["entry"]
+
+    # VENTE : le prix est descendu, on verrouille un stop SOUS l'entrée.
+    vente = store.records.put(execution_service.ORDER, "vente-sec", {
+        "id": "vente-sec", "mode": "paper", "symbol": "GOOGL", "side": "sell", "qty": 10.0,
+        "entry": 100.0, "filled_price": 100.0, "stop_loss": 105.0, "take_profit": 90.0,
+        "initial_risk": 5.0, "outcome": None, "tenant_id": user.tenant_id,
+    }, tenant_id=user.tenant_id)
+    _fix_price(monkeypatch, 96.0)
+    maj = await execution_service.update_order_levels(
+        store, user.tenant_id, vente["id"], stop_loss=98.0)
+    assert maj["stop_loss"] == 98.0, "une vente doit pouvoir verrouiller un stop sous l'entrée"
+    assert maj["stop_loss"] < maj["entry"]
+
+
+async def test_a_stop_already_crossed_is_still_refused(monkeypatch):
+    """La seule contrainte qui compte reste : le prix ne doit pas avoir déjà franchi le stop.
+
+    Sinon la position se clôturerait au passage de surveillance suivant, sans que rien ne
+    l'explique à l'écran.
+    """
+    from app.services import execution_service
+    from tests.test_playbook import _tenant
+
+    store = _store_for_execution()
+    user = _tenant(store, "stop-franchi@test.com")
+    _fix_price(monkeypatch, 100.0)
+    ordre = await _open_googl_buy(store, user.tenant_id)
+    _fix_price(monkeypatch, 96.0)
+    with pytest.raises(execution_service.ExecutionError, match="a déjà franchi ce niveau"):
+        await execution_service.update_order_levels(
+            store, user.tenant_id, ordre["id"], stop_loss=97.0)
+
+
+async def test_close_all_closes_every_open_position(monkeypatch):
+    """« Tout clôturer » ferme tout — et laisse ouvert ce qu'il ne sait pas valoriser."""
+    from app.services import execution_service
+    from tests.test_playbook import _tenant
+
+    store = _store_for_execution()
+    user = _tenant(store, "close-all@test.com")
+    _fix_price(monkeypatch, 100.0)
+    for _ in range(3):
+        await _open_googl_buy(store, user.tenant_id)
+
+    ouvertes = [o for o in execution_service.list_orders(store, user.tenant_id)
+                if o.get("outcome") not in execution_service.FINAL_OUTCOMES]
+    assert len(ouvertes) == 3, "état de départ du test"
+
+    _fix_price(monkeypatch, 110.0)
+    res = await execution_service.close_all_open(store, user.tenant_id)
+
+    assert len(res["closed"]) == 3
+    assert res["failed"] == []
+    assert res["realized_pnl"] > 0, "les trois positions étaient en gain"
+    restantes = [o for o in execution_service.list_orders(store, user.tenant_id)
+                 if o.get("outcome") not in execution_service.FINAL_OUTCOMES]
+    assert restantes == [], "plus aucune position ouverte"
+
+
+async def test_close_all_never_closes_without_a_real_price(monkeypatch):
+    """Sans prix de marché réel, la position reste OUVERTE — même dans un ordre groupé."""
+    from app.data import markets
+    from app.services import execution_service
+    from tests.test_playbook import _tenant
+
+    store = _store_for_execution()
+    user = _tenant(store, "close-all-nodata@test.com")
+    _fix_price(monkeypatch, 100.0)
+    await _open_googl_buy(store, user.tenant_id)
+
+    async def _rien(symbol, interval="1h", limit=200, **kw):  # noqa: ANN001
+        return []
+
+    monkeypatch.setattr(markets, "load_candles", _rien)
+    monkeypatch.setattr(markets, "is_real", lambda symbol: False)
+    execution_service._price_cache.clear()
+
+    res = await execution_service.close_all_open(store, user.tenant_id)
+    assert res["closed"] == []
+    assert len(res["failed"]) == 1, "l'échec doit être rendu, pas silencieux"
+    assert "impossible" in res["failed"][0]["reason"].lower()
+    restantes = [o for o in execution_service.list_orders(store, user.tenant_id)
+                 if o.get("outcome") not in execution_service.FINAL_OUTCOMES]
+    assert len(restantes) == 1, "on ne ferme jamais sur un prix supposé"
 
 
 async def test_update_order_levels_requires_at_least_one_field():
