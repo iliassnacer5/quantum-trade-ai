@@ -1411,5 +1411,14 @@ async def _notify_close(store: AppStore, tenant_id: str, order: dict) -> None:
         user = next((u for u in store.users.list_by_tenant(tenant_id)), None)
         if user and getattr(user, "push_token", None):
             await notifier.send_push(user.push_token, msg)
+        if user and getattr(user, "alert_email", False) and getattr(user, "email", None):
+            body = (
+                f"{msg}\n\n"
+                f"Entrée : {order.get('entry')} | SL : {order.get('stop_loss')} | "
+                f"TP : {order.get('take_profit')}\n"
+                f"P&L réalisé : {order.get('realized_pnl')}\n\n"
+                "Aide à la décision — pas un conseil en investissement."
+            )
+            await notifier.send_email(user.email, f"Position clôturée — {order['symbol']}", body)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Notification clôture échouée (%s)", exc)

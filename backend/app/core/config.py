@@ -600,6 +600,12 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     resend_api_key: str = ""
     email_from: str = "alerts@quantumtrade.ai"
+    # Envoi email via SMTP Gmail direct (aucun nom de domaine requis, contrairement à Resend
+    # ci-dessus). `gmail_app_password` est un « mot de passe d'application » généré sur
+    # myaccount.google.com/apppasswords — jamais le mot de passe réel du compte. Si renseigné,
+    # prend le pas sur Resend dans `notifier.send_email`.
+    gmail_address: str = ""
+    gmail_app_password: str = ""
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_from: str = ""

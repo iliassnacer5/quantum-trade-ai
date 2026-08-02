@@ -360,6 +360,14 @@ async def _announce(store, tenant_id: str, order: dict) -> None:  # noqa: ANN001
             await notifier.send_push(user.push_token, msg)
         if user and getattr(user, "alert_telegram", False) and getattr(user, "telegram_chat_id", None):
             await notifier.send_telegram(user.telegram_chat_id, msg)
+        if user and getattr(user, "alert_email", False) and getattr(user, "email", None):
+            body = (
+                f"{msg}\n\n"
+                f"Déclencheur : {order.get('trigger')}\n"
+                f"Ordre : {order.get('order_id')}\n\n"
+                "Aide à la décision — pas un conseil en investissement."
+            )
+            await notifier.send_email(user.email, f"Position ouverte — {order['symbol']}", body)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Auto-entrée : notification échouée (%s)", exc)
 

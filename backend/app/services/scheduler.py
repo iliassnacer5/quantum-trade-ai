@@ -18,6 +18,53 @@ from app.services import signal_service
 logger = logging.getLogger(__name__)
 
 
+async def _format_portfolio_and_journal(store, tenant_id: str) -> str:  # noqa: ANN001
+    """État du portefeuille (solde, équité, positions ouvertes) + du journal (KPI), pour un tenant.
+
+    Personnel à chaque utilisateur — contrairement aux trades du jour, qui sont les mêmes pour
+    tout le monde — donc calculé par tenant plutôt que diffusé une seule fois.
+    """
+    from app.services import journal_service, wallet_service
+
+    lines = ["\n— — —\n💼 Portefeuille"]
+    try:
+        w = await wallet_service.compute_wallet(store, tenant_id)
+        st = w["stats"]
+        lines.append(
+            f"Solde : {w['balance']:.2f} | Équité : {w['equity']:.2f} "
+            f"({w['return_pct']:+.2f} % depuis le départ)"
+        )
+        lines.append(
+            f"Trades clôturés : {st['trades']} ({st['wins']}G / {st['losses']}P, "
+            f"{st['win_rate']} % de réussite) | Profit factor {st['profit_factor']}"
+        )
+        if w["positions"]:
+            lines.append(f"{len(w['positions'])} position(s) ouverte(s) :")
+            for p in w["positions"][:10]:
+                lines.append(
+                    f"  • {p['symbol']} {p['side']} @ {p['entry']:g} — "
+                    f"P&L latent {p['unrealized_pnl']:+.2f}"
+                )
+        else:
+            lines.append("Aucune position ouverte.")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("État portefeuille indisponible pour digest (%s)", exc)
+        lines.append("Indisponible pour le moment.")
+
+    lines.append("\n📓 Journal")
+    try:
+        entries = journal_service.all_entries(store, tenant_id)
+        js = journal_service.stats(entries)
+        lines.append(
+            f"{js['closed']} trade(s) clôturé(s), {js['open']} en cours — "
+            f"{js['wins']}G / {js['losses']}P ({js['win_rate']} %) | P&L cumulé {js['total_pnl']:+.2f}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("État journal indisponible pour digest (%s)", exc)
+        lines.append("Indisponible pour le moment.")
+    return "\n".join(lines)
+
+
 def _format_digest(picks: list[dict]) -> str:
     if not picks:
         return "Aucun trade fiable à forte conviction aujourd'hui. Mieux vaut s'abstenir."
@@ -162,7 +209,10 @@ async def run_daily_digest(store) -> dict:  # noqa: ANN001
             continue
         try:
             if user.alert_email and user.email:
-                await notifier.send_email(user.email, "Quantum Trade AI — Trades du jour", text)
+                state = await _format_portfolio_and_journal(store, user.tenant_id)
+                await notifier.send_email(
+                    user.email, "Quantum Trade AI — Trades du jour", text + state,
+                )
             if user.alert_telegram and user.telegram_chat_id:
                 await notifier.send_telegram(user.telegram_chat_id, text)
             if user.push_token:

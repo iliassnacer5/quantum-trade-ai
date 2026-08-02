@@ -6,6 +6,7 @@ pipeline complet fonctionne en dev/test sans dépendances externes.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.core.config import get_settings
@@ -49,8 +50,33 @@ async def send_telegram(chat_id: str, text: str) -> bool:
         return False
 
 
+def _send_email_gmail_sync(to: str, subject: str, text: str) -> bool:
+    """SMTP Gmail (bloquant — appelé via `asyncio.to_thread`). Pas de domaine à posséder ni à
+    vérifier : l'email part directement du compte Gmail configuré, authentifié par un mot de
+    passe d'application (jamais le mot de passe réel du compte)."""
+    s = get_settings()
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+
+        msg = MIMEText(text, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = s.gmail_address
+        msg["To"] = to
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+            server.login(s.gmail_address, s.gmail_app_password)
+            server.sendmail(s.gmail_address, [to], msg.as_string())
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Envoi email Gmail échoué (%s)", exc)
+        return False
+
+
 async def send_email(to: str, subject: str, text: str) -> bool:
     s = get_settings()
+    # Gmail (SMTP direct) est prioritaire : aucun domaine à posséder, contrairement à Resend.
+    if s.gmail_address and s.gmail_app_password:
+        return await asyncio.to_thread(_send_email_gmail_sync, to, subject, text)
     if not s.resend_api_key:
         logger.info("[email:noop] to=%s subject=%s", to, subject)
         return False
