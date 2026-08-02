@@ -214,3 +214,17 @@ Ce projet est développé à des fins éducatives et de recherche. Il ne constit
 ---
 
 <p align="center"><i>Quantum Trade AI — Plusieurs agents, une décision éclairée.</i></p>
+
+
+=== PASSE PORTEE 1h ===
+2358 trades | 38.1% | +0.139 R | PF 1.22 | DD 57.79 R | total 326.77 R
+annees: 0.96 | paires testees: 48
+
+VERDICT: marginal
+Sur 0.96 ans et 48 paires, la stratégie a produit 2358 trades : 899 gagnants et 1459 perdants, soit 38.1 % de réussite, pour une espérance de +0.14 R par trade et un profit factor de 1.22. Verdict global : marginal.
+
+Indices: 6/6 rentables -- JPN225(+0.59R), NAS100(+0.53R), SPX500(+0.50R), US30(+0.40R), GER40(+0.37R)
+Actions: 1/1 rentables -- AAPL(+0.51R)
+Forex: 10/10 rentables -- USD/CAD(+0.40R), USD/JPY(+0.25R), AUD/JPY(+0.23R), EUR/USD(+0.22R), USD/CHF(+0.20R)
+Métaux précieux: 3/4 rentables -- XPT/USD(+0.11R), XPD/USD(+0.09R), XAG/USD(+0.01R), XAU/USD(-0.30R)
+Crypto: 0/0 rentables --

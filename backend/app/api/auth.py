@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.core import totp
+from app.core.config import get_settings
 from app.core.deps import current_user, store_dep
 from app.core.security import create_access_token, hash_password, verify_password
 from app.models.entities import User
@@ -44,6 +45,8 @@ def _to_response(user: User, store: AppStore) -> UserResponse:
 async def register(
     body: RegisterRequest, request: Request, store: AppStore = Depends(store_dep)
 ) -> TokenResponse:
+    if not get_settings().allow_registration:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Inscription fermée")
     if store.users.get_by_email(body.email):
         raise HTTPException(status.HTTP_409_CONFLICT, "Email déjà enregistré")
     tenant = store.tenants.create(name=body.email)

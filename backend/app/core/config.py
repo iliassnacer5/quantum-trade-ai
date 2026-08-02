@@ -469,6 +469,10 @@ class Settings(BaseSettings):
     secret_key: str = "change-me"
     access_token_expire_minutes: int = 60
     cors_origins: str = "http://localhost:3000"
+    # Usage privé (2 personnes) : une fois les comptes créés, mettre à false pour fermer
+    # /api/auth/register — sinon n'importe qui trouvant l'URL peut créer un compte et consommer
+    # les clés API payantes (LLM, données de marché) via le moteur de trading.
+    allow_registration: bool = True
 
     # Persistance
     database_url: str = "postgresql+asyncpg://quantum:quantum_dev_pwd@postgres:5432/quantum"

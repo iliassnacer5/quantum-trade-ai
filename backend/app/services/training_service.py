@@ -33,6 +33,8 @@ from datetime import UTC, datetime, timedelta
 from app.core.config import get_settings
 from app.data import sessions as sessions_mod
 from app.domain import playbook
+from app.domain.factor_attribution import FACTOR_OWNER
+from app.domain.factor_attribution import factor_votes as _factor_votes
 from app.domain.indicators import Candle
 
 logger = logging.getLogger(__name__)
@@ -48,18 +50,9 @@ _MAX_HOLD_BARS = 96
 # linéaire en nombre de bougies × nombre de points évalués).
 _TAIL = {"monthly": 60, "daily": 200, "h4": 200, "h1": 200, "m15": 200}
 
-# Quel agent porte quel facteur de la stratégie. C'est la table qui transforme « le RSI avait
-# raison 58 % du temps » en « l'agent technique mérite un poids un peu plus élevé ».
-FACTOR_OWNER = {
-    "ma": "technical",
-    "rsi": "technical",
-    "macd": "technical",
-    "vwap": "volume",
-    "volume": "volume",
-    "structure": "pattern",
-    "divergence": "pattern",
-    "fibonacci": "playbook",
-}
+# FACTOR_OWNER vit désormais dans `app.domain.factor_attribution` : c'est la table PARTAGÉE avec
+# `journal_service`, qui en a besoin pour attribuer les trades clôturés en direct aux mêmes agents
+# (cf. le module pour le pourquoi des deux boucles d'apprentissage distinctes).
 
 # État en mémoire : dernier entraînement connu. Rempli au démarrage depuis le store puis à chaque
 # passage nocturne. Lu à chaud par le classement des trades et par les agents.
@@ -243,23 +236,6 @@ def _replay(m15: list[Candle], start: int, direction: str, stop: float, target: 
         if hit_tp:
             return "won", 1.0
     return "expired", 0.0
-
-
-def _factor_votes(setup_layers: dict, direction: str) -> dict[str, int]:
-    """Pour chaque facteur : a-t-il plaidé DANS le sens du trade (+1), contre (-1), ou pas (0) ?
-
-    On agrège les couches journalier / 4 h / 15 min (celles qui portent la décision d'entrée) :
-    c'est la compétence du facteur SUR CETTE STRATÉGIE que l'on mesure, pas dans l'absolu.
-    """
-    want = 1 if direction == "BUY" else -1
-    votes: dict[str, int] = {}
-    for layer_name in ("daily", "h4", "m15"):
-        for f in (setup_layers.get(layer_name) or {}).get("factors", []):
-            score = f.get("score", 0)
-            if not score:
-                continue
-            votes[f["key"]] = votes.get(f["key"], 0) + (1 if (score > 0) == (want > 0) else -1)
-    return votes
 
 
 async def train_symbol(symbol: str, *, asset_class: str = "") -> dict:

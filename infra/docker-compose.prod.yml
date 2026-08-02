@@ -81,6 +81,9 @@ services:
       CORS_ORIGINS: https://${DOMAIN:?DOMAIN est obligatoire (ex. trade.mondomaine.com)}
       ENVIRONMENT: prod
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY est obligatoire en production (openssl rand -hex 32)}
+      # Usage privé (2 personnes) : fermé par défaut. Ouvrir temporairement à "true" (variable
+      # ALLOW_REGISTRATION dans .env) le temps de créer les 2 comptes, puis refermer et redémarrer.
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-false}
     # Pas de `ports:` — Caddy joint le backend par le réseau interne, sur `backend:8000`.
     expose:
       - "8000"

@@ -17,6 +17,7 @@ import uuid
 from datetime import UTC, datetime
 
 from app.core import crypto
+from app.domain import factor_attribution
 from app.execution.alpaca import AlpacaBroker
 from app.execution.base import OrderResult
 from app.execution.paper import PaperBroker
@@ -920,6 +921,12 @@ async def execute_playbook_trades(
             "trigger_type": (p.get("trigger") or "").split(" — ", 1)[0].strip() or None,
             "session_window": (sess_ctx.get("kill_zones") or ["hors_fenetre"])[0],
             "atr_pct": daily_metrics.get("atr_pct"),
+            # CE QUE CHAQUE FACTEUR A VOTÉ à l'ouverture (MA, RSI, MACD, VWAP, structure,
+            # divergence — mêmes clés que l'entraînement nocturne, cf. `domain.factor_attribution`).
+            # C'est ce qui permet, à la clôture, d'attribuer le résultat RÉEL de ce trade aux mêmes
+            # agents que le walk-forward hors ligne : le Journal apprend enfin de l'expérience
+            # vécue, pas seulement du flux « Analyser ce symbole » (cf. `journal_service`).
+            "factor_votes": factor_attribution.factor_votes(p.get("layers") or {}, direction),
             # D'OÙ VIENNENT LE STOP ET L'OBJECTIF — la justification des NIVEAUX, distincte de celle
             # de l'ENTRÉE (`trigger`). La stratégie les calcule déjà et les explique en clair (« zone
             # de demande 355.45 (force 0.71) — traversée, elle invalide l'entrée »), mais ces

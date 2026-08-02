@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 
 from app.agents.journal import compute_weight_multipliers
+from app.domain import factor_attribution
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ def playbook_entries(store, tenant_id: str, limit: int = 200) -> list[dict]:
         if outcome_raw in execution_service.NEUTRAL_OUTCOMES:
             continue
         outcome = {"won": "win", "lost": "loss"}.get(outcome_raw, "open")
+        direction = "BUY" if o.get("side") == "buy" else "SELL"
         # Pips réalisés (entrée -> sortie) sur un trade clôturé : la même lecture que sur la carte
         # de Paper Trading, pour que les deux pages ne racontent pas deux histoires différentes.
         pips = pips_mod.signed_pips(
@@ -70,16 +72,29 @@ def playbook_entries(store, tenant_id: str, limit: int = 200) -> list[dict]:
             o.get("entry") if o.get("entry") is not None else o.get("filled_price"),
             o.get("exit_price"),
         ) if outcome != "open" else None
+        # L'EXPÉRIENCE VÉCUE NOURRIT ENFIN LES AGENTS.
+        #
+        # `factor_votes` est enregistré à l'OUVERTURE par `execution_service.execute_playbook_trades`
+        # (ce que chaque facteur — MA, RSI, MACD, VWAP, structure, divergence — a voté ce jour-là).
+        # On le convertit ici en scores par agent SEULEMENT pour les trades clôturés : un trade
+        # encore ouvert n'a pas d'issue à apprendre. Un ordre plus ancien (avant l'ajout de ce
+        # champ) ou une position ouverte manuellement (« Acheter »/« Vendre », sans passage par le
+        # playbook) n'a pas de `factor_votes` : `{}` reste le résultat honnête, on n'invente pas
+        # une rationale qui n'existait pas au moment du trade.
+        agent_scores = (
+            factor_attribution.agent_scores_from_votes(o.get("factor_votes") or {}, direction)
+            if outcome in ("win", "loss") else {}
+        )
         out.append({
             "id": o["id"],
             "source": "playbook",
             "symbol": o.get("symbol"),
-            "direction": "BUY" if o.get("side") == "buy" else "SELL",
+            "direction": direction,
             "outcome": outcome,
             "pips": pips,
             "pips_label": pips_mod.label(o.get("symbol", "")),
             "pnl": round(float(o["realized_pnl"]), 2) if outcome != "open" and o.get("realized_pnl") is not None else None,
-            "agent_scores": {},
+            "agent_scores": agent_scores,
             "trigger": o.get("trigger"),
             "entry": o.get("entry") or o.get("filled_price"),
             "stop_loss": o.get("stop_loss"),
@@ -116,10 +131,17 @@ def recent_entries(store, tenant_id: str, limit: int = 200) -> list[dict]:
 def compute_multipliers(store, tenant_id: str, market: str | None = None) -> dict[str, float]:
     """Multiplicateurs de poids par agent, dérivés de l'historique (taux de réussite).
 
+    Source = `all_entries` : signaux classiques (flux « Analyser ce symbole ») ET trades playbook
+    clôturés (auto-entrée, « Ouvrir en démo »). Avant, seul le premier flux comptait ici — un compte
+    qui ne clique jamais sur « Analyser » mais accumule des dizaines de trades papier ne faisait
+    progresser AUCUN agent, quel que soit son volume. Les entrées playbook sans `factor_votes`
+    (ordres manuels, ou antérieurs à ce champ) portent `agent_scores={}` et ne contribuent à rien —
+    ni régression, ni signal inventé pour l'historique déjà accumulé.
+
     `market` (crypto|forex|stock) : apprentissage SÉPARÉ par marché — un agent mauvais en forex ne
     pénalise plus son score crypto. Rétrocompatible : sans `market`, on apprend sur tout l'historique.
     """
-    entries = recent_entries(store, tenant_id)
+    entries = all_entries(store, tenant_id)
     if market:
         from app.data import markets
         entries = [e for e in entries if markets.asset_class(e.get("symbol", "")) == market]

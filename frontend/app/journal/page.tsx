@@ -100,9 +100,9 @@ export default function JournalPage() {
           </div>
           {insights.reliability_source === 'training' && (
             <p className="mb-2 text-[11px] text-muted">
-              ⓘ Aucun signal généré via le dashboard pour l&apos;instant : la fiabilité ci-dessous
-              vient du walk-forward nocturne de la stratégie (positions démo), pas d&apos;un vote
-              d&apos;agents en direct.
+              ⓘ Aucun trade clôturé n&apos;a encore produit de score d&apos;agent (ni signal
+              « Analyser ce symbole », ni position playbook) : la fiabilité ci-dessous vient du
+              walk-forward nocturne de la stratégie, pas de l&apos;expérience vécue de ce compte.
             </p>
           )}
           {insights.reliability && insights.reliability.length > 0 ? (

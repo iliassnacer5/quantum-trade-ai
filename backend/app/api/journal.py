@@ -62,26 +62,28 @@ async def insights(
     signaux classiques et playbook réunis, cf. `journal_service.all_entries` : c'est le nombre
     réel de trades du compte, pas seulement ceux du flux « Générer un signal ».
 
-    La fiabilité PAR AGENT (`reliability`), elle, ne peut mesurer QUE les signaux classiques : eux
-    seuls portent un score par agent au moment de l'ouverture (`agent_scores`) — les trades
-    playbook n'ont pas cette décomposition, la stratégie n'étant pas un vote d'agents. Quand ce
-    flux est vide mais que des trades PLAYBOOK existent, on expose à la place la compétence déjà
-    mesurée par le walk-forward nocturne (`training_service`) plutôt que d'afficher un « pas
-    encore assez de trades » trompeur alors que l'apprentissage a bien eu lieu, ailleurs.
+    La fiabilité PAR AGENT (`reliability`) porte désormais elle aussi sur LES DEUX flux. Les trades
+    playbook (auto-entrée, « Ouvrir en démo ») portent un score par agent DÉRIVÉ des facteurs qui
+    ont motivé l'entrée (MA, RSI, MACD, VWAP, structure, divergence — mêmes clés que l'entraînement
+    nocturne, cf. `domain.factor_attribution`) — sauf un achat/vente MANUEL, qui n'a aucune
+    rationale stratégique à attribuer et contribue `{}`, comme avant.
+    Quand ni l'un ni l'autre flux n'a encore de signal exploitable mais qu'un entraînement nocturne
+    a déjà eu lieu, on expose à la place la compétence mesurée par le walk-forward
+    (`training_service`) plutôt que d'afficher un « pas encore assez de trades » trompeur alors que
+    l'apprentissage a bien eu lieu, ailleurs.
     """
     from app.agents.journal import reliability_report
 
     all_rows = journal_service.all_entries(store, user.tenant_id, limit=500)
-    signal_rows = [e for e in all_rows if e.get("source") != "playbook"]
-    report = reliability_report(signal_rows)
-    learned = sum(1 for e in signal_rows if e.get("outcome") in ("win", "loss"))
+    report = reliability_report(all_rows)
+    learned = sum(1 for e in all_rows if e.get("outcome") in ("win", "loss") and e.get("agent_scores"))
 
     out = {
         "stats": journal_service.stats(all_rows),
         "weight_multipliers": journal_service.compute_multipliers(store, user.tenant_id),
         "reliability": report,            # détail par agent (réussite, volume, multiplicateur)
-        "trades_learned": learned,        # trades du flux SIGNAUX qui nourrissent ce calcul précis
-        "reliability_source": "signals",
+        "trades_learned": learned,        # trades AYANT UN SCORE D'AGENT (signaux + playbook)
+        "reliability_source": "live",
     }
     if not report:
         from app.services import training_service

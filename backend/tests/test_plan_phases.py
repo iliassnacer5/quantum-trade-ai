@@ -500,6 +500,161 @@ async def test_opened_orders_carry_their_context(flat_market):
     assert order["risk_pct"] > 0 and order["conviction_mult"] > 0
 
 
+async def test_opened_orders_carry_their_factor_votes(flat_market):
+    """Chaque ordre playbook emporte AUSSI ce que chaque facteur a voté à l'ouverture.
+
+    C'est la matière première qui permet, à la clôture, d'attribuer le résultat RÉEL du trade aux
+    mêmes agents que l'entraînement nocturne (cf. `domain.factor_attribution`). Sans ce champ, le
+    Journal ne peut apprendre que du flux « Analyser ce symbole » — jamais de l'auto-entrée.
+    """
+    pick = _pick("USD/CHF")
+    pick["layers"] = {
+        "daily": {"metrics": {"atr_pct": 1.12},
+                  "factors": [{"key": "ma", "score": 0.5}, {"key": "rsi", "score": 0.3}]},
+        "h4": {"factors": [{"key": "ma", "score": 0.4}]},
+        "m15": {"factors": [{"key": "structure", "score": -0.2}]},
+    }
+    store = get_store()
+    user = _user(store, "factor-votes@test.com")
+    report = await execution_service.execute_playbook_trades(
+        store, user.tenant_id, count=1, picks=[pick],
+    )
+    assert len(report["opened"]) == 1
+    order = execution_service.list_orders(store, user.tenant_id)[0]
+    assert order["factor_votes"] == {"ma": 2, "rsi": 1, "structure": -1}
+
+
+# ---------------------------------------------------------------------------------------
+# 3.5 — L'expérience VÉCUE (trades playbook clôturés) nourrit le Journal, pas seulement le
+# flux « Analyser ce symbole ». Demandé le 02/08/2026 : « je veux que les agents s'entraînent
+# aussi avec les positions clôturées dans le journal, plus l'historique ».
+# ---------------------------------------------------------------------------------------
+async def test_a_single_closed_trade_is_not_enough_to_move_a_multiplier(flat_market):
+    """Un seul trade clôturé ne doit RIEN faire bouger — c'est le garde-fou contre le sur-ajustement.
+
+    `compute_weight_multipliers` exige au moins 3 échantillons par agent avant de s'écarter de la
+    neutralité (1.0) : sur-réagir à un trade unique, gagnant ou perdant, produirait un poids
+    d'agent qui ne représente qu'un coup de chance ou de malchance.
+    """
+    from app.services import journal_service
+
+    pick = _pick("USD/CHF")
+    pick["layers"] = {"daily": {"factors": [{"key": "ma", "score": 0.5}]}}
+    store = get_store()
+    user = _user(store, "closed-loop-single@test.com")
+    report = await execution_service.execute_playbook_trades(
+        store, user.tenant_id, count=1, picks=[pick],
+    )
+    order = execution_service.list_orders(store, user.tenant_id)[0]
+
+    store.records.put(execution_service.ORDER, order["id"], {
+        **order, "outcome": "won", "realized_pnl": 200.0,
+    }, tenant_id=user.tenant_id)
+
+    rows = journal_service.playbook_entries(store, user.tenant_id)
+    closed = next(r for r in rows if r["id"] == order["id"])
+    assert closed["agent_scores"]["technical"] > 0, "le score est bien calculé…"
+
+    after = journal_service.compute_multipliers(store, user.tenant_id)
+    assert after.get("technical", 1.0) == 1.0, "…mais 1 seul échantillon reste neutre (n < 3)"
+
+
+async def test_accumulated_closed_trades_do_move_the_multiplier(flat_market):
+    """LA RÉPONSE À LA QUESTION POSÉE : l'ACCUMULATION de trades clôturés aide-t-elle réellement ?
+
+    Oui, une fois le seuil de confiance franchi (n ≥ 3 échantillons pour cet agent) : trois trades
+    playbook gagnés d'affilée, dont les facteurs « technical » avaient tous voté dans le bon sens,
+    déplacent le multiplicateur de cet agent au-dessus de la neutralité — sans qu'aucun signal du
+    flux « Analyser ce symbole » n'existe. C'est exactement le trou que cette fonctionnalité comble :
+    avant, ces trades ne faisaient progresser AUCUN agent, quel que soit leur nombre.
+    """
+    from app.services import journal_service
+
+    store = get_store()
+    user = _user(store, "closed-loop-accum@test.com")
+    # Symboles distincts : le garde anti-doublon refuserait un 2e ACHAT sur la même paire tant que
+    # le premier reste visible comme « récent » — hors de propos ici, on teste l'ACCUMULATION par
+    # agent, pas ce garde-fou (déjà couvert ailleurs).
+    for symbol in ("USD/CHF", "AUD/CHF", "NZD/CHF"):
+        pick = _pick(symbol)
+        pick["layers"] = {"daily": {"factors": [{"key": "ma", "score": 0.5}]},
+                          "h4": {"factors": [{"key": "rsi", "score": 0.3}]}}
+        report = await execution_service.execute_playbook_trades(
+            store, user.tenant_id, count=1, picks=[pick],
+        )
+        assert report["opened"], f"{symbol} : ouverture attendue ({report['skipped']})"
+        order = report["opened"][0]
+        store.records.put(execution_service.ORDER, order["order_id"], {
+            **store.records.get(execution_service.ORDER, order["order_id"]),
+            "outcome": "won", "realized_pnl": 100.0,
+        }, tenant_id=user.tenant_id)
+
+    after = journal_service.compute_multipliers(store, user.tenant_id)
+    assert after["technical"] > 1.0, "3 gains accumulés doivent renforcer l'agent technique"
+
+
+async def test_a_manual_order_never_fabricates_a_rationale(flat_market):
+    """Un achat/vente MANUEL (bouton « Acheter »/« Vendre ») n'a aucune rationale stratégique : il
+    ne doit jamais se voir attribuer un score d'agent inventé, gagné ou perdu."""
+    from app.services import journal_service
+
+    store = get_store()
+    user = _user(store, "manual-order@test.com")
+    conn_id = execution_service.ensure_paper_connection(store, user.tenant_id)
+    # `flat_market` sert un prix constant de 1.1 sur tous les symboles : les niveaux doivent
+    # encadrer CE prix, pas un prix arbitraire (GOOGL n'a rien de spécial dans ce fixture).
+    order = await execution_service.place_order(
+        store, user.tenant_id, conn_id=conn_id, symbol="GOOGL", side="buy", qty=1.0,
+        stop_loss=1.05, take_profit=1.2,
+    )
+    store.records.put(execution_service.ORDER, order["id"], {
+        **order, "outcome": "won", "realized_pnl": 50.0,
+    }, tenant_id=user.tenant_id)
+
+    rows = journal_service.playbook_entries(store, user.tenant_id)
+    assert rows[0]["agent_scores"] == {}, "aucune rationale à attribuer sur un ordre manuel"
+
+
+async def test_insights_endpoint_reflects_playbook_learning(flat_market):
+    """Bout en bout par l'API que la page Journal appelle réellement."""
+    from fastapi.testclient import TestClient
+
+    from app.core.security import hash_password
+    from app.main import app
+
+    pick = _pick("USD/CHF")
+    pick["layers"] = {
+        "daily": {"factors": [{"key": "vwap", "score": 0.5}]},
+        "h4": {"factors": [{"key": "vwap", "score": 0.4}]},
+        "m15": {"factors": [{"key": "volume", "score": 0.3}]},
+    }
+    store = get_store()
+    tenant = store.tenants.create(name="insights@test.com")
+    user = store.users.create(
+        tenant_id=tenant.id, email="insights@test.com",
+        password_hash=hash_password("password123"), full_name="Insights",
+    )
+    await execution_service.execute_playbook_trades(
+        store, user.tenant_id, count=1, picks=[pick],
+    )
+    order = execution_service.list_orders(store, user.tenant_id)[0]
+    store.records.put(execution_service.ORDER, order["id"], {
+        **order, "outcome": "won", "realized_pnl": 120.0,
+    }, tenant_id=user.tenant_id)
+
+    client = TestClient(app)
+    r = client.post("/api/auth/login", json={"email": "insights@test.com", "password": "password123"})
+    h = {"Authorization": f"Bearer {r.json()['access_token']}"}
+    r = client.post("/api/billing/checkout/pro", headers=h)
+    assert r.status_code == 200, r.text
+
+    ins = client.get("/api/journal/insights", headers=h).json()
+    assert ins["reliability_source"] == "live"
+    assert ins["trades_learned"] >= 1
+    volume_row = next((row for row in ins["reliability"] if row["agent"] == "volume"), None)
+    assert volume_row is not None, "l'agent volume doit apparaître, nourri par ce trade playbook"
+
+
 # ---------------------------------------------------------------------------------------
 # API — les verdicts sont exposés à l'interface (2.7 côté backend)
 # ---------------------------------------------------------------------------------------

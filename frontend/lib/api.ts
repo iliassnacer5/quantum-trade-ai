@@ -236,9 +236,10 @@ export type JournalInsights = {
   weight_multipliers: Record<string, number>;
   reliability?: { agent: string; samples: number; hit_rate: number; multiplier: number; low_sample?: boolean }[];
   trades_learned?: number;
-  /** 'signals' = mesuré sur le flux « Générer un signal » ; 'training' = repli sur le walk-forward
-   *  nocturne de la stratégie quand ce flux est vide mais que des trades playbook existent. */
-  reliability_source?: 'signals' | 'training';
+  /** 'live' = mesuré sur l'expérience vécue du compte (signaux « Analyser ce symbole » ET trades
+   *  playbook clôturés, auto-entrée comprise) ; 'training' = repli sur le walk-forward nocturne de
+   *  la stratégie quand rien n'est encore mesurable en direct. */
+  reliability_source?: 'live' | 'training';
 };
 
 export type TeamMember = { id: string; email: string; full_name?: string | null; role: string; onboarded: boolean };
