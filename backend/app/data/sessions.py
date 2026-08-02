@@ -9,6 +9,32 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+# --- AFFICHAGE LOCAL (Maroc) ---------------------------------------------------------------
+# Toute la LOGIQUE ci-dessous (sessions, kill zones, can_trade) reste calculée en UTC — seul
+# ce que l'utilisateur LIT change. Décalage fixe : le Maroc est en GMT+1 toute l'année, SAUF
+# pendant le Ramadan (~1 mois, cf. `playbook_training_hour` dans `core/config.py`) où il repasse
+# à GMT+0. Un décalage fixe ne peut pas suivre ce changement automatiquement — à ajuster
+# manuellement si besoin pendant cette période.
+_DISPLAY_TZ_OFFSET_HOURS = 1
+_DISPLAY_TZ_LABEL = "GMT+1"
+
+
+def _local_hm(dt: datetime) -> str:
+    """Heure courante, décalée pour l'affichage (le calcul interne, lui, reste en UTC)."""
+    local_hour = (dt.hour + _DISPLAY_TZ_OFFSET_HOURS) % 24
+    return f"{local_hour:02d}:{dt.minute:02d} {_DISPLAY_TZ_LABEL}"
+
+
+def _local_range(start: float, end: float) -> str:
+    """Fenêtre horaire (heures UTC décimales de SESSIONS/KILL_ZONES), décalée pour l'affichage."""
+
+    def fmt(h: float) -> str:
+        local_h = (h + _DISPLAY_TZ_OFFSET_HOURS) % 24
+        return f"{int(local_h):02d}:{int(local_h % 1 * 60):02d}"
+
+    return f"{fmt(start)}–{fmt(end)} {_DISPLAY_TZ_LABEL}"
+
+
 # Cryptos majeures — liquides en continu, incluses dans toutes les sessions.
 _CRYPTO = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT"]
 
@@ -177,7 +203,7 @@ def session_context(now: datetime | None = None) -> dict:
         label = "hors sessions majeures (liquidité faible)" if not active else "session asiatique seule"
     tradable, trade_reason = can_trade(now)
     return {
-        "utc_time": now.strftime("%H:%M UTC"),
+        "utc_time": _local_hm(now),
         "active": active,
         "active_labels": [SESSIONS[a]["label"] for a in active],
         "kill_zones": [z["id"] for z in zones],
@@ -205,8 +231,7 @@ def _next_window(now: datetime) -> dict | None:
     delta_h, zone = upcoming[0]
     return {"id": zone["id"], "label": zone["label"],
             "starts_in_minutes": int(round(delta_h * 60)),
-            "window_utc": f"{int(zone['start']):02d}:{int(zone['start'] % 1 * 60):02d}–"
-                          f"{int(zone['end']):02d}:{int(zone['end'] % 1 * 60):02d} UTC"}
+            "window_utc": _local_range(zone["start"], zone["end"])}
 
 
 def session_universe(session: str) -> list[dict]:
@@ -239,20 +264,19 @@ def overview(now: datetime | None = None) -> dict:
     active = current_sessions(now)
     ctx = session_context(now)
     return {
-        "utc_time": now.strftime("%H:%M UTC"),
+        "utc_time": _local_hm(now),
         "active": active,
         "context": ctx,
         "kill_zones": [
             {**z, "active": z["id"] in ctx["kill_zones"],
-             "window_utc": f"{int(z['start']):02d}:{int(z['start'] % 1 * 60):02d}–"
-                           f"{int(z['end']):02d}:{int(z['end'] % 1 * 60):02d}"}
+             "window_utc": _local_range(z["start"], z["end"])}
             for z in KILL_ZONES
         ],
         "sessions": [
             {
                 "id": name,
                 "label": s["label"],
-                "window_utc": f"{s['start']:02d}:00–{s['end']:02d}:00",
+                "window_utc": _local_range(s["start"], s["end"]),
                 "open": name in active,
                 "symbol_count": len(session_universe(name)),
             }
