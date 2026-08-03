@@ -81,18 +81,40 @@ MARKET_LABELS = {"forex": "Forex", "commodity": "Métaux précieux", "index": "I
                  "stock": "Actions", "crypto": "Crypto"}
 
 
+def tradable(symbols: list[str]) -> list[str]:
+    """Retire les marchés et instruments que le desk REFUSE de trader.
+
+    Le backtest ne mesure que ce qui peut réellement être tradé, et c'est une décision (03/08/2026),
+    pas une limite technique. Mesurer un marché exclu coûtait trois choses :
+
+    1. **du temps** — 31 des 88 symboles du catalogue (la crypto entière plus XAU/USD), soit 35 % du
+       calcul, sur une passe 1 h qui dure déjà plus de 40 minutes ;
+    2. **du débit fournisseur** — c'est ce balayage qui continuait de marteler l'API Binance ;
+    3. **la justesse du verdict**, et c'est le plus grave : l'espérance globale mélangeait des
+       marchés tradés et non tradés. Un « +0,12 R, marginal » qui inclut la crypto à -0,32 R ne
+       décrit pas le desk, il décrit un desk imaginaire qui traderait tout.
+
+    Point de vérité unique : c'est `playbook_service.is_excluded` qui tranche ici comme au balayage
+    des trades et à l'ouverture de position. Rouvrir un marché dans la configuration le fait donc
+    revenir dans le backtest tout seul — il n'y a rien à resynchroniser à la main.
+    """
+    from app.services import playbook_service
+
+    return [s for s in symbols if not playbook_service.is_excluded(s)]
+
+
 def full_universe() -> list[str]:
-    """TOUT le catalogue — c'est l'univers par défaut du backtest.
+    """Le catalogue TRADABLE — c'est l'univers par défaut du backtest.
 
     La fréquence d'opportunité mesurée est d'environ 0,085 trade par jour et par symbole (entrée
-    évaluée en 1 h), avec un écart considérable d'un marché à l'autre : l'or en produit environ sept
-    fois plus qu'EUR/USD. Le nombre de trades dépend donc AVANT TOUT du nombre de symboles balayés,
-    et c'est le seul levier de volume qui ne coûte rien en qualité — élargir n'assouplit aucune
-    règle, chaque trade reste soumis aux trois étapes.
+    évaluée en 1 h), avec un écart considérable d'un marché à l'autre. Le nombre de trades dépend
+    donc AVANT TOUT du nombre de symboles balayés, et c'est le seul levier de volume qui ne coûte
+    rien en qualité — élargir n'assouplit aucune règle, chaque trade reste soumis aux trois étapes.
+    Élargir veut dire ajouter des symboles TRADABLES, jamais rouvrir un marché exclu.
     """
     from app.data import symbols as symbols_catalog
 
-    return [i["symbol"] for i in symbols_catalog.all_symbols()]
+    return tradable([i["symbol"] for i in symbols_catalog.all_symbols()])
 
 
 DEFAULT_UNIVERSE = CORE_UNIVERSE   # remplacé par `full_universe()` à l'appel (import paresseux)
@@ -1054,7 +1076,7 @@ async def run_backtest(store=None, *, universe: list[str] | None = None,  # noqa
     fiabilité, et le profil commun des trades qui ont touché le stop.
     """
     s = get_settings()
-    universe = universe or full_universe()
+    universe = tradable(universe or full_universe())
     deep = s.playbook_backtest_deep_enabled if deep is None else deep
     deep_step = s.playbook_backtest_deep_step if deep_step is None else deep_step
     deep_years = s.playbook_backtest_deep_years if deep_years is None else deep_years
@@ -1437,7 +1459,7 @@ async def run_volatility_ab(
     Le gagnant n'est pas appliqué automatiquement : changer la stratégie est une décision, le rôle
     du run est de la rendre possible avec des chiffres. Le résultat est persisté pour l'interface.
     """
-    universe = universe or DEFAULT_UNIVERSE
+    universe = tradable(universe or DEFAULT_UNIVERSE)
     if _state["running"]:
         raise RuntimeError("un backtest est déjà en cours — attendre qu'il se termine")
     _state.update(running=True, started_at=datetime.now(UTC).isoformat())
@@ -1521,7 +1543,7 @@ async def run_strategy_ab(
 
     Comme pour l'A/B volatilité, la gagnante n'est PAS appliquée automatiquement.
     """
-    universe = universe or DEFAULT_UNIVERSE
+    universe = tradable(universe or DEFAULT_UNIVERSE)
     if _state["running"]:
         raise RuntimeError("un backtest est déjà en cours — attendre qu'il se termine")
     _state.update(running=True, started_at=datetime.now(UTC).isoformat())
@@ -1609,7 +1631,7 @@ async def run_volume_ab(
     variante n'est retenue que si elle augmente le total SANS dégrader le profit factor ni le
     drawdown — c'est le critère explicite du desk, et il n'est pas appliqué automatiquement.
     """
-    universe = universe or full_universe()
+    universe = tradable(universe or full_universe())
     variants = variants or VOLUME_VARIANTS
     if _state["running"]:
         raise RuntimeError("un backtest est déjà en cours — attendre qu'il se termine")

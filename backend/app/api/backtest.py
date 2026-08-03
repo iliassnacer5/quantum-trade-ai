@@ -96,12 +96,17 @@ async def playbook_markets(
     """
     from app.backtest import playbook_backtest as pbt
 
+    # Les marchés EXCLUS ne sont pas proposés : les afficher laisserait croire qu'on peut les
+    # backtester, alors que `run_pass` filtre désormais l'univers et rendrait zéro trade. Un marché
+    # dont il ne reste aucun symbole tradable disparaît donc de la liste (cf. `pbt.tradable`).
+    markets = [
+        {"market": cls, "label": pbt.MARKET_LABELS.get(cls, cls),
+         "symbols": tradable_syms, "count": len(tradable_syms)}
+        for cls, syms in pbt.MARKET_UNIVERSES.items()
+        if (tradable_syms := pbt.tradable(syms))
+    ]
     return {
-        "markets": [
-            {"market": cls, "label": pbt.MARKET_LABELS.get(cls, cls),
-             "symbols": syms, "count": len(syms)}
-            for cls, syms in pbt.MARKET_UNIVERSES.items()
-        ],
+        "markets": markets,
         "entry_timeframes": [
             {"tf": "1h", "label": "1 h — profondeur maximale (~2 ans)",
              "note": "la passe qui donne le recul statistique"},

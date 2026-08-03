@@ -1696,3 +1696,30 @@ def test_no_background_loop_scans_an_excluded_market():
     assert "XAU/USD" not in mapped and "XAU/USD" not in opinions
     # ...et ce qui reste tradable doit continuer d'être cartographié, sinon on a cassé la carte.
     assert {"EUR/USD", "XAG/USD"} <= mapped
+
+
+def test_the_backtest_only_measures_what_can_be_traded():
+    """Le backtest ne mesure plus les marchés exclus (décision du 03/08/2026).
+
+    Trois raisons, dont la dernière est la vraie : 31 des 88 symboles du catalogue étaient mesurés
+    pour rien (35 % du calcul), c'était ce balayage qui martelait encore l'API Binance, et surtout
+    l'espérance globale MÉLANGEAIT tradé et non-tradé — un « +0,12 R » incluant la crypto à -0,32 R
+    ne décrit pas le desk.
+
+    Le filtre passe par `playbook_service.is_excluded`, le même point de vérité qu'au balayage des
+    trades : rouvrir un marché dans la configuration le fait revenir ici tout seul.
+    """
+    from app.backtest import playbook_backtest as pbt
+
+    with _desk_exclusions():
+        universe = pbt.full_universe()
+        # Un univers passé EXPLICITEMENT doit être filtré lui aussi, sinon le filtre se contourne
+        # d'un simple paramètre.
+        forced = pbt.tradable(["BTC/USDT", "XAU/USD", "EUR/USD", "GER40"])
+
+    assert not (set(universe) & {"BTC/USDT", "ETH/USDT", "NEAR/USDT"}), "crypto encore backtestée"
+    assert "XAU/USD" not in universe
+    assert forced == ["EUR/USD", "GER40"]
+    # ...et ce qui reste tradable doit continuer d'être mesuré, sinon on a cassé le backtest.
+    assert {"EUR/USD", "XAG/USD", "GER40"} <= set(universe)
+    assert len(universe) > 40, f"univers trop maigre ({len(universe)}) : le filtre a trop coupé"
