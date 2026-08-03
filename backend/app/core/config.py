@@ -488,7 +488,15 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     secret_key: str = "change-me"
-    access_token_expire_minutes: int = 60
+    # DURÉE DE SESSION : 30 jours (43 200 min), relevée de 60 min le 03/08/2026 à la demande —
+    # se reconnecter toutes les heures rendait le desk inutilisable pour un suivi de positions.
+    # Ce que ça coûte, et il faut le savoir : il n'y a PAS de mécanisme de révocation ni de jeton de
+    # rafraîchissement. Un jeton qui fuite (poste partagé, historique de navigateur, capture d'écran
+    # d'un en-tête) reste donc valable un mois, et le seul moyen de l'invalider est de changer
+    # `secret_key` — ce qui déconnecte TOUT LE MONDE d'un coup.
+    # C'est un compromis assumé pour un déploiement PRIVÉ à deux comptes (cf. `allow_registration`
+    # ci-dessous). Sur un déploiement ouvert, il faudrait des jetons courts + rafraîchissement.
+    access_token_expire_minutes: int = 43_200
     cors_origins: str = "http://localhost:3000"
     # Usage privé (2 personnes) : une fois les comptes créés, mettre à false pour fermer
     # /api/auth/register — sinon n'importe qui trouvant l'URL peut créer un compte et consommer

@@ -1145,6 +1145,12 @@ export const api = {
   setAutoTrade: (enabled: boolean) =>
     req<{ auto_trade: boolean }>(`/api/agents/auto-trade?enabled=${enabled}`, { method: 'POST' }),
   agentsStatus: () => req<AgentStatus>('/api/agents/status'),
+  /** Choisit le modèle LLM servant un RÔLE (master, reasoning, fast, vision, grounding). */
+  setAgentModel: (role: string, model: string) =>
+    req<{ role: string; model: string }>('/api/agents/model', {
+      method: 'POST',
+      body: JSON.stringify({ role, model }),
+    }),
   /** LA stratégie décrite de A à Z, avec les seuils réellement appliqués par le moteur. */
   strategySpec: () => req<StrategySpec>('/api/agents/strategy'),
   // Phase 3
