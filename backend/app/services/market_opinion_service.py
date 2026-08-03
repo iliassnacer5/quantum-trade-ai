@@ -50,10 +50,16 @@ DEFAULT_SYMBOLS = [
 
 
 def symbols() -> list[str]:
-    """Univers analysé, depuis la configuration (repli sur `DEFAULT_SYMBOLS`)."""
+    """Univers analysé, depuis la configuration (repli sur `DEFAULT_SYMBOLS`).
+
+    Ce que le desk REFUSE de trader en est retiré : produire chaque jour un avis motivé sur un
+    marché exclu coûte des requêtes et un appel LLM pour une conclusion inexploitable.
+    """
+    from app.services import playbook_service
+
     raw = get_settings().market_opinion_symbols or ""
     parsed = [s.strip().upper() for s in raw.split(",") if s.strip()]
-    return parsed or DEFAULT_SYMBOLS
+    return [s for s in (parsed or DEFAULT_SYMBOLS) if not playbook_service.is_excluded(s)]
 
 
 # --- Lecture d'un avis, en français ----------------------------------------------------------

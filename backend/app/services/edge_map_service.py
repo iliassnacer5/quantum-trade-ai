@@ -23,14 +23,22 @@ logger = logging.getLogger(__name__)
 STRATEGY_ID = "playbook"
 STRATEGY_NAME = "Playbook — confluence multi-indicateurs"
 
-#: Univers balayé : TOUT le catalogue, comme la stratégie elle-même. Une carte de l'edge qui ne
-#: couvre qu'un sixième des symboles ne peut pas répondre à « où gagne-t-on », elle répond à « où
-#: gagne-t-on parmi ceux que j'ai choisi de regarder » — ce qui est une autre question.
+#: Univers balayé : tout le catalogue MOINS ce que le desk refuse de trader. Une carte de l'edge
+#: qui ne couvre qu'un sixième des symboles ne peut pas répondre à « où gagne-t-on », elle répond à
+#: « où gagne-t-on parmi ceux que j'ai choisi de regarder » — ce qui est une autre question. Mais
+#: cartographier un marché EXCLU n'a pas de sens non plus : la carte sert à décider où trader, et
+#: ces symboles ne seront jamais tradés. Le balayage leur coûtait des requêtes réseau et du CPU
+#: (deux unités de temps par symbole, en boucle de fond) pour une réponse inutilisable.
+#: C'est ce qui continuait d'appeler Binance après l'exclusion de la crypto : cette boucle ne passe
+#: pas par `playbook_service.daily_universe`, elle lisait le catalogue en direct.
 def universe() -> dict[str, list[str]]:
     from app.data import symbols as symbols_catalog
+    from app.services import playbook_service
 
     out: dict[str, list[str]] = {}
     for item in symbols_catalog.all_symbols():
+        if playbook_service.is_excluded(item["symbol"]):
+            continue
         out.setdefault(item["asset_class"], []).append(item["symbol"])
     return out
 

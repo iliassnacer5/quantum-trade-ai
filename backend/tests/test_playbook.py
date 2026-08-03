@@ -1673,3 +1673,26 @@ def test_the_exclusion_settings_drive_the_exclusion():
         assert {"crypto", "commodity"} <= classes
     finally:
         s.playbook_excluded_classes, s.playbook_excluded_symbols = prev_cls, prev_syms
+
+
+def test_no_background_loop_scans_an_excluded_market():
+    """Les boucles de FOND doivent respecter l'exclusion, pas seulement le balayage des trades.
+
+    Régression réelle du 03/08/2026 : la crypto avait bien disparu des trades, mais le backend
+    continuait d'appeler Binance en boucle. La carte de l'edge (`edge_map_service.universe`) et
+    l'avis de marché lisent le catalogue EN DIRECT — ils ne passent pas par
+    `playbook_service.daily_universe`, donc le filtre ne les touchait pas. Cartographier un marché
+    qu'on ne tradera jamais coûte des requêtes et du CPU pour une réponse inutilisable.
+    """
+    from app.services import edge_map_service, market_opinion_service
+
+    with _desk_exclusions():
+        mapped = {s for syms in edge_map_service.universe().values() for s in syms}
+        opinions = set(market_opinion_service.symbols())
+
+    assert not (mapped & {"BTC/USDT", "ETH/USDT", "NEAR/USDT"}), (
+        "la carte de l'edge balaie encore la crypto : c'est ce qui rappelait Binance en boucle"
+    )
+    assert "XAU/USD" not in mapped and "XAU/USD" not in opinions
+    # ...et ce qui reste tradable doit continuer d'être cartographié, sinon on a cassé la carte.
+    assert {"EUR/USD", "XAG/USD"} <= mapped
