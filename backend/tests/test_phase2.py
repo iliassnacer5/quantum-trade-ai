@@ -194,9 +194,9 @@ def test_agents_status_endpoint():
     assert names[0] == "playbook"  # agent chef de file
     assert data["strategy"]["min_risk_reward"] == 2.0
     assert data["strategy"]["max_risk_reward"] == 3.0
-    # Plancher d'objectif : 50 pips (décision du 28/07/2026, remplace les 200 pips). L'ATR
-    # journalier ne participe plus au calcul du profit.
-    assert data["strategy"]["min_target_pips"] == 50.0
+    # AUCUN plancher d'objectif en pips (03/08/2026) : ni le SL ni le TP ne sont définis par une
+    # distance prédéfinie — ils sortent des niveaux du graphique, encadrés par le seul R/R.
+    assert data["strategy"]["min_target_pips"] == 0.0
     assert data["strategy"]["entry_timeframe"] == "15m"
     assert data["strategy"]["confirm_timeframe"] == "1h"
     # Le stop ne vit plus sur une unité de temps fixe : il est posé sur le niveau qui invalide le

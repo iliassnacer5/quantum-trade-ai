@@ -296,6 +296,8 @@ export type AgentStatus = {
   status: string;
   llm_enabled: boolean;
   providers: { anthropic: boolean; google: boolean };
+  available_models?: string[];
+  role_models?: Record<string, string>;
   agents: AgentInfo[];
   strategy?: {
     name: string; enabled: boolean; veto: boolean; steps: string[];

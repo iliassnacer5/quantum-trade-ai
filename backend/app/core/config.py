@@ -22,7 +22,11 @@ class Settings(BaseSettings):
     daily_digest_enabled: bool = True
 
     # Ingestion temps réel (WebSocket Binance, crypto, gratuit/sans clé).
-    live_ingestion_enabled: bool = True
+    # DÉSACTIVÉE le 03/08/2026 avec le retrait de la crypto : ce flux ne sert QUE des paires
+    # crypto, et plus aucune n'est analysée ni tradée (cf. `playbook_excluded_classes`). Le laisser
+    # tourner maintiendrait une connexion WebSocket permanente vers Binance pour alimenter des
+    # symboles que le desk refuse. La liste est conservée : réactiver, c'est un seul booléen.
+    live_ingestion_enabled: bool = False
     live_symbols: str = "BTC/USDT,ETH/USDT,BNB/USDT,SOL/USDT,XRP/USDT,ADA/USDT,DOGE/USDT,AVAX/USDT"
     live_interval: str = "1h"
     # Refuse de passer un ordre si les données du marché sont synthétiques (démo).
@@ -49,11 +53,14 @@ class Settings(BaseSettings):
     # --- Niveaux du trade : stop et objectif posés sur des NIVEAUX de marché ---------------------
     # Le stop vient de ce qui invalide le scénario (zone d'offre/demande, creux de structure,
     # support/résistance) et l'objectif du premier obstacle réel devant le prix.
-    # OBJECTIF MINIMUM : 50 pips (décision utilisateur du 28/07/2026, remplace les 200 pips).
-    # L'unité reste comparable d'un marché à l'autre : hors forex/métaux, 1 pip = 1 point de base du
-    # prix (cf. `domain/pips.py`), donc 50 pips = 0,5 % de mouvement aussi bien sur le DAX que sur
-    # BTC. C'est ce plancher-là qui commande désormais l'échelle du trade, plus l'ATR.
-    playbook_min_target_pips: float = 50.0
+    # AUCUN PLANCHER D'OBJECTIF EN PIPS — supprimé le 03/08/2026 (200 → 50 le 28/07, puis zéro).
+    # Règle du desk : le SL et le TP ne sont JAMAIS définis par une distance fixe ni un nombre de
+    # pips prédéfini. Ils sortent des niveaux du graphique, encadrés par le seul R/R.
+    # Effet de bord que ce plancher produisait, et qui était le vrai problème : il imposait un STOP
+    # MINIMUM par ricochet (`target_floor / max_rr`, soit 50 ÷ 3 = 16,7 pips). Sur une majeure forex,
+    # dont le stop structurel 15 min tombe couramment à 10-20 pips, le R/R sortait de la bande par le
+    # haut et le setup était refusé — d'où zéro trade forex alors que crypto et actions passaient.
+    playbook_min_target_pips: float = 0.0
     # ÉCHELLE DU TRADE, en multiples de l'ATR journalier.
     # L'ATR NE BORNE PLUS L'OBJECTIF (`playbook_min_target_atr_daily = 0`) : demandé explicitement —
     # « ne prends pas en considération l'ATR dans le profit ». Le plancher d'objectif est désormais
@@ -304,13 +311,27 @@ class Settings(BaseSettings):
         "EUR/USD,GBP/JPY,NZD/USD,USD/CHF,GBP/USD,AUD/JPY,USD/JPY,AUD/USD,EUR/CAD,EUR/CHF"
     )
     # CLASSES D'ACTIFS INTERDITES AU TRADING — exclusion DURE, pas une simple priorité de balayage.
-    # `commodity` = les métaux précieux (XAU/USD, XAG/USD, XPT/USD, XPD/USD) : exclus sur demande du
-    # desk le 29/07/2026. L'or et l'argent produisent le plus grand nombre de setups du catalogue
-    # (~7× EUR/USD), ils occupaient donc une part démesurée des positions ouvertes alors que le desk
-    # n'en veut aucune. L'exclusion est appliquée à DEUX endroits pour qu'aucun chemin ne la
-    # contourne : le balayage (`playbook_service.daily_universe`) et l'ouverture de position
-    # (`execution_service`), y compris pour un ordre lancé à la main depuis l'interface.
-    playbook_excluded_classes: str = "commodity"
+    # L'exclusion est appliquée à DEUX endroits pour qu'aucun chemin ne la contourne : le balayage
+    # (`playbook_service.daily_universe`) et l'ouverture de position (`execution_service`), y
+    # compris pour un ordre lancé à la main depuis l'interface.
+    #
+    # `crypto` — retirée le 03/08/2026 sur demande du desk (« supprime le crypto de l'analyse, des
+    # trades et de tout »). La mesure allait dans le même sens : sur la passe portée, la crypto est
+    # le SEUL marché à espérance nettement négative (-0,32 R sur 75 trades), et 18 de ses
+    # 19 instruments n'avaient même pas l'échantillon minimal pour être notés. Le flux d'ingestion
+    # temps réel, qui ne sert que des paires crypto, est coupé en même temps (`live_ingestion_enabled`).
+    #
+    # `commodity` — RÉTABLIE le 03/08/2026 : l'exclusion de la classe entière (29/07) visait l'or,
+    # mais emportait XAG/USD (+0,21 R), XPT/USD (+0,11 R) et XPD/USD (+0,09 R), tous trois mesurés
+    # rentables. Une exclusion de classe ne sait pas viser : l'or est désormais retiré nommément
+    # (cf. `playbook_excluded_symbols`) et les trois autres métaux reviennent.
+    playbook_excluded_classes: str = "crypto"
+    # INSTRUMENTS INTERDITS UN PAR UN — même exclusion dure, à la maille du symbole.
+    # `XAU/USD` : mesuré -0,25 R sur 197 trades (23,4 % de réussite), la pire ligne du backtest et
+    # la seule perdante des quatre métaux. C'est aussi le plus gros producteur de setups du
+    # catalogue (~7× EUR/USD) : le garder reviendrait à laisser l'instrument le moins rentable
+    # occuper le plus de positions.
+    playbook_excluded_symbols: str = "XAU/USD"
     # Symboles analysés en parallèle. Chacun déclenche 5 requêtes réseau : au-delà de 4, on se fait
     # limiter en débit par les fournisseurs (Yahoo répond alors 422), ce qui rallonge tout le cycle.
     # Valeur MESURÉE, laissée telle quelle malgré l'élargissement de l'univers : c'est le cache

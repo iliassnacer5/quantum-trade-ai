@@ -214,3 +214,127 @@ def test_without_history_the_gain_is_taken_rather_than_risked():
     res = exits.momentum_still_supports([_c(100, 101, 99, 100)] * 10, 1)
     assert res["ok"] is False
     assert "insuffisant" in res["reasons"][0]
+
+
+# --- Pools de liquidité et niveaux cassés (BOS/CHOCH) --------------------------------------------
+
+def _pool(price: float, side: str, touches: int = 3, strength: float = 0.85) -> dict:
+    return {"price": price, "side": side, "touches": touches, "strength": strength,
+            "first_index": 0, "last_index": 10}
+
+
+def test_the_stop_goes_beyond_a_liquidity_pool_never_in_front_of_it():
+    """LE point de la liquidité : un stop posé avant l'amas est le premier servi au balayage.
+
+    Achat à 100 avec des creux égaux à 97 : un stop à 97,5 serait pris quand le marché descend
+    chercher les ordres accumulés — souvent juste avant de repartir à la hausse. Le stop doit
+    passer SOUS 97.
+    """
+    stop, why = exits.plan_stop(
+        entry=100.0, direction=1, h4=[], zones=[], sr_levels=[], structure={}, atr15=0.4,
+        min_distance=1.0, max_distance=6.0, liquidity=[_pool(97.0, "low")],
+    )
+    assert stop < 97.0, f"stop à {stop} : il est DEVANT le pool, il sera balayé"
+    assert "pool de liquidité" in why and "balayé" in why
+
+
+def test_a_stop_in_front_of_a_pool_loses_against_one_beyond_it():
+    """Le candidat exposé au balayage existe toujours, mais il doit PERDRE.
+
+    Ici la zone de demande (98) est plus proche et solide, mais elle laisse le stop au-dessus des
+    creux égaux à 97 : c'est exactement le placement qui se fait balayer.
+    """
+    stop, why = exits.plan_stop(
+        entry=100.0, direction=1, h4=[], zones=[_zone("demand", 98.0, 98.5, strength=0.95)],
+        sr_levels=[], structure={}, atr15=0.2, min_distance=0.5, max_distance=6.0,
+        liquidity=[_pool(97.0, "low")],
+    )
+    assert stop < 97.0, f"stop à {stop} : la zone exposée au balayage a gagné à tort"
+    assert "pool de liquidité" in why
+
+
+def test_the_broken_bos_level_can_carry_the_stop():
+    """On est entré PARCE QUE ce niveau a cédé : le repasser annule la raison d'être là."""
+    stop, why = exits.plan_stop(
+        entry=100.0, direction=1, h4=[], zones=[], sr_levels=[], structure={}, atr15=0.4,
+        min_distance=1.0, max_distance=6.0,
+        bos={"level": 97.5, "index": 5, "bars_ago": 1, "close": 98.0},
+    )
+    assert stop < 97.5
+    assert "BOS" in why and "cassure" in why
+
+
+def test_a_stale_break_is_less_reliable_than_a_fresh_one():
+    """Une cassure vieille de vingt bougies a été digérée : elle pèse moins qu'une fraîche.
+
+    Les deux candidats sont à la même distance et de même nature — seule la fraîcheur les sépare,
+    donc c'est bien elle que ce test mesure.
+    """
+    # Une cassure FRAÎCHE doit battre un pivot de structure ; la même cassure devenue vieille doit
+    # lui céder la place. C'est la seule façon de mesurer la fraîcheur : la faire changer de camp.
+    pivot_structure = {"last_higher_low": 96.0}
+
+    def _stop(bars_ago: int) -> str:
+        _, why = exits.plan_stop(
+            entry=100.0, direction=1, h4=[], zones=[], sr_levels=[],
+            structure=pivot_structure, atr15=0.1, min_distance=1.0, max_distance=6.0,
+            bos={"level": 97.5, "index": 5, "bars_ago": bars_ago, "close": 98.0},
+        )
+        return why
+
+    assert "BOS" in _stop(0), "une cassure toute fraîche doit porter le stop"
+    assert "creux plus haut" in _stop(19), (
+        "une cassure de 19 bougies a été digérée : le pivot de structure doit reprendre la main"
+    )
+
+
+def test_the_stop_prefers_the_most_reliable_level_not_the_closest():
+    """Le stop va au niveau le plus SOLIDE, pas au plus proche.
+
+    Un micro-pivot touché une fois (note 0,55) ne doit pas passer devant un support testé douze
+    fois sur trois unités de temps (note 1,00) au seul motif qu'il est plus près : c'est ce qui
+    produisait des stops serrés posés sur du vide.
+    """
+    weak = _level(98.5, "support", score=0.55, touches=1)
+    strong = {**_level(96.5, "support", score=1.0, touches=12),
+              "timeframes": ["15m", "1h", "4h"]}
+    stop, why = exits.plan_stop(
+        entry=100.0, direction=1, h4=[], zones=[], sr_levels=[weak, strong], structure={},
+        atr15=0.2, min_distance=0.5, max_distance=6.0,
+    )
+    assert stop < 96.5, f"stop à {stop} : le micro-pivot a gagné alors qu'il est moins fiable"
+    assert "12 fois" in why
+
+
+def test_equally_reliable_levels_are_split_by_the_tighter_stop():
+    """À solidité égale, le plus serré gagne : il donne le meilleur R/R, et rien ne le dépare."""
+    near = _level(98.0, "support", score=0.9, touches=5)
+    far = _level(95.0, "support", score=0.9, touches=5)
+    stop, _ = exits.plan_stop(
+        entry=100.0, direction=1, h4=[], zones=[], sr_levels=[near, far], structure={},
+        atr15=0.2, min_distance=0.5, max_distance=6.0,
+    )
+    assert 97.0 < stop < 98.0, f"stop à {stop} : à fiabilité égale, le plus serré devait gagner"
+
+
+def test_a_liquidity_pool_ahead_becomes_a_target():
+    """Devant nous, l'amas est un AIMANT : le prix va y chercher les ordres accumulés."""
+    plan = exits.plan_targets(
+        entry=100.0, stop=98.0, direction=1, zones=[], sr_levels=[], structure={},
+        fib_ext=None, barrier=None, min_rr=2.0, max_rr=3.0, atr15=0.2,
+        liquidity=[_pool(105.0, "high")],
+    )
+    assert plan["tp1"] is not None
+    assert plan["tp1"] < 105.0, "on vise JUSTE AVANT l'amas, pas dedans"
+    assert "pool de liquidité" in plan["target_basis"]
+    assert 2.0 <= plan["rr"] <= 3.0
+
+
+def test_liquidity_behind_us_is_never_used_as_a_target():
+    """Un pool du mauvais côté n'est pas un objectif : on ne vise pas derrière soi."""
+    plan = exits.plan_targets(
+        entry=100.0, stop=98.0, direction=1, zones=[], sr_levels=[], structure={},
+        fib_ext=None, barrier=None, min_rr=2.0, max_rr=3.0, atr15=0.2,
+        liquidity=[_pool(95.0, "low")],
+    )
+    assert "pool" not in plan["target_basis"]

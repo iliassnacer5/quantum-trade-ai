@@ -141,12 +141,24 @@ def watchlist_symbols() -> list[str]:
 def excluded_classes() -> set[str]:
     """Classes d'actifs INTERDITES au trading (`playbook_excluded_classes`).
 
-    Par défaut `commodity` : les métaux précieux (or, argent, platine, palladium). C'est une
-    exclusion dure, pas une priorité de balayage — elle vaut aussi bien pour le scan que pour
-    l'ouverture d'une position.
+    Par défaut `crypto` : retirée le 03/08/2026 sur demande du desk, et la mesure allait dans le
+    même sens (seul marché à espérance nettement négative). C'est une exclusion dure, pas une
+    priorité de balayage — elle vaut aussi bien pour le scan que pour l'ouverture d'une position.
     """
     raw = get_settings().playbook_excluded_classes or ""
     return {c.strip().lower() for c in raw.split(",") if c.strip()}
+
+
+def excluded_symbols() -> set[str]:
+    """Instruments INTERDITS un par un (`playbook_excluded_symbols`).
+
+    Complément indispensable de `excluded_classes` : bannir une CLASSE entière pour un seul mauvais
+    instrument coûte tous les autres. C'est exactement ce qui arrivait aux métaux — la classe était
+    exclue à cause de l'or (-0,25 R), ce qui emportait XAG/USD (+0,21 R), XPT/USD (+0,11 R) et
+    XPD/USD (+0,09 R), tous trois mesurés rentables. Une exclusion de classe ne sait pas viser.
+    """
+    raw = get_settings().playbook_excluded_symbols or ""
+    return {s.strip().upper() for s in raw.split(",") if s.strip()}
 
 
 def is_excluded(symbol: str) -> str | None:
@@ -158,9 +170,12 @@ def is_excluded(symbol: str) -> str | None:
     """
     from app.data import markets as markets_mod
 
+    if symbol.strip().upper() in excluded_symbols():
+        return "instrument mesuré perdant sur le backtest (espérance négative)"
     cls = markets_mod.asset_class(symbol)
     if cls in excluded_classes():
-        label = "métaux précieux (or, argent, platine, palladium)" if cls == "commodity" else cls
+        label = {"commodity": "métaux précieux (or, argent, platine, palladium)",
+                 "crypto": "crypto-monnaies"}.get(cls, cls)
         return f"marché exclu du desk : {label}"
     return None
 
@@ -175,9 +190,10 @@ def daily_universe(now: datetime | None = None, limit: int | None = None) -> lis
     `limit=0` (le réglage par défaut) ne coupe RIEN : le catalogue entier est balayé. Un plafond
     décidait d'avance où chercher l'edge ; c'est la mesure qui doit le dire.
 
-    `playbook_excluded_classes` (métaux précieux par défaut) retire des classes ENTIÈRES du
-    balayage : ce n'est pas un ordre de priorité mais une exclusion, et elle est doublée à
-    l'ouverture de position pour qu'aucun chemin ne la contourne (cf. `is_excluded`).
+    `playbook_excluded_classes` (crypto par défaut) retire des classes ENTIÈRES du balayage, et
+    `playbook_excluded_symbols` (XAU/USD par défaut) des instruments un par un. Ce ne sont pas des
+    ordres de priorité mais des exclusions, doublées à l'ouverture de position pour qu'aucun chemin
+    ne les contourne (cf. `is_excluded`).
 
     `playbook_watchlist_only` COURT-CIRCUITE tout ce qui suit : le balayage EN LIGNE (cette
     fonction) ne porte alors que sur les symboles mesurés rentables. Il est désactivé depuis le
@@ -212,9 +228,12 @@ def daily_universe(now: datetime | None = None, limit: int | None = None) -> lis
     def _add(items: list[dict]) -> None:
         for item in items:
             cls = item.get("asset_class", "")
-            # Exclusion DURE d'abord : une classe interdite n'est même pas analysée. Inutile de
-            # dépenser cinq requêtes réseau par symbole pour un marché qu'on ne tradera pas.
-            if cls in banned:
+            # Exclusion DURE d'abord : ce qu'on ne tradera pas n'est même pas analysé. Inutile de
+            # dépenser cinq requêtes réseau par symbole pour un marché ou un instrument interdit.
+            # On passe par `is_excluded` (et non par le seul test de classe) pour que l'exclusion
+            # PAR SYMBOLE morde ici aussi : sans cela, XAU/USD serait analysé, proposé et classé
+            # parmi les trades du jour, pour n'être refusé qu'au moment de passer l'ordre.
+            if cls in banned or is_excluded(item["symbol"]):
                 continue
             if s.playbook_focus_only and focus and cls not in focus:
                 continue

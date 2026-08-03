@@ -73,11 +73,19 @@ from app.domain.indicators import Candle
 # au-delà de trois fois le risque est atteint trop rarement pour ce qu'il fait perdre en chemin.
 MIN_RR = 2.0                 # risque/rendement minimum : le gain vaut au moins 2 fois le risque
 MAX_RR = 3.0                 # risque/rendement maximum
-# OBJECTIF MINIMUM : 50 pips. Le plancher de 200 pips a été explicitement ramené à 50 le
-# 28/07/2026. L'unité reste comparable d'un marché à l'autre : hors forex et métaux, 1 pip vaut
-# 1 point de base du prix (cf. `domain/pips.py`), donc 50 pips = 0,5 % de mouvement, aussi bien sur
-# le DAX que sur BTC. C'est ce plancher qui commande désormais l'échelle du trade.
-MIN_TARGET_PIPS = 50.0
+# AUCUN PLANCHER D'OBJECTIF EN PIPS — supprimé le 03/08/2026 (200 pips → 50 le 28/07, puis zéro).
+# Règle du desk : « le SL et le TP ne doivent JAMAIS être définis avec une distance fixe ou un
+# nombre de pips prédéfini ». Ils sortent désormais uniquement des niveaux du graphique — supports
+# et résistances multi-UT, zones d'offre/demande, extensions de Fibonacci, structure — encadrés par
+# le seul R/R.
+#
+# Ce plancher ne faisait pas que relever l'objectif : il imposait aussi un STOP MINIMUM par
+# ricochet, via `target_floor / max_rr` dans `build` (50 pips ÷ 3 = 16,7 pips). Sur les instruments
+# peu volatils, la fenêtre de stop admissible s'en trouvait réduite à ~17-25 pips, alors qu'un stop
+# structurel 15 min sur une majeure forex tombe couramment à 10-20 pips : le R/R sortait de la bande
+# par le haut et le setup était refusé. C'est la raison pour laquelle le desk ne prenait AUCUN trade
+# forex tout en en prenant sur la crypto et les actions, dont l'amplitude ouvre la fenêtre en grand.
+MIN_TARGET_PIPS = 0.0
 MAX_STOP_PIPS = 150.0        # garde-fou absolu en pips (forex/métaux uniquement)
 
 # DESCRIPTION CANONIQUE DE LA MÉTHODE — une seule source, et c'est délibéré.
@@ -1505,6 +1513,17 @@ def build(
         sd_zones += zones_mod.supply_demand_zones(h1, tf="1h")
     sr_levels = zones_mod.ranked_levels(m15, h1, h4, last_price)
     market_struct = ms_mod.label_swings(m15)
+    # POOLS DE LIQUIDITÉ (sommets/creux ÉGAUX) et niveaux cassés (BOS/CHOCH) : calculés ici pour
+    # servir à l'étape 3. Ils y jouent deux rôles opposés — un pool DEVANT nous est un objectif
+    # probable (le prix va y chercher les ordres accumulés), un pool DERRIÈRE nous est un piège à
+    # stop (s'y arrêter avant, c'est se faire balayer). Le niveau cassé par le BOS/CHOCH, lui, est
+    # l'invalidation la plus littérale du scénario : on est entré parce qu'il a cédé.
+    # Le 1 h est ajouté au 15 min : un amas visible sur deux unités de temps est bien plus défendu.
+    liquidity = ms_mod.liquidity_pools(m15)
+    if h1:
+        liquidity += ms_mod.liquidity_pools(h1)
+    struct_break = ms_mod.detect_bos(m15, entry_direction) if entry_direction else None
+    struct_choch = ms_mod.detect_choch(m15) if entry_direction else None
 
     conf: dict = {"fired": False, "confirmations": [], "score": 0.0, "reason": ""}
     if entry_mode in ("confluence", "hybrid"):
@@ -1640,6 +1659,11 @@ def build(
         "ranked": sr_levels[:5],
         "zones": [z for z in sd_zones[:4]],
         "structure_state": market_struct["state"],
+        # Affiché, pas seulement calculé : un stop placé au-delà d'un pool doit pouvoir être
+        # justifié à l'écran, sinon il a l'air arbitrairement large.
+        "liquidity": liquidity[:4],
+        "bos": struct_break,
+        "choch": struct_choch,
     }
 
     # Repli historique : la structure 4 h, qui reste la référence quand rien de plus fin ne tombe
@@ -1655,6 +1679,7 @@ def build(
         entry=entry, direction=bias, h4=h4, zones=sd_zones, sr_levels=sr_levels,
         structure=market_struct, atr15=atr15,
         min_distance=min_risk, max_distance=max_risk, fallback=(fb_stop, fb_reason),
+        liquidity=liquidity, bos=struct_break, choch=struct_choch,
     )
 
     # --- Variante A/B « stop_atr4h » : stop à k × ATR 4 h, borné par la bande de R/R ---
@@ -1727,6 +1752,7 @@ def build(
         entry=entry, stop=stop, direction=bias, zones=sd_zones, sr_levels=sr_levels,
         structure=market_struct, fib_ext=fib_ext, barrier=barrier,
         min_rr=min_rr, max_rr=max_rr, atr15=atr15, floor_distance=target_floor,
+        liquidity=liquidity,
     )
     tp1 = plan["tp1"]
     tp2 = plan["tp2"]
@@ -1773,26 +1799,47 @@ def build(
     if not rr_ok:
         reasons.append(f"R/R {rr:.2f} hors de la bande {min_rr:g}–{max_rr:g}")
 
-    # L'objectif doit valoir au moins le plancher en PIPS (50 par défaut). L'ATR n'entre plus dans
-    # ce calcul : c'est un nombre de pips, comparable d'un marché à l'autre par construction.
+    # PLUS AUCUN PLANCHER EN PIPS par défaut (`target_floor` vaut 0) : l'objectif sort des NIVEAUX
+    # du graphique, et le R/R est le seul encadrement. Le plancher reste paramétrable pour pouvoir
+    # rejouer l'ancienne échelle dans un A/B, d'où les deux rédactions ci-dessous.
     floor_ok = target_dist >= target_floor - 1e-12
     floor_pips = (target_floor / pip) if pip else 0.0
     floor_atr = (target_dist / atr_daily) if atr_daily > 0 else 0.0
-    checklist.append(_check(
-        7, f"Objectif d'au moins {floor_pips:.0f} {setup.pips_label}", floor_ok,
-        f"{reward_pips:.1f} {setup.pips_label} (TP1 {tp1:.6g}) — {setup.target_basis}",
-        f"TP1 ({tp1:.6g}) est placé devant le premier obstacle réel qui paie le risque pris, et il "
-        f"ne peut pas valoir moins de {floor_pips:.0f} {setup.pips_label}. Hors forex et métaux, "
-        f"1 pip vaut 1 point de base du prix : ce plancher représente donc {floor_pips / 100:.1f} % "
-        f"de mouvement, aussi bien sur une paire de devises que sur un indice ou une action. "
-        f"L'ATR journalier n'intervient PAS dans ce calcul — l'objectif est un nombre de pips, pas "
-        f"un multiple de volatilité (pour information, il vaut ici {floor_atr:.2f} × l'amplitude "
-        f"d'une journée moyenne). Dès que TP1 est touché et que le momentum confirme la suite, le "
-        f"stop remonte à {tp1_lock_fraction:.0%} du chemin parcouru "
-        f"({setup.tp1_lock_stop:.6g}) et la position part chercher TP2."
+    tail = (
+        f" Dès que TP1 est touché et que le momentum confirme la suite, le stop remonte à "
+        f"{tp1_lock_fraction:.0%} du chemin parcouru ({setup.tp1_lock_stop:.6g}) et la position "
+        f"part chercher TP2."
         + (f" TP2 ({tp2:.6g}) — {plan['tp2_basis']}."
            if tp2 is not None else
-           " Aucun second objectif distinct n'est identifiable ici : on n'en invente pas."),
+           " Aucun second objectif distinct n'est identifiable ici : on n'en invente pas.")
+    )
+    if target_floor > 0:
+        label = f"Objectif d'au moins {floor_pips:.0f} {setup.pips_label}"
+        explain = (
+            f"TP1 ({tp1:.6g}) est placé devant le premier obstacle réel qui paie le risque pris, et "
+            f"il ne peut pas valoir moins de {floor_pips:.0f} {setup.pips_label}. Hors forex et "
+            f"métaux, 1 pip vaut 1 point de base du prix : ce plancher représente donc "
+            f"{floor_pips / 100:.1f} % de mouvement. L'ATR journalier n'intervient PAS dans ce "
+            f"calcul (pour information, l'objectif vaut ici {floor_atr:.2f} × l'amplitude d'une "
+            f"journée moyenne)."
+        )
+    else:
+        label = "Objectif posé sur un niveau du marché"
+        explain = (
+            f"TP1 ({tp1:.6g}) est placé devant le premier obstacle réel qui paie le risque pris : "
+            f"résistance ou support classé multi-unités de temps, bord proche d'une zone d'offre ou "
+            f"de demande, extension de Fibonacci, ou dernier sommet/creux de structure. "
+            f"AUCUNE distance minimale en pips ne s'applique — un objectif ne se décrète pas, il se "
+            f"lit sur le graphique ; le seul encadrement est le rapport risque/rendement "
+            f"(1:{min_rr:g} à 1:{max_rr:g}). L'ATR journalier n'entre pas non plus dans ce calcul "
+            f"(pour information, l'objectif vaut ici {floor_atr:.2f} × l'amplitude d'une journée "
+            f"moyenne). Quand aucun niveau ne tombe dans la bande, TP1 est posé arithmétiquement au "
+            f"R/R minimum et le motif le dit franchement plutôt que d'inventer un niveau."
+        )
+    checklist.append(_check(
+        7, label, floor_ok,
+        f"{reward_pips:.1f} {setup.pips_label} (TP1 {tp1:.6g}) — {setup.target_basis}",
+        explain + tail,
     ))
     if not floor_ok:
         reasons.append(

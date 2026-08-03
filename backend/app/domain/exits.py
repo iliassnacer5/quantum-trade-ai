@@ -29,32 +29,75 @@ LEVEL_BUFFER_ATR = 0.25
 # en dessous, c'est un micro-pivot que le marché ne défend pas.
 MIN_LEVEL_SCORE = 0.5
 
+# --- FIABILITÉ D'UN NIVEAU QUI PORTE LE STOP ---------------------------------------------------
+# Le stop ne va plus au niveau le plus PROCHE mais au plus SOLIDE : un support testé douze fois sur
+# trois unités de temps protège mieux qu'un micro-pivot touché une fois, même s'il est plus loin.
+# Chaque poids est multiplié par la solidité MESURÉE du niveau (note du S/R, force de la zone,
+# nombre de pivots alignés du pool), pour que ce soit le graphique qui tranche et non un classement
+# figé. Un `LEVEL_WEIGHT` à 1,00 sur une note de 0,5 vaut donc 0,50, sous une zone à 0,95.
+#
+# L'ordre traduit ce que chaque niveau PROUVE, pas un gain constaté : il n'a pas été validé par un
+# backtest, et c'est écrit ici pour que personne ne le prenne pour une mesure.
+LEVEL_WEIGHT = 1.00        # S/R classé : la note intègre déjà touches et multi-unités de temps
+LIQUIDITY_WEIGHT = 0.95    # au-delà d'un pool : le seul placement qui protège d'un balayage
+ZONE_WEIGHT = 0.90         # zone d'offre/demande d'entrée : sa traversée tue l'idée
+BREAK_WEIGHT = 0.85        # niveau cassé par le BOS/CHOCH, pondéré par la fraîcheur de la cassure
+PIVOT_WEIGHT = 0.70        # dernier HL/LH : solide, mais un seul point de contact
+# Un stop placé entre le prix et un pool de liquidité sera servi lors du balayage : on le dégrade
+# fortement plutôt que de l'interdire — mieux vaut un stop exposé que pas de trade du tout.
+SWEEP_PENALTY = 0.35
+
 
 def plan_stop(
     *, entry: float, direction: int, h4: list[Candle], zones: list[dict],
     sr_levels: list[dict], structure: dict, atr15: float,
     min_distance: float, max_distance: float,
     fallback: tuple[float, str] | None = None,
+    liquidity: list[dict] | None = None,
+    bos: dict | None = None, choch: dict | None = None,
 ) -> tuple[float, str]:
     """Place le stop au niveau qui INVALIDE le scénario, et le nomme.
 
-    Les candidats sont essayés dans l'ordre de ce qu'ils prouvent :
+    Chaque candidat est un NIVEAU qui, s'il est traversé, rend le scénario faux :
 
     1. **la zone d'offre/demande d'où l'on entre** — si le prix la traverse, les ordres qu'on
        attendait n'étaient pas là : l'idée est morte ;
     2. **le dernier creux plus haut (ou sommet plus bas)** — sa perte casse la séquence HH/HL qui
        définissait la tendance ;
-    3. **un support/résistance classé** suffisamment solide ;
-    4. à défaut, la **structure 4 h** (`fallback`), qui reste la référence quand rien de plus fin
-       n'est exploitable.
+    3. **le niveau cassé par le BOS / CHOCH** — on est entré PARCE QUE ce niveau a cédé ; si le prix
+       repasse derrière, la cassure était fausse et il n'y a plus de raison d'être là ;
+    4. **au-delà d'un pool de liquidité** — voir plus bas, c'est le seul candidat qui protège ;
+    5. **un support/résistance classé** suffisamment solide ;
+    6. à défaut, la **structure 4 h** (`fallback`).
 
-    Le premier candidat dont la distance tombe dans ``[min_distance, max_distance]`` gagne : c'est
-    le stop le plus SERRÉ qui ait encore un sens de marché, donc le meilleur rapport possible.
+    **Le choix ne se fait plus sur la distance, mais sur la FIABILITÉ du niveau.** Le code retenait
+    auparavant le premier candidat de la liste tombant dans la bande, c'est-à-dire le plus serré :
+    un micro-pivot touché une fois passait devant une résistance testée douze fois sur trois unités
+    de temps, au seul motif qu'il était plus proche. On classe désormais par solidité MESURÉE du
+    niveau — nombre de touches, confirmation multi-unités de temps, force de la zone, nombre de
+    pivots alignés — et la distance ne sert plus qu'à départager deux niveaux aussi solides (le plus
+    serré gagne alors, il donne le meilleur R/R).
+
+    **Les pools de liquidité sont traités à part, parce qu'ils se comportent à l'envers.** Un stop
+    posé ENTRE le prix et un amas de creux égaux est le premier servi quand le marché vient balayer
+    cet amas — souvent juste avant de repartir dans notre sens. Un tel candidat est donc fortement
+    dégradé (`SWEEP_PENALTY`), et le passage AU-DELÀ du pool est proposé comme candidat à part
+    entière. Quand il tient dans la bande de risque, c'est lui qui gagne.
+
+    Réserve à ne pas cacher : cette hiérarchie de fiabilité s'appuie sur des grandeurs réellement
+    mesurées sur le graphique (touches, unités de temps, alignements), mais l'ORDRE lui-même n'a pas
+    été validé par un backtest — il traduit ce que les niveaux prouvent, pas un gain constaté.
 
     Retourne ``(prix, motif)`` — le motif nomme toujours le niveau retenu.
     """
     buffer = LEVEL_BUFFER_ATR * max(atr15, 0.0)
-    candidates: list[tuple[float, str]] = []
+    sign = 1 if direction > 0 else -1
+    # (prix, motif, fiabilité) — la fiabilité décide, la distance ne fait que départager.
+    candidates: list[tuple[float, str, float]] = []
+
+    def _beyond(level: float) -> float:
+        """Le stop se pose TOUJOURS derrière le niveau, jamais dessus (une mèche suffirait)."""
+        return level - sign * buffer
 
     kind = "demand" if direction > 0 else "supply"
     for z in zones:
@@ -63,17 +106,56 @@ def plan_stop(
         edge = z["low"] if direction > 0 else z["high"]
         side_txt = "de demande" if direction > 0 else "d'offre"
         candidates.append((
-            edge - buffer if direction > 0 else edge + buffer,
+            _beyond(edge),
             f"zone {side_txt} {edge:.6g} (force {z['strength']:.2f}) — traversée, elle invalide "
             f"l'entrée",
+            ZONE_WEIGHT * float(z["strength"]),
         ))
 
     pivot = structure.get("last_higher_low") if direction > 0 else structure.get("last_lower_high")
     if pivot is not None:
         label = "dernier creux plus haut" if direction > 0 else "dernier sommet plus bas"
         candidates.append((
-            pivot - buffer if direction > 0 else pivot + buffer,
+            _beyond(pivot),
             f"{label} {pivot:.6g} — sa perte casse la structure de la tendance",
+            PIVOT_WEIGHT,
+        ))
+
+    # --- BOS / CHOCH : le niveau dont la cassure a justifié l'entrée ---------------------------
+    # Sa reprise en sens inverse est l'invalidation la plus littérale qui soit : on est entré parce
+    # qu'il a cédé. Plus la cassure est FRAÎCHE, plus ce niveau est pertinent — une cassure de
+    # vingt bougies a déjà été digérée par le marché.
+    for label, event in (("cassure de structure (BOS)", bos), ("changement de caractère (CHOCH)", choch)):
+        if not event or event.get("level") is None:
+            continue
+        level = float(event["level"])
+        # Un niveau du mauvais côté du prix ne peut pas porter un stop.
+        if (direction > 0 and level >= entry) or (direction < 0 and level <= entry):
+            continue
+        freshness = max(0.0, 1.0 - float(event.get("bars_ago", 0)) / 20.0)
+        candidates.append((
+            _beyond(level),
+            f"{label} {level:.6g} — le repasser annule la cassure qui a justifié l'entrée",
+            BREAK_WEIGHT * (0.6 + 0.4 * freshness),
+        ))
+
+    # --- Pools de liquidité : passer AU-DELÀ, jamais devant --------------------------------------
+    # Côté du stop : sous le prix pour un achat (creux égaux), au-dessus pour une vente.
+    pool_side = "low" if direction > 0 else "high"
+    threats: list[dict] = []
+    for pool in (liquidity or []):
+        if pool["side"] != pool_side:
+            continue
+        level = float(pool["price"])
+        if (direction > 0 and level >= entry) or (direction < 0 and level <= entry):
+            continue
+        threats.append(pool)
+        kind_txt = "creux égaux" if direction > 0 else "sommets égaux"
+        candidates.append((
+            _beyond(level),
+            f"au-delà du pool de liquidité {level:.6g} ({pool['touches']} {kind_txt}) — "
+            f"un stop posé avant lui serait balayé",
+            LIQUIDITY_WEIGHT * float(pool["strength"]),
         ))
 
     side = "support" if direction > 0 else "resistance"
@@ -85,25 +167,46 @@ def plan_stop(
             continue
         tf = "/".join(lv["timeframes"])
         candidates.append((
-            price - buffer if direction > 0 else price + buffer,
+            _beyond(price),
             f"{'support' if direction > 0 else 'résistance'} {price:.6g} en {tf} "
             f"(touché {lv['touches']} fois, note {lv['score']:.2f})",
+            LEVEL_WEIGHT * float(lv["score"]),
         ))
 
-    for price, why in candidates:
-        distance = abs(entry - price)
-        if min_distance <= distance <= max_distance:
-            return price, why
+    # --- Dégradation des candidats exposés à un balayage ----------------------------------------
+    # Un stop situé ENTRE le prix et un pool sera pris quand le marché ira chercher ce pool. On ne
+    # l'interdit pas (il vaut mieux un stop exposé que pas de trade), on le fait perdre.
+    def _exposed(price: float) -> bool:
+        return any(
+            (price > float(p["price"]) if direction > 0 else price < float(p["price"]))
+            for p in threats
+        )
+
+    scored = [
+        (price, why, reliability * (SWEEP_PENALTY if _exposed(price) else 1.0))
+        for price, why, reliability in candidates
+    ]
+
+    # Seuls les candidats dont la distance tient dans la bande de risque sont éligibles.
+    eligible = [
+        (price, why, reliability) for price, why, reliability in scored
+        if min_distance <= abs(entry - price) <= max_distance
+    ]
+    if eligible:
+        # Fiabilité d'abord ; à fiabilité égale, le stop le plus serré (meilleur R/R).
+        best = max(eligible, key=lambda c: (round(c[2], 6), -abs(entry - c[0])))
+        return best[0], best[1]
     if fallback is not None:
         return fallback
     # Dernier recours : la distance minimale exigée, en le disant clairement.
-    return entry - (1 if direction > 0 else -1) * min_distance, "distance minimale (aucun niveau exploitable)"
+    return entry - sign * min_distance, "distance minimale (aucun niveau exploitable)"
 
 
 def plan_targets(
     *, entry: float, stop: float, direction: int, zones: list[dict], sr_levels: list[dict],
     structure: dict, fib_ext: dict | None, barrier: float | None,
     min_rr: float, max_rr: float, atr15: float, floor_distance: float = 0.0,
+    liquidity: list[dict] | None = None,
 ) -> dict:
     """Choisit TP1 et TP2 sur des niveaux RÉELS, dans la bande de risque/rendement autorisée.
 
@@ -162,6 +265,23 @@ def plan_targets(
         candidates.append((swing - sign * buffer,
                            f"dernier sommet de structure {swing:.6g}"
                            if direction > 0 else f"dernier creux de structure {swing:.6g}"))
+
+    # --- Pools de liquidité DEVANT nous : des aimants, pas des obstacles -------------------------
+    # Côté opposé au stop : les sommets égaux au-dessus pour un achat, les creux égaux en dessous
+    # pour une vente. Le prix va souvent les chercher précisément parce qu'il y a des ordres à y
+    # prendre — c'est une destination probable, donc un bon objectif. On vise JUSTE AVANT l'amas
+    # (`- sign * buffer`) : sortir dedans, c'est espérer être servi au milieu du balayage.
+    target_pool_side = "high" if direction > 0 else "low"
+    for pool in (liquidity or []):
+        if pool["side"] != target_pool_side:
+            continue
+        level = float(pool["price"])
+        kind_txt = "sommets égaux" if direction > 0 else "creux égaux"
+        candidates.append((
+            level - sign * buffer,
+            f"pool de liquidité {level:.6g} ({pool['touches']} {kind_txt}) — "
+            f"le prix va souvent y chercher les ordres accumulés",
+        ))
 
     # Ne restent que les niveaux DEVANT nous, du plus proche au plus lointain.
     ahead = sorted(

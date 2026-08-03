@@ -1,15 +1,19 @@
-"""Structure de marché : sommets/creux étiquetés, cassure de structure (BOS) et changement de
-caractère (CHOCH).
+"""Structure de marché : sommets/creux étiquetés, cassure de structure (BOS), changement de
+caractère (CHOCH) et POOLS DE LIQUIDITÉ (equal highs / equal lows).
 
 Un marché ne « monte » pas parce qu'un indicateur le dit : il monte parce qu'il inscrit des sommets
 plus hauts (HH) ET des creux plus hauts (HL). C'est la lecture la plus proche de ce qu'un trader
-voit sur son écran, et elle sert à deux moments distincts de la stratégie :
+voit sur son écran, et elle sert à trois moments distincts de la stratégie :
 
 - **Étape 1 (tendance)** : `label_swings` confirme que la structure valide la direction mesurée par
   les indicateurs. Une tendance haussière sans HL est une tendance en train de mourir.
 - **Étape 2 (entrée)** : `detect_bos` autorise l'entrée seulement APRÈS que la correction a été
   cassée dans le sens de la tendance, et `detect_choch` signale que la correction est terminée.
   Sans eux, on entrerait pendant la correction — c'est-à-dire contre le mouvement en cours.
+- **Étape 3 (sorties)** : `liquidity_pools` repère les sommets et creux ÉGAUX. Ce sont les endroits
+  où reposent les ordres stop de tout le monde, donc les deux choses à la fois :
+  un **aimant** (le prix va souvent les chercher — bon objectif) et un **piège** (poser son stop
+  juste avant, c'est se faire balayer — le stop doit passer AU-DELÀ du pool, jamais devant).
 
 Tout s'appuie sur `indicators.swing_points` : une seule définition du pivot pour tout le projet.
 """
@@ -22,6 +26,14 @@ from app.domain.indicators import Candle
 # Un pivot doit dominer ce nombre de bougies de chaque côté pour être retenu. À 2, on capte la
 # structure fine du 15 min sans transformer chaque respiration en « niveau ».
 DEFAULT_STRENGTH = 2
+
+# Deux pivots sont « égaux » quand ils tiennent dans cette fraction d'ATR. C'est la MÊME tolérance
+# que celle des étiquettes EQ de `label_swings` : deux définitions différentes de l'égalité dans un
+# même module finiraient par se contredire (un double sommet vu par l'une, ignoré par l'autre).
+EQUAL_TOLERANCE_ATR = 0.15
+# Nombre minimal de pivots alignés pour parler de POOL. À un seul pivot il n'y a pas de « liquidité
+# accumulée » : c'est juste un sommet, déjà couvert par `last_swing_high`.
+MIN_POOL_TOUCHES = 2
 
 
 def label_swings(
@@ -98,6 +110,84 @@ def label_swings(
         # candidat naturel pour poser un stop (et le LH, symétriquement, à la vente).
         "last_higher_low": higher_lows[-1]["price"] if higher_lows else None,
         "last_lower_high": lower_highs[-1]["price"] if lower_highs else None,
+    }
+
+
+def liquidity_pools(
+    candles: list[Candle], *, left: int = DEFAULT_STRENGTH, right: int = DEFAULT_STRENGTH,
+    lookback: int = 120, tolerance_atr: float = EQUAL_TOLERANCE_ATR,
+    min_touches: int = MIN_POOL_TOUCHES,
+) -> list[dict]:
+    """POOLS DE LIQUIDITÉ : les sommets égaux (equal highs) et les creux égaux (equal lows).
+
+    Quand le prix bute deux ou trois fois sur le même niveau, tout le monde voit la même chose et
+    place ses ordres au même endroit : les stops des vendeurs s'accumulent juste AU-DESSUS des
+    sommets égaux, ceux des acheteurs juste EN DESSOUS des creux égaux. Ces amas d'ordres ont deux
+    conséquences opposées, et c'est pour cela qu'il faut les nommer :
+
+    - **comme objectif** : le prix va souvent les chercher, précisément parce qu'il y a de la
+      liquidité à y prendre. Un pool devant nous est une destination probable ;
+    - **comme piège** : un stop posé juste AVANT un pool est le premier servi quand le marché vient
+      le balayer, souvent avant de repartir dans notre sens. Un stop doit donc passer AU-DELÀ du
+      pool, jamais entre le prix et lui.
+
+    Deux pivots sont « égaux » à `tolerance_atr` × ATR près — la même tolérance que les étiquettes
+    EQ de `label_swings`.
+
+    Retourne une liste de ``{"price", "side", "touches", "strength", "first_index", "last_index"}``,
+    triée du pool le plus solide au plus faible. `side="high"` = liquidité au-dessus (equal highs),
+    `side="low"` = liquidité en dessous (equal lows). `strength` ∈ ]0,1] croît avec le nombre de
+    touches et avec la propreté de l'alignement.
+    """
+    if not candles or len(candles) < left + right + 4:
+        return []
+    window = candles[-lookback:] if len(candles) > lookback else candles
+    atr_v = ind.atr(window, 14) or 0.0
+    if atr_v <= 0:
+        return []
+    tol = tolerance_atr * atr_v
+    sw = ind.swing_points(window, left, right)
+
+    pools: list[dict] = []
+    for side, pivots in (("high", sw["highs"]), ("low", sw["lows"])):
+        # Regroupement par proximité : on trie par prix, puis on coupe dès qu'un écart dépasse la
+        # tolérance. Un simple « tous ceux à ±tol du premier » ferait dériver le groupe de proche en
+        # proche et finirait par réunir des niveaux éloignés (chaînage).
+        ordered = sorted(pivots, key=lambda p: p[1])
+        group: list[tuple[int, float]] = []
+        for point in ordered:
+            if group and point[1] - group[0][1] > tol:
+                pools.append(_pool(group, side))
+                group = []
+            group.append(point)
+        if group:
+            pools.append(_pool(group, side))
+
+    kept = [p for p in pools if p["touches"] >= min_touches]
+    kept.sort(key=lambda p: (-p["strength"], -p["touches"]))
+    return kept
+
+
+def _pool(group: list[tuple[int, float]], side: str) -> dict:
+    """Construit un pool à partir d'un groupe de pivots alignés.
+
+    Le prix retenu est l'EXTRÊME du groupe, pas sa moyenne : c'est le plus haut des sommets égaux
+    (ou le plus bas des creux égaux) qui doit être franchi pour que la liquidité soit réellement
+    prise. Viser la moyenne laisserait le stop ou l'objectif à l'intérieur de l'amas.
+    """
+    prices = [p for _, p in group]
+    indices = [i for i, _ in group]
+    touches = len(group)
+    # Solidité : le nombre de touches domine (2 = correct, 4+ = incontournable). Un pool très large
+    # est moins net qu'un pool serré, d'où le léger malus d'étalement.
+    strength = min(1.0, 0.45 + 0.20 * (touches - 1))
+    return {
+        "price": round(max(prices) if side == "high" else min(prices), 8),
+        "side": side,
+        "touches": touches,
+        "strength": round(strength, 2),
+        "first_index": min(indices),
+        "last_index": max(indices),
     }
 
 

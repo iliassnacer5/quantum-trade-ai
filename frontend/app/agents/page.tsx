@@ -68,6 +68,7 @@ export default function AgentsPage() {
   const [training, setTraining] = useState<TrainingReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [modelBusy, setModelBusy] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -100,6 +101,19 @@ export default function AgentsPage() {
       setError(e.message);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function updateModel(role: string, model: string) {
+    setError(null);
+    setModelBusy((m) => ({ ...m, [role]: true }));
+    try {
+      await api.setAgentModel(role, model);
+      await load();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setModelBusy((m) => ({ ...m, [role]: false }));
     }
   }
 
@@ -271,7 +285,20 @@ export default function AgentsPage() {
                 </p>
               )}
 
-              <div className="mt-auto flex flex-col gap-1 pt-3">
+              <div className="mt-auto flex flex-col gap-2 pt-3">
+                <label className="space-y-1 text-[10px] uppercase tracking-wide text-muted">
+                  <span>Modèle</span>
+                  <select
+                    value={status?.role_models?.[agent.role] ?? agent.model}
+                    onChange={(e) => void updateModel(agent.role, e.target.value)}
+                    disabled={!!modelBusy[agent.role]}
+                    className="w-full rounded-lg border border-border bg-background px-2 py-1.5 text-[11px] text-white outline-none focus:border-accent"
+                  >
+                    {(status?.available_models ?? []).map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                </label>
                 <span className="truncate font-mono text-[10px] text-muted">{agent.model}</span>
                 <span className="w-fit rounded bg-buy/10 px-2 py-1 text-xs text-buy">Actif</span>
               </div>

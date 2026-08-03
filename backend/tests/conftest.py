@@ -29,6 +29,16 @@ def _test_env():
     settings.conviction_sizing_enabled = False
     settings.correlation_guard_enabled = False
     settings.loss_freeze_enabled = False
+    # MARCHÉS ET INSTRUMENTS EXCLUS (crypto, XAU/USD) : même raisonnement que les gates ci-dessus.
+    # Une douzaine de tests d'exécution, de portefeuille et de corrélation utilisent BTC/USDT comme
+    # cobaye — non pas parce qu'ils parlent de crypto, mais parce qu'elle cote 24 h/24 : sur une
+    # paire forex, ces mêmes tests échoueraient le week-end. Laisser l'exclusion active ici les
+    # ferait tous tomber sur un refus qui n'a rien à voir avec ce qu'ils vérifient.
+    # L'exclusion elle-même est testée explicitement dans tests/test_playbook.py, réglages posés à
+    # la main — et les VALEURS EXPÉDIÉES en production y sont vérifiées sur `model_fields`, donc
+    # ces deux lignes ne peuvent pas masquer une régression du défaut.
+    settings.playbook_excluded_classes = ""
+    settings.playbook_excluded_symbols = ""
     settings.block_synthetic_orders = False  # tests déterministes (pas de dépendance réseau)
     # DONNÉES FICTIVES : interdites en production (`data_allow_synthetic=False` par défaut — une
     # bougie inventée affichée comme réelle est pire qu'une page vide). La suite de tests, elle,

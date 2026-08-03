@@ -131,3 +131,64 @@ def test_short_history_says_nothing_rather_than_guessing():
     assert ms.label_swings(tiny)["state"] == "indéterminée"
     assert ms.detect_bos(tiny, 1) is None
     assert ms.detect_choch(tiny) is None
+
+
+# --- Pools de liquidité : sommets et creux ÉGAUX -------------------------------------------------
+# Ce sont les endroits où reposent les stops de tout le monde. Ils servent deux fois dans la
+# stratégie, et dans des sens opposés : aimant devant nous (bon objectif), piège derrière nous
+# (un stop posé avant l'amas se fait balayer).
+
+def _with_equal_extremes(n: int = 90, *, high: float = 110.0, low: float = 100.0,
+                         hits: int = 3) -> list[Candle]:
+    """Série plate qui va toucher EXACTEMENT `hits` fois le même sommet et le même creux.
+
+    Le reste du temps le prix oscille à l'intérieur, sans jamais approcher ces extrêmes : sans
+    cette marge, le bruit de fond formerait ses propres pivots et on ne saurait plus lequel des
+    pools le test a mesuré.
+    """
+    inner_h, inner_l = high - 4.0, low + 4.0
+    out: list[Candle] = []
+    for i in range(n):
+        touch = i % (n // (hits + 1)) == 0 and 0 < i < n - 3
+        h = high if touch else inner_h
+        low_ = low if touch else inner_l
+        out.append(_c((h + low_) / 2, h, low_, (h + low_) / 2))
+    return out
+
+
+def test_equal_highs_and_equal_lows_are_detected_as_pools():
+    pools = ms.liquidity_pools(_with_equal_extremes())
+    assert pools, "des sommets et des creux répétés doivent former des pools"
+    highs = [p for p in pools if p["side"] == "high"]
+    lows = [p for p in pools if p["side"] == "low"]
+    assert highs and lows
+    # Le prix retenu est l'EXTRÊME de l'amas, pas sa moyenne : c'est lui qu'il faut franchir pour
+    # que la liquidité soit réellement prise.
+    assert max(p["price"] for p in highs) == 110.0
+    assert min(p["price"] for p in lows) == 100.0
+    assert all(p["touches"] >= 2 for p in pools)
+    assert all(0.0 < p["strength"] <= 1.0 for p in pools)
+
+
+def test_a_single_pivot_is_not_a_liquidity_pool():
+    """Un sommet isolé n'est pas de la liquidité ACCUMULÉE : c'est juste un sommet.
+
+    Il est déjà couvert par `last_swing_high` ; le compter comme pool ferait de chaque respiration
+    du marché une « zone de liquidité » et viderait la notion de son sens.
+    """
+    pools = ms.liquidity_pools(_zigzag(80, 1.1000, 0.0020, up=True), min_touches=5)
+    assert all(p["touches"] >= 5 for p in pools)
+
+
+def test_pools_are_ranked_with_the_most_touched_first():
+    pools = ms.liquidity_pools(_with_equal_extremes())
+    strengths = [p["strength"] for p in pools]
+    assert strengths == sorted(strengths, reverse=True), (
+        "un pool plus touché doit passer devant : c'est lui que le marché défend le plus"
+    )
+
+
+def test_liquidity_needs_enough_history():
+    """Pas d'invention sur trois bougies : sans historique, on ne rend rien."""
+    assert ms.liquidity_pools([]) == []
+    assert ms.liquidity_pools(_zigzag(5, 1.10, 0.002)) == []

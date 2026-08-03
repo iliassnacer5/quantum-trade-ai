@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 
 from app.agents import llm
 from app.core.config import get_settings
@@ -11,6 +12,20 @@ from app.models.entities import User
 from app.repositories.store import AppStore
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
+
+
+class AgentModelRequest(BaseModel):
+    role: str
+    model: str
+
+
+_ROLE_MODEL_FIELDS = {
+    "master": "llm_model_master",
+    "reasoning": "llm_model_reasoning",
+    "fast": "llm_model_fast",
+    "vision": "llm_model_vision",
+    "grounding": "llm_model_grounding",
+}
 
 _AGENTS = [
     {"name": "playbook", "role": "reasoning",
@@ -38,9 +53,17 @@ async def status(_user: User = Depends(current_user)) -> dict:
 
     llm_on = llm.available()
     s = get_settings()
+    role_models = {
+        role: (llm.route(role) if llm_on else None) or "déterministe (fallback)"
+        for role in _ROLE_MODEL_FIELDS
+    }
+    available_models = list(dict.fromkeys([
+        getattr(s, field)
+        for field in _ROLE_MODEL_FIELDS.values()
+    ] + [s.litellm_default_model]))
     agents = [
         {**a, "weight": DEFAULT_WEIGHTS.get(a["name"]),
-         "model": (llm.route(a["role"]) if llm_on else None) or "déterministe (fallback)",
+         "model": role_models.get(a["role"], "déterministe (fallback)"),
          # Ce que l'entraînement de la nuit a mesuré pour cet agent, et la fiche qui en découle.
          "competence": expertise.competence(a["name"]),
          "expertise": expertise.memo(a["name"]) or None}
@@ -50,6 +73,8 @@ async def status(_user: User = Depends(current_user)) -> dict:
         "status": "online",
         "llm_enabled": llm_on,
         "providers": {"anthropic": bool(s.anthropic_api_key), "google": bool(s.google_api_key)},
+        "available_models": available_models,
+        "role_models": role_models,
         "agents": agents,
         "strategy": {
             "name": "Playbook MTF",
@@ -92,6 +117,18 @@ async def status(_user: User = Depends(current_user)) -> dict:
         "training": _training_summary(),
         "session": sessions_mod.session_context(),
     }
+
+
+@router.post("/model")
+async def set_model(body: AgentModelRequest, _user: User = Depends(current_user)) -> dict:
+    """Sélectionne le modèle LLM ciblé pour un rôle donné à l'exécution courante."""
+    field = _ROLE_MODEL_FIELDS.get(body.role)
+    if field is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Rôle inconnu: {body.role}")
+
+    settings = get_settings()
+    setattr(settings, field, body.model)
+    return {"role": body.role, "model": body.model}
 
 
 @router.get("/strategy")

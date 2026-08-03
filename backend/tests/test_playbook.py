@@ -11,6 +11,7 @@ Vérifie, dans l'ordre de la méthode :
 
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime, timezone
 
 from app.data import sessions as sessions_mod
@@ -588,41 +589,46 @@ def test_risk_reward_band_is_1_2_to_1_3():
     assert all(m["min_rr"] == 2.0 for m in MODES.values())
 
 
-def test_the_target_floor_is_fifty_pips_and_the_atr_stays_out_of_it():
-    """Plancher d'objectif : 50 pips. L'ATR journalier ne participe plus au calcul du profit.
+def test_no_fixed_pip_distance_defines_the_stop_or_the_target():
+    """Règle du desk (03/08/2026) : ni le SL ni le TP ne viennent d'une distance prédéfinie.
 
-    Décision de l'utilisateur du 28/07/2026 (« minimum 50 pips, pas 200 » et « ne prends pas en
-    considération l'ATR dans le profit »). Le plancher de STOP a suivi par arithmétique et non par
-    goût : à 0,55 × ATR journalier (~69 pips sur EUR/USD), le R/R minimum de 1:2 imposerait déjà
-    138 pips d'objectif et les 50 pips demandés seraient inatteignables.
+    Les deux sortent des NIVEAUX du graphique (structure, supports/résistances multi-UT, zones
+    d'offre/demande, extensions de Fibonacci), encadrés par le seul R/R. L'ATR ne sert que de MARGE
+    de sécurité contre le bruit, jamais de méthode de calcul.
+
+    Ce plancher ne relevait pas que l'objectif : il imposait un STOP minimum par ricochet
+    (`target_floor / max_rr`), ce qui refusait les instruments peu volatils — le forex en tête.
     """
     from app.core.config import get_settings
 
     s = get_settings()
-    assert playbook.MIN_TARGET_PIPS == s.playbook_min_target_pips == 50.0
+    assert playbook.MIN_TARGET_PIPS == s.playbook_min_target_pips == 0.0
     assert playbook.MIN_TARGET_ATR_DAILY == s.playbook_min_target_atr_daily == 0.0
+    # L'ATR reste une MARGE de sécurité (plancher/plafond de stop), pas un calcul d'objectif.
     assert playbook.MIN_STOP_ATR_DAILY == s.playbook_min_stop_atr_daily == 0.20
-    # Cohérence arithmétique : le stop minimum doit permettre 50 pips au R/R minimum.
-    assert playbook.MIN_STOP_ATR_DAILY * playbook.MIN_RR <= 1.0
     # Le PLAFOND de risque ne bouge PAS : c'est lui qui contient le drawdown (l'oublier l'a doublé).
     assert playbook.MAX_STOP_ATR_DAILY == s.playbook_max_stop_atr_daily == 0.85
     assert playbook.MIN_STOP_ATR_DAILY < playbook.MAX_STOP_ATR_DAILY
     # Plancher de dernier recours quand l'ATR journalier n'est pas calculable.
     assert playbook.MIN_STOP_ATR15 == 0.6
+    # Le R/R MINIMUM reste 1:2 — c'est lui, et lui seul, qui encadre désormais l'objectif.
+    assert playbook.MIN_RR == s.playbook_min_rr == 2.0
 
 
-def test_the_objective_reaches_the_pip_floor():
-    """Tout setup validé vise au moins le plancher en pips, et la checklist le nomme en pips."""
+def test_the_objective_is_read_on_the_chart_not_decreed_in_pips():
+    """L'objectif vient d'un NIVEAU et du R/R, et la checklist le dit sans parler de plancher."""
     setup = _build()
     assert setup.direction == "BUY", setup.reasons
-    assert setup.reward_pips >= playbook.MIN_TARGET_PIPS - 1e-6, (
-        f"objectif à {setup.reward_pips:.1f} pips, sous le plancher de {playbook.MIN_TARGET_PIPS:.0f}"
-    )
-    step7 = next(c for c in setup.checklist if c["step"] == 7 and "Objectif d'au moins" in c["label"])
+    step7 = next(c for c in setup.checklist
+                 if c["step"] == 7 and c["label"] == "Objectif posé sur un niveau du marché")
     assert step7["pass"] is True
-    assert "50" in step7["label"]
+    # Aucune distance minimale ne doit être annoncée à l'utilisateur.
+    assert "au moins" not in step7["label"]
+    assert "AUCUNE distance minimale" in step7["explain"]
+    # Le seul encadrement restant est le R/R, et il doit être respecté.
+    assert setup.risk_reward >= playbook.MIN_RR - 1e-6, setup.risk_reward
     # L'ATR est cité comme INFORMATION, jamais comme contrainte de l'objectif.
-    assert "n'intervient PAS" in step7["explain"]
+    assert "n'entre pas non plus dans ce calcul" in step7["explain"]
 
 
 def test_the_pip_floor_is_enforced_by_construction_not_by_refusal():
@@ -634,6 +640,8 @@ def test_the_pip_floor_is_enforced_by_construction_not_by_refusal():
     Ce qui écarte, c'est la bande de R/R — un plancher qu'on ne peut pas payer avec le risque pris
     y sort le rapport.
     """
+    # Le plancher vaut ZÉRO en production ; il reste paramétrable pour rejouer l'ancienne échelle
+    # dans un A/B, et c'est ce comportement paramétré qu'on vérifie ici.
     for floor in (50.0, 120.0, 300.0):
         setup = _build(min_target_pips=floor)
         if setup.direction == "NO_TRADE":
@@ -1495,7 +1503,8 @@ def test_watchlist_disabled_by_default_scans_every_market():
     assert s.playbook_watchlist_only is False
     universe = playbook_service.daily_universe()
     assert len(universe) > 50, "tout le catalogue doit être balayé"
-    assert {u["asset_class"] for u in universe} >= {"forex", "stock", "index", "crypto"}
+    # La crypto est exclue depuis le 03/08/2026 : les marchés balayés sont les quatre autres.
+    assert {u["asset_class"] for u in universe} >= {"forex", "stock", "index", "commodity"}
 
 
 def test_watchlist_can_be_disabled_to_scan_the_full_catalogue():
@@ -1564,44 +1573,103 @@ def test_the_backtest_still_sweeps_the_full_catalogue_regardless_of_the_watchlis
 
 
 # ---------------------------------------------------------------------------------------
-# 6. Marchés exclus du desk — les métaux précieux (29/07/2026)
+# 6. Ce que le desk refuse — la CRYPTO en entier, l'OR nommément (03/08/2026)
+#
+# Deux mailles d'exclusion, et c'est la leçon du 29/07 : bannir la classe `commodity` pour se
+# débarrasser de l'or emportait XAG/USD (+0,21 R), XPT/USD (+0,11 R) et XPD/USD (+0,09 R), tous
+# mesurés rentables. Une exclusion de classe ne sait pas viser — il faut les deux.
 # ---------------------------------------------------------------------------------------
-def test_metals_are_excluded_from_the_scan():
-    """Or, argent, platine, palladium : jamais balayés, quelle que soit la session.
+@contextlib.contextmanager
+def _desk_exclusions():
+    """Applique les exclusions RÉELLEMENT EXPÉDIÉES, que `conftest` neutralise pour les autres tests.
 
-    L'or et l'argent OUVRAIENT la liste de balayage (les plus liquides) : leur exclusion doit être
-    complète, pas seulement un déclassement dans l'ordre de priorité."""
+    On lit le défaut depuis `model_fields` et non une constante recopiée : si quelqu'un change le
+    réglage expédié, ces tests suivent le changement au lieu de tester un souvenir.
+    """
+    from app.core.config import Settings, get_settings
+
+    s = get_settings()
+    prev = (s.playbook_excluded_classes, s.playbook_excluded_symbols)
+    s.playbook_excluded_classes = Settings.model_fields["playbook_excluded_classes"].default
+    s.playbook_excluded_symbols = Settings.model_fields["playbook_excluded_symbols"].default
+    try:
+        yield
+    finally:
+        s.playbook_excluded_classes, s.playbook_excluded_symbols = prev
+
+
+def test_the_shipped_defaults_exclude_crypto_and_gold():
+    """Ce que le desk EXPÉDIE, pas ce qu'un test a réglé — `conftest` neutralise les exclusions.
+
+    Sans cette vérification sur `model_fields`, la neutralisation globale du conftest masquerait
+    une régression du défaut : tous les autres tests passeraient avec la crypto réactivée.
+    """
+    from app.core.config import Settings
+
+    assert Settings.model_fields["playbook_excluded_classes"].default == "crypto"
+    assert Settings.model_fields["playbook_excluded_symbols"].default == "XAU/USD"
+    # Le flux WebSocket Binance ne sert QUE des paires crypto : le laisser tourner maintiendrait
+    # une connexion permanente pour alimenter des symboles que le desk refuse.
+    assert Settings.model_fields["live_ingestion_enabled"].default is False
+
+
+def test_crypto_is_excluded_from_the_scan():
+    """La crypto n'est plus jamais balayée, quelle que soit la session.
+
+    Elle cote 24 h/24 : sans exclusion, c'est le marché qui remplit les creux horaires où aucune
+    place n'est ouverte — donc celui qui occupe le plus de positions."""
     from app.services import playbook_service
 
-    universe = playbook_service.daily_universe()
+    with _desk_exclusions():
+        universe = playbook_service.daily_universe()
     symbols = {u["symbol"] for u in universe}
-    assert not (symbols & {"XAU/USD", "XAG/USD", "XPT/USD", "XPD/USD"})
-    assert "commodity" not in {u["asset_class"] for u in universe}
-    # Les autres marchés, eux, doivent rester intégralement balayés.
-    assert {"EUR/USD", "NVDA", "SPX500", "BTC/USDT"} <= symbols
+    assert "crypto" not in {u["asset_class"] for u in universe}
+    assert not (symbols & {"BTC/USDT", "ETH/USDT", "SOL/USDT", "NEAR/USDT"})
+    # Les quatre autres marchés, eux, restent intégralement balayés.
+    assert {"EUR/USD", "NVDA", "SPX500", "XAG/USD"} <= symbols
 
 
-def test_metals_are_refused_at_order_time_too():
+def test_gold_is_excluded_but_the_other_metals_come_back():
+    """LE point de la double maille : l'or part, les trois autres métaux restent.
+
+    XAU/USD est mesuré à -0,25 R sur 197 trades — la pire ligne du backtest, et le plus gros
+    producteur de setups du catalogue (~7× EUR/USD). Le retirer nommément permet de rouvrir la
+    classe `commodity` sans réintégrer l'instrument qui la plombait."""
+    from app.services import playbook_service
+
+    with _desk_exclusions():
+        symbols = {u["symbol"] for u in playbook_service.daily_universe()}
+    assert "XAU/USD" not in symbols
+    assert {"XAG/USD", "XPT/USD", "XPD/USD"} <= symbols
+
+
+def test_exclusions_are_refused_at_order_time_too():
     """L'exclusion vaut aussi pour un ordre lancé À LA MAIN : le filtre de balayage ne protège que
     l'auto-entrée, il ne dit rien du ticket manuel ni d'un appel d'API direct."""
     from app.services import playbook_service
 
-    assert playbook_service.is_excluded("XAU/USD")
-    assert playbook_service.is_excluded("XAG/USD")
-    assert playbook_service.is_excluded("EUR/USD") is None
-    assert playbook_service.is_excluded("NVDA") is None
+    with _desk_exclusions():
+        assert playbook_service.is_excluded("BTC/USDT")
+        assert playbook_service.is_excluded("XAU/USD")
+        assert playbook_service.is_excluded("xau/usd"), "la casse ne doit pas contourner le filtre"
+        assert playbook_service.is_excluded("XAG/USD") is None
+        assert playbook_service.is_excluded("EUR/USD") is None
+        assert playbook_service.is_excluded("NVDA") is None
 
 
-def test_the_excluded_classes_setting_drives_the_exclusion():
+def test_the_exclusion_settings_drive_the_exclusion():
     """L'exclusion est un RÉGLAGE, pas une liste en dur : le desk peut changer d'avis sans patch."""
     from app.core.config import get_settings
     from app.services import playbook_service
 
     s = get_settings()
-    previous = s.playbook_excluded_classes
+    prev_cls, prev_syms = s.playbook_excluded_classes, s.playbook_excluded_symbols
     s.playbook_excluded_classes = ""
+    s.playbook_excluded_symbols = ""
     try:
+        assert playbook_service.is_excluded("BTC/USDT") is None
         assert playbook_service.is_excluded("XAU/USD") is None
-        assert "commodity" in {u["asset_class"] for u in playbook_service.daily_universe()}
+        classes = {u["asset_class"] for u in playbook_service.daily_universe()}
+        assert {"crypto", "commodity"} <= classes
     finally:
-        s.playbook_excluded_classes = previous
+        s.playbook_excluded_classes, s.playbook_excluded_symbols = prev_cls, prev_syms

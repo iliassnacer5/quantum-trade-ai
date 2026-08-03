@@ -583,9 +583,10 @@ def test_production_backtest_and_training_share_the_same_settings():
     accepted = set(inspect.signature(playbook.build).parameters)
     unknown = set(kwargs) - accepted
     assert not unknown, f"mots-clés inconnus de playbook.build : {sorted(unknown)}"
-    # Les réglages décidés le 28/07/2026 doivent bien y figurer, sinon ils ne s'appliqueraient
-    # qu'à la production et le backtest mesurerait une autre stratégie.
-    assert kwargs["min_target_pips"] == 50.0
+    # Les réglages décidés doivent bien y figurer, sinon ils ne s'appliqueraient qu'à la production
+    # et le backtest mesurerait une autre stratégie. Plancher d'objectif SUPPRIMÉ le 03/08/2026 :
+    # aucune distance en pips ne définit plus le SL ni le TP.
+    assert kwargs["min_target_pips"] == 0.0
     assert kwargs["min_target_atr_daily"] == 0.0
     assert kwargs["require_daily"] is False
     assert kwargs["block_stop_width"] is False
