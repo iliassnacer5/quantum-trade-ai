@@ -1,7 +1,9 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { api, PlaybookTrade, StrategySpec, StrategyStep, WalkForward } from '@/lib/api';
+import {
+  api, PlaybookTrade, StrategyNote, StrategySpec, StrategyStep, WalkForward,
+} from '@/lib/api';
 import { MarketSelector } from '@/components/domain';
 import { PageHeader, RouteTabs, PROVE_TABS } from '@/components/ui';
 
@@ -9,10 +11,31 @@ const VERDICT_STYLE: Record<string, string> = {
   robuste: 'text-buy', fragile: 'text-yellow-400', non_prouve: 'text-sell', insuffisant: 'text-muted',
 };
 
+/** Les sections de la page, dans l'ordre — sert aussi de sommaire cliquable. */
+const SECTIONS = [
+  ['principes', 'Ce à quoi la méthode obéit'],
+  ['boucles', 'Ce qui tourne en permanence'],
+  ['deroule', 'Le déroulé, de A à Z'],
+  ['outils', 'Comment le graphique est lu'],
+  ['checklist', 'La checklist du moteur'],
+  ['risque', 'Ce qui protège le capital'],
+  ['execution', 'De la décision à l’ordre'],
+  ['selection', 'Comment les trades sont choisis'],
+  ['perimetre', 'Où et quand elle s’applique'],
+  ['glossaire', 'Ce que mesure chaque indicateur'],
+  ['refus', 'Ce que la stratégie refuse de faire'],
+  ['appliquer', 'L’appliquer à un symbole'],
+] as const;
+
 /**
  * La page ne présente qu'UNE stratégie : celle du desk. Elle la décrit de A à Z, en lisant la
  * SPÉCIFICATION servie par le backend (`/api/agents/strategy`) — donc les seuils réellement
  * appliqués par le moteur, jamais une copie qui finirait par décrire une version disparue.
+ *
+ * Elle ne s'arrête pas aux grands principes : les règles exactes de chaque indicateur, les
+ * cadences des boucles de fond, la façon dont un ordre est dimensionné et les garde-fous qui
+ * peuvent l'annuler y figurent aussi. Une stratégie qu'on ne peut pas vérifier ligne à ligne
+ * n'est pas discutable, et une règle qu'on ne peut pas discuter finit par ne plus être appliquée.
  */
 export default function StrategyPage() {
   const [spec, setSpec] = useState<StrategySpec | null>(null);
@@ -82,14 +105,20 @@ export default function StrategyPage() {
 
       {spec && (
         <>
+          {/* Sommaire : la page décrit la méthode entière, elle est longue par nature. */}
+          <nav className="flex flex-wrap gap-2 rounded-xl border border-border bg-surface p-3">
+            {SECTIONS.map(([id, label]) => (
+              <a key={id} href={`#${id}`}
+                className="rounded-lg border border-border/60 bg-background px-2.5 py-1 text-xs text-muted hover:border-primary/60 hover:text-white">
+                {label}
+              </a>
+            ))}
+          </nav>
+
           {/* --- Ce à quoi la méthode obéit --- */}
-          <section className="rounded-xl border border-border bg-surface p-5 space-y-4">
-            <div className="flex flex-wrap items-baseline gap-3">
-              <h2 className="text-lg font-semibold text-white">{spec.name}</h2>
-              <span className="text-xs text-muted">
-                {spec.veto ? 'Droit de veto actif — aucun agent ne la contourne' : 'Veto inactif'}
-              </span>
-            </div>
+          <Section id="principes" title="Ce à quoi la méthode obéit"
+            aside={spec.veto ? 'Droit de veto actif — aucun agent ne la contourne' : 'Veto inactif'}>
+            <p className="text-sm leading-relaxed text-muted">{spec.name}</p>
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
               {spec.principles.map((p) => (
                 <div key={p.title} className="rounded-lg border border-border/60 bg-background p-3">
@@ -98,17 +127,99 @@ export default function StrategyPage() {
                 </div>
               ))}
             </div>
-          </section>
+          </Section>
+
+          {/* --- Les boucles de fond : la stratégie n'est pas une page qu'on rafraîchit --- */}
+          <Section id="boucles" title="Ce qui tourne en permanence">
+            <div className="space-y-2">
+              {spec.pipeline.loops.map((l) => (
+                <div key={l.name} className="rounded-lg border border-border/60 bg-background p-3">
+                  <div className="flex flex-wrap items-baseline gap-2">
+                    <span className="text-sm font-medium text-white">{l.name}</span>
+                    <span className="rounded bg-primary/15 px-2 py-0.5 font-mono text-2xs text-primary">
+                      {l.cadence}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs leading-relaxed text-muted">{l.body}</p>
+                </div>
+              ))}
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[34rem] text-left text-xs">
+                <thead className="text-2xs uppercase tracking-wide text-muted">
+                  <tr>
+                    <th className="py-1.5 pr-3">Unité de temps</th>
+                    <th className="py-1.5 pr-3">Rôle dans la décision</th>
+                    <th className="py-1.5 pr-3">Bougies chargées</th>
+                    <th className="py-1.5 pr-3">Minimum exigé</th>
+                    <th className="py-1.5">Cache</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {spec.pipeline.timeframes.map((t) => (
+                    <tr key={t.tf} className="border-t border-border/60">
+                      <td className="py-1.5 pr-3 font-mono text-white">{t.tf}</td>
+                      <td className="py-1.5 pr-3 leading-relaxed text-muted">{t.role}</td>
+                      <td className="py-1.5 pr-3 font-mono text-muted">{t.candles}</td>
+                      <td className="py-1.5 pr-3 font-mono text-muted">{t.min_candles}</td>
+                      <td className="py-1.5 font-mono text-muted">{fmtSeconds(t.cache_s)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <ul className="space-y-1">
+              {spec.pipeline.notes.map((n, i) => (
+                <li key={i} className="flex gap-2 text-xs leading-relaxed text-muted">
+                  <span className="text-primary">▸</span><span>{n}</span>
+                </li>
+              ))}
+            </ul>
+          </Section>
 
           {/* --- Le déroulé, étape par étape --- */}
-          <section className="space-y-4">
+          <section id="deroule" className="scroll-mt-6 space-y-4">
             <h2 className="text-lg font-semibold text-white">Le déroulé, de A à Z</h2>
             {spec.steps.map((step) => <StepCard key={step.n} step={step} />)}
           </section>
 
+          {/* --- Les outils de lecture, communs aux trois étapes --- */}
+          <Section id="outils" title="Comment le graphique est lu"
+            aside="les mêmes outils servent à valider la tendance, à choisir le moment, et à poser le stop">
+            <div className="grid gap-3 md:grid-cols-2">
+              {spec.toolbox.map((t) => (
+                <div key={t.name} className="rounded-lg border border-border/60 bg-background p-3">
+                  <div className="text-sm font-medium text-white">{t.name}</div>
+                  <div className="mt-0.5 text-2xs uppercase tracking-wide text-primary">{t.purpose}</div>
+                  <p className="mt-1.5 text-xs leading-relaxed text-muted">{t.body}</p>
+                </div>
+              ))}
+            </div>
+          </Section>
+
+          {/* --- La checklist : ce qui bloque, et ce qui informe --- */}
+          <Section id="checklist" title="La checklist du moteur"
+            aside={`${spec.checklist.filter((c) => c.blocking).length} cases sur ${spec.checklist.length} refusent réellement le trade`}>
+            <div className="space-y-1.5">
+              {spec.checklist.map((c) => (
+                <div key={c.n} className="flex flex-wrap items-start gap-x-3 gap-y-1 rounded-lg bg-background px-3 py-2">
+                  <span className="font-mono text-2xs text-muted/60">étape {c.step}</span>
+                  <span className="min-w-[16rem] flex-1 text-xs font-medium text-white">{c.label}</span>
+                  <span className={`rounded px-1.5 py-0.5 text-[10px] ${
+                    c.blocking ? 'bg-sell/20 text-sell' : 'bg-border/60 text-muted'}`}>
+                    {c.blocking ? 'bloquante' : 'informative'}
+                  </span>
+                  <span className="w-full text-2xs leading-relaxed text-muted">{c.why}</span>
+                </div>
+              ))}
+            </div>
+            <p className="text-xs leading-relaxed text-muted">{spec.checklist_note}</p>
+          </Section>
+
           {/* --- Gestion du risque --- */}
-          <section className="rounded-xl border border-border bg-surface p-5 space-y-3">
-            <h2 className="text-lg font-semibold text-white">Ce qui protège le capital</h2>
+          <Section id="risque" title="Ce qui protège le capital">
             <dl className="grid gap-3 md:grid-cols-2">
               {([
                 ['Taille de position', spec.risk.sizing],
@@ -123,11 +234,67 @@ export default function StrategyPage() {
                 </div>
               ))}
             </dl>
-          </section>
+          </Section>
+
+          {/* --- De la décision à l'ordre : c'est là que se joue chaque trade réel --- */}
+          <Section id="execution" title="De la décision à l’ordre">
+            <div>
+              <h3 className="mb-1.5 text-sm font-medium text-white">Comment la position est dimensionnée</h3>
+              <ul className="space-y-1">
+                {spec.execution.sizing.map((line, i) => (
+                  <li key={i} className="flex gap-2 text-xs leading-relaxed text-muted">
+                    <span className="text-primary">▸</span><span>{line}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            <div>
+              <h3 className="mb-1.5 text-sm font-medium text-white">
+                Ce qui peut annuler un ordre alors même que le setup est valide
+              </h3>
+              <div className="space-y-1.5">
+                {spec.execution.guards.map((g) => (
+                  <div key={g.label} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 rounded-lg bg-background px-3 py-2">
+                    <span className="min-w-[13rem] text-xs font-medium text-white">{g.label}</span>
+                    <span className="flex-1 text-2xs leading-relaxed text-muted">{g.body}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <Note label="Ce que chaque position emporte dans le journal" body={spec.execution.journal} />
+            <Note label="Aucun refus n’est silencieux" body={spec.execution.no_silent_refusal} />
+            <div className="rounded-lg border border-warn/30 bg-warn/5 p-3 text-xs leading-relaxed text-muted">
+              {spec.execution.paper_only}
+            </div>
+          </Section>
+
+          {/* --- Sélection et classement --- */}
+          <Section id="selection" title="Comment les trades sont choisis, puis classés">
+            <div className="grid gap-3 md:grid-cols-3">
+              {spec.selection.tiers.map((t) => (
+                <div key={t.label} className="rounded-lg border border-border/60 bg-background p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-primary">{t.label}</div>
+                  <p className="mt-1 text-xs leading-relaxed text-muted">{t.body}</p>
+                </div>
+              ))}
+            </div>
+            <div>
+              <h3 className="mb-1.5 text-sm font-medium text-white">Ordre de classement</h3>
+              <ol className="space-y-1">
+                {spec.selection.ranking.map((r, i) => (
+                  <li key={i} className="text-xs leading-relaxed text-muted">{r}</li>
+                ))}
+              </ol>
+            </div>
+            <Note label="Plancher de fiabilité" body={spec.selection.floor} />
+            <Note label="Aucun quota" body={spec.selection.no_quota} />
+            <Note label="Ordre de balayage" body={spec.selection.universe_order} />
+          </Section>
 
           {/* --- Périmètre --- */}
-          <section className="rounded-xl border border-border bg-surface p-5 space-y-4">
-            <h2 className="text-lg font-semibold text-white">Où et quand elle s’applique</h2>
+          <Section id="perimetre" title="Où et quand elle s’applique">
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <Fact label="Marchés" value={spec.scope.markets.join(' · ')} />
               <Fact
@@ -147,15 +314,29 @@ export default function StrategyPage() {
                 value={spec.scope.auto_entry ? 'Active — compte démo' : 'Désactivée'}
               />
             </div>
+            {spec.scope.universe_note && (
+              <p className="text-xs leading-relaxed text-muted">{spec.scope.universe_note}</p>
+            )}
             <p className="text-xs leading-relaxed text-muted">{spec.scope.why_all_markets}</p>
             {spec.scope.auto_entry && (
               <p className="text-xs text-warn">{spec.scope.auto_entry_mode}</p>
             )}
-          </section>
+          </Section>
+
+          {/* --- Glossaire : un score ne doit jamais être un chiffre opaque --- */}
+          <Section id="glossaire" title="Ce que mesure chaque indicateur">
+            <div className="grid gap-3 md:grid-cols-2">
+              {spec.glossary.map((g) => (
+                <div key={g.term} className="rounded-lg border border-border/60 bg-background p-3">
+                  <div className="text-sm font-medium text-white">{g.term}</div>
+                  <p className="mt-1 text-xs leading-relaxed text-muted">{g.body}</p>
+                </div>
+              ))}
+            </div>
+          </Section>
 
           {/* --- Honnêteté des données : la partie qu'on ne met jamais en avant, et qui compte --- */}
-          <section className="rounded-xl border border-border bg-surface p-5 space-y-2">
-            <h2 className="text-lg font-semibold text-white">Ce que la stratégie refuse de faire</h2>
+          <Section id="refus" title="Ce que la stratégie refuse de faire">
             <ul className="space-y-2">
               {spec.data_honesty.map((line, i) => (
                 <li key={i} className="flex gap-2 text-xs leading-relaxed text-muted">
@@ -164,12 +345,12 @@ export default function StrategyPage() {
                 </li>
               ))}
             </ul>
-          </section>
+          </Section>
         </>
       )}
 
       {/* --- Application à un symbole --- */}
-      <section className="rounded-xl border border-border bg-surface p-5 space-y-4">
+      <section id="appliquer" className="scroll-mt-6 space-y-4 rounded-xl border border-border bg-surface p-5">
         <h2 className="text-lg font-semibold text-white">L’appliquer maintenant à un symbole</h2>
         <div className="flex flex-wrap items-center gap-3">
           <label className="text-sm text-muted">Marché</label>
@@ -234,7 +415,7 @@ export default function StrategyPage() {
   );
 }
 
-/** Une étape : son résumé, ses facteurs pondérés, et ce qui la rend BLOQUANTE. */
+/** Une étape : son résumé, ses facteurs pondérés, ses règles exactes, et ce qui la rend BLOQUANTE. */
 function StepCard({ step }: { step: StrategyStep }) {
   return (
     <article className="rounded-xl border border-border bg-surface p-5 space-y-4">
@@ -292,6 +473,15 @@ function StepCard({ step }: { step: StrategyStep }) {
         </p>
       )}
 
+      {/* La MÉCANIQUE exacte : ce que chaque outil doit voir, et combien il vaut alors. Sans elle,
+          un poids affiché ne dit pas ce qui a réellement fait le score. */}
+      {step.detail?.length ? (
+        <div className="space-y-2 rounded-lg border border-border/60 bg-background/40 p-3">
+          <div className="text-xs font-medium text-white/80">Les règles exactes, telles que le moteur les applique</div>
+          {step.detail.map((d) => <Note key={d.label} label={d.label} body={d.body} plain />)}
+        </div>
+      ) : null}
+
       {step.stop_candidates?.length ? (
         <div>
           <div className="mb-1 text-xs font-medium text-white">Où le stop est posé, par ordre de préférence</div>
@@ -303,6 +493,26 @@ function StepCard({ step }: { step: StrategyStep }) {
             ))}
           </ol>
           {step.stop_rule && <p className="mt-2 text-xs leading-relaxed text-muted">{step.stop_rule}</p>}
+        </div>
+      ) : null}
+
+      {/* La fiabilité de chaque type de niveau : c'est elle qui départage, pas la distance. */}
+      {step.stop_weights?.length ? (
+        <div className="space-y-1.5">
+          <div className="text-xs font-medium text-white">Fiabilité de chaque type de niveau porteur de stop</div>
+          {step.stop_weights.map((w) => (
+            <div key={w.label} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg bg-background px-3 py-2">
+              <span className="min-w-[15rem] text-xs font-medium text-white">{w.label}</span>
+              <span className="flex items-center gap-2">
+                <span className="h-1.5 w-24 overflow-hidden rounded-full bg-border">
+                  <span className="block h-full rounded-full bg-primary"
+                    style={{ width: `${Math.min(100, w.weight * 100)}%` }} />
+                </span>
+                <span className="font-mono text-2xs text-muted">{w.weight.toFixed(2)}</span>
+              </span>
+              <span className="flex-1 text-2xs leading-relaxed text-muted">{w.why}</span>
+            </div>
+          ))}
         </div>
       ) : null}
 
@@ -362,6 +572,31 @@ function StepCard({ step }: { step: StrategyStep }) {
   );
 }
 
+/** Une section ancrée : le sommaire y renvoie, l'ancre reste lisible sous l'en-tête. */
+function Section({ id, title, aside, children }: {
+  id: string; title: string; aside?: string; children: React.ReactNode;
+}) {
+  return (
+    <section id={id} className="scroll-mt-6 space-y-4 rounded-xl border border-border bg-surface p-5">
+      <div className="flex flex-wrap items-baseline gap-3">
+        <h2 className="text-lg font-semibold text-white">{title}</h2>
+        {aside && <span className="text-xs text-muted">{aside}</span>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+/** Un paragraphe titré. `plain` retire le cadre quand il est déjà dans un encadré. */
+function Note({ label, body, plain }: StrategyNote & { plain?: boolean }) {
+  return (
+    <div className={plain ? '' : 'rounded-lg border border-border/60 bg-background p-3'}>
+      <div className="text-xs font-medium text-white">{label}</div>
+      <p className="mt-1 text-xs leading-relaxed text-muted">{body}</p>
+    </div>
+  );
+}
+
 function Fact({ label, value }: { label: string; value: string }) {
   return (
     <div>
@@ -369,4 +604,11 @@ function Fact({ label, value }: { label: string; value: string }) {
       <div className="mt-1 text-sm text-white">{value}</div>
     </div>
   );
+}
+
+/** Durées de cache lisibles : « 60 s », « 15 min », « 6 h » — jamais 21600. */
+function fmtSeconds(s: number): string {
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.round(s / 60)} min`;
+  return `${Math.round(s / 3600)} h`;
 }

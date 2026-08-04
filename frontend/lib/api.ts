@@ -325,6 +325,9 @@ export type AgentStatus = {
   session?: SessionContext;
 };
 
+/** Un paragraphe titré : la forme de tout ce que la spécification explique en prose. */
+export type StrategyNote = { label: string; body: string };
+
 /** Un facteur d'une étape (indicateur de tendance ou outil de confirmation) avec son poids. */
 export type StrategyInput = {
   key: string; label: string; role: string;
@@ -344,7 +347,12 @@ export type StrategyStep = {
    *  à ne pas confondre avec `blocking` : un ❌ ici informe, il ne bloque rien. */
   informative?: string[];
   rules?: string[];
+  /** La RÈGLE EXACTE de chaque outil de l'étape — ce qu'il doit voir pour compter, et combien il
+   *  vaut alors. Un poids seul ne dit pas ce qui a réellement fait le score. */
+  detail?: StrategyNote[];
   stop_candidates?: string[];
+  /** Fiabilité de chaque type de niveau porteur de stop : c'est elle qui décide, pas la distance. */
+  stop_weights?: { label: string; weight: number; why: string }[];
   stop_rule?: string;
   scale_explained?: string;
   not_used?: string;
@@ -373,6 +381,35 @@ export type StrategySpec = {
     auto_entry: boolean; auto_entry_mode: string; why_all_markets: string;
   };
   data_honesty: string[];
+  /** Ce qui tourne EN PERMANENCE (cadences réelles des boucles) et sur quelles données. */
+  pipeline: {
+    loops: { name: string; cadence: string; body: string }[];
+    timeframes: { tf: string; role: string; candles: number; cache_s: number; min_candles: number }[];
+    notes: string[];
+  };
+  /** Les cases que le moteur remplit, et lesquelles REFUSENT réellement le trade. */
+  checklist: { n: number; step: number; label: string; blocking: boolean; why: string }[];
+  checklist_note: string;
+  /** Comment le graphique est lu — les mêmes outils servent aux trois étapes. */
+  toolbox: { name: string; purpose: string; body: string }[];
+  /** De la décision à l'ordre : dimensionnement, garde-fous, journalisation. */
+  execution: {
+    sizing: string[];
+    guards: { label: string; body: string }[];
+    journal: string;
+    no_silent_refusal: string;
+    paper_only: string;
+  };
+  /** Comment les trades sont retenus puis classés entre eux. */
+  selection: {
+    tiers: { label: string; body: string }[];
+    ranking: string[];
+    floor: string;
+    no_quota: string;
+    universe_order: string;
+  };
+  /** Ce que MESURE chaque indicateur — le glossaire du moteur, pas une paraphrase. */
+  glossary: { term: string; body: string }[];
   settings: Record<string, number | string | boolean>;
 };
 
